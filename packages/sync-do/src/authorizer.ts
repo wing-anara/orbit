@@ -63,7 +63,10 @@ const fromBase64url = (text: string): Uint8Array<ArrayBuffer> | null => {
   }
 }
 
-const hmacKey = (secret: string): Effect.Effect<CryptoKey> =>
+/** The key type is derived so the module typechecks without the DOM lib (Node backends). */
+type HmacKey = Awaited<ReturnType<typeof crypto.subtle.importKey>>
+
+const hmacKey = (secret: string): Effect.Effect<HmacKey> =>
   Effect.promise(() =>
     crypto.subtle.importKey(
       "raw",
