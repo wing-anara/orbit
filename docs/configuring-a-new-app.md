@@ -251,15 +251,15 @@ The `?worker` import lets Vite bundle the SQLite worker. In `vite.config.ts`, ex
 
 `orbit-server run` needs these environment variables (see `crates/orbit-server/src/config.rs`):
 
-| Variable                             | Meaning                                                                      |
-| ------------------------------------ | ---------------------------------------------------------------------------- |
-| `VITESS_GRPC_URI`                    | vtgate gRPC endpoint.                                                        |
-| `VITESS_USERNAME`, `VITESS_PASSWORD` | Basic auth, optional for local Vitess.                                       |
-| `VITESS_CELLS`                       | Cells for tablet selection, when the provider requires one.                  |
-| `SYNC_SCHEMA_PATH`                   | Path to `orbit.schema.json`.                                                 |
-| `STATE_PATH`                         | SQLite file for checkpoints and quarantine.                                  |
-| `WORKER_URL`                         | Base URL of the mounted router, for example `https://app.example.com/orbit`. |
-| `WORKER_SECRET`                      | Must equal `ORBIT_INTERNAL_SECRET`.                                          |
+| Variable                             | Meaning                                                                              |
+| ------------------------------------ | ------------------------------------------------------------------------------------ |
+| `VITESS_GRPC_URI`                    | vtgate gRPC endpoint.                                                                |
+| `VITESS_USERNAME`, `VITESS_PASSWORD` | Basic auth, optional for local Vitess.                                               |
+| `VITESS_CELLS`                       | Cells for tablet selection, when the provider requires one.                          |
+| `SYNC_SCHEMA_PATH`                   | Optional local `orbit.schema.json`; by default the engine fetches the Worker's copy. |
+| `STATE_PATH`                         | SQLite file for checkpoints and quarantine.                                          |
+| `WORKER_URL`                         | Base URL of the mounted router, for example `https://app.example.com/orbit`.         |
+| `WORKER_SECRET`                      | Must equal `ORBIT_INTERNAL_SECRET`.                                                  |
 
 On first start the checkpoint is empty and the stream begins at the current position. Existing rows reach the Durable Objects through demand fills. See [bootstrap.md](bootstrap.md) and [checkpoints.md](checkpoints.md).
 

@@ -9,10 +9,11 @@
  * * `POST /internal/fills/:fillId`      fill upload (NDJSON)
  * * `GET  /internal/status/:partition`  Durable Object status
  * * `POST /internal/reset/:partition`   operator reset of one Durable Object
+ * * `GET  /internal/schema`             the compiled sync schema the Worker runs
  */
 
-import { Effect, Exit, ManagedRuntime, type Layer } from "effect"
-import type { SyncSchema } from "@orbit/protocol"
+import { Effect, Exit, ManagedRuntime, Schema, type Layer } from "effect"
+import { SyncSchema } from "@orbit/protocol"
 
 import { Authorizer, grantAllows, type Grant } from "./authorizer.ts"
 import { AuthError, InternalAuthError, PartitionDenied } from "./errors.ts"
@@ -33,6 +34,7 @@ export interface OrbitHandlerConfig<Env extends OrbitWorkerEnv> {
 }
 
 const json = (body: unknown, status = 200): Response => Response.json(body, { status })
+const encodeSchema = Schema.encodeSync(SyncSchema)
 
 const constantTimeEqual = (a: string, b: string): boolean => {
   if (a.length !== b.length) return false
@@ -160,6 +162,10 @@ export const createOrbitHandler = <Env extends OrbitWorkerEnv>(config: OrbitHand
         const stub = env.ORBIT_FILL_REGISTRY.get(env.ORBIT_FILL_REGISTRY.idFromName("registry"))
         return stub.fetch(new Request("https://registry/status"))
       }
+      // The engine loads the artifact from here when it has no local copy, so both sides
+      // always run the same schema hash.
+      if (path === "/internal/schema" && request.method === "GET")
+        return json(encodeSchema(config.schema), 200)
       return json({ error: "not found" }, 404)
     }
     return json({ error: "not found" }, 404)

@@ -2,10 +2,8 @@
 # process. Built for Railway (see railway.json and docs/deployment-railway.md), but it is a plain
 # image: any host that gives it a persistent volume and one replica works.
 #
-# The image carries one sync schema artifact at /app/schema/orbit.schema.json. The build argument
-# SYNC_SCHEMA selects it; the default is the repository's example fixture, which is only a
-# placeholder. Build with `--build-arg SYNC_SCHEMA=path/to/orbit.schema.json`, or mount the
-# artifact at run time and set SYNC_SCHEMA_PATH.
+# The engine fetches the compiled sync schema from the Worker at start (`GET /internal/schema`),
+# so the image carries no artifact. Mount one and set SYNC_SCHEMA_PATH to run against a local copy.
 
 FROM rust:1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
@@ -18,10 +16,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
   && useradd --system --uid 10001 --create-home orbit
 COPY --from=build /src/target/release/orbit-server /usr/local/bin/orbit-server
-ARG SYNC_SCHEMA=schema/fixtures/SyncSchema.json
-COPY ${SYNC_SCHEMA} /app/schema/orbit.schema.json
-ENV SYNC_SCHEMA_PATH=/app/schema/orbit.schema.json \
-    STATE_PATH=/data/orbit-state.sqlite \
+ENV STATE_PATH=/data/orbit-state.sqlite \
     RUST_LOG=info
 # The checkpoint state must survive restarts: mount a volume at /data. There is deliberately no
 # VOLUME instruction: Railway's builder fails the build on it (without a log line), and every

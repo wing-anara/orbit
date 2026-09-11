@@ -28,7 +28,7 @@ All flags of `orbit-server run` accept environment variables (`crates/orbit-serv
 | `VITESS_GRPC_URI`                    | required                  | vtgate gRPC endpoint.                        |
 | `VITESS_USERNAME`, `VITESS_PASSWORD` | none                      | Basic auth.                                  |
 | `VITESS_CELLS`                       | none                      | Cells for tablet selection.                  |
-| `SYNC_SCHEMA_PATH`                   | required                  | Compiled artifact.                           |
+| `SYNC_SCHEMA_PATH`                   | fetched from the Worker   | Local artifact; else `GET /internal/schema`. |
 | `STATE_PATH`                         | `data/orbit-state.sqlite` | Checkpoint, counters, quarantine.            |
 | `WORKER_URL`                         | required                  | Base URL of the router.                      |
 | `WORKER_SECRET`                      | required                  | Equals `ORBIT_INTERNAL_SECRET`.              |

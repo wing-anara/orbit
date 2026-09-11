@@ -18,14 +18,36 @@ use tracing::{error, info};
 
 fn load_schema(path: &std::path::Path) -> anyhow::Result<SyncSchema> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading sync schema {}", path.display()))?;
-    let schema: SyncSchema = serde_json::from_str(&text).context("parsing sync schema")?;
+    parse_schema(&text, &path.display().to_string())
+}
+
+fn parse_schema(text: &str, source: &str) -> anyhow::Result<SyncSchema> {
+    let schema: SyncSchema = serde_json::from_str(text).context("parsing sync schema")?;
     if let Err(errors) = schema.validate() {
         for e in &errors {
             error!(error = %e, "invalid sync schema");
         }
-        bail!("sync schema {} is invalid ({} problems)", path.display(), errors.len());
+        bail!("sync schema {} is invalid ({} problems)", source, errors.len());
     }
     Ok(schema)
+}
+
+/// The artifact the Worker was deployed with, from `GET {worker_url}/internal/schema`.
+async fn fetch_schema(worker_url: &str, secret: &str) -> anyhow::Result<SyncSchema> {
+    let url = format!("{}/internal/schema", worker_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(secret)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .with_context(|| format!("fetching sync schema from {url}"))?;
+    let status = response.status();
+    let text = response.text().await.context("reading sync schema response")?;
+    if !status.is_success() {
+        bail!("fetching sync schema from {url}: http {status}");
+    }
+    parse_schema(&text, &url)
 }
 
 fn init_tracing() {
@@ -59,7 +81,10 @@ fn subscriber_config(vitess: &config::VitessArgs, keyspace: &str, allow_merged: 
 }
 
 async fn run(args: RunArgs) -> anyhow::Result<()> {
-    let schema = Arc::new(load_schema(&args.schema)?);
+    let schema = Arc::new(match &args.schema {
+        Some(path) => load_schema(path)?,
+        None => fetch_schema(&args.worker_url, &args.worker_secret).await?,
+    });
     info!(app = %schema.app, keyspace = %schema.keyspace, schema_hash = %schema.schema_hash, tables = schema.tables.len(), "sync schema loaded");
 
     metrics_exporter_prometheus::PrometheusBuilder::new()

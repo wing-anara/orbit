@@ -9,7 +9,7 @@ Vitess keyspace  --VStream gRPC-->  orbit-server on Railway  --HTTPS-->  Worker 
 
 ## The engine on Railway
 
-The image is `Dockerfile` at the repository root: a release build of `orbit-server` with a sync schema artifact at `/app/schema/orbit.schema.json`. The Dockerfile copies `schema/fixtures/SyncSchema.json` as a placeholder artifact. The build argument `SYNC_SCHEMA` overrides it at build time. A real deployment builds with `--build-arg SYNC_SCHEMA=path/to/orbit.schema.json`, or mounts the artifact and sets `SYNC_SCHEMA_PATH`. `railway.json` selects the Dockerfile builder and the deploy policy. Railway calls this format "config as code" and has deprecated it in favour of `.railway/railway.ts`; it keeps working until 2026-12-01, and `railway config migrate` converts it.
+The image is `Dockerfile` at the repository root: a release build of `orbit-server`. It carries no schema artifact: at start the engine fetches the compiled schema from the Worker (`GET /internal/schema`, authenticated with the internal secret), so the engine and the Durable Objects always run the same schema hash. `railway.json` selects the Dockerfile builder and the deploy policy. Railway calls this format "config as code" and has deprecated it in favour of `.railway/railway.ts`; it keeps working until 2026-12-01, and `railway config migrate` converts it.
 
 Deploy from the repository root after `railway link` to the project and the engine's service: `railway up --service <engine service> --detach`. The CLI uploads the repository (minus `.dockerignore`) and builds the image on Railway; a release build of the workspace takes several minutes.
 
@@ -29,7 +29,7 @@ Variables to set on the service (names only; values come from the database provi
 | `VITESS_CELLS`                       | `planetscale_operator_default` on PlanetScale                               |
 | `WORKER_URL`                         | the Worker's engine mount, `https://<worker>/orbit` with the default prefix |
 | `WORKER_SECRET`                      | equals the Worker's `ORBIT_INTERNAL_SECRET`                                 |
-| `SYNC_SCHEMA_PATH`                   | already set in the image; override for a mounted artifact                   |
+| `SYNC_SCHEMA_PATH`                   | leave unset; set it only to run a mounted local artifact                    |
 | `STATE_PATH`                         | already set in the image (`/data/orbit-state.sqlite`)                       |
 | `RUST_LOG`                           | `info` by default                                                           |
 

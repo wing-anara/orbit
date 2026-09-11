@@ -63,9 +63,11 @@ impl VitessArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub vitess: VitessArgs,
-    /// Path to the compiled sync schema artifact (orbit.schema.json).
+    /// Path to the compiled sync schema artifact (orbit.schema.json). When omitted, the artifact
+    /// is fetched from the Worker (`GET {worker_url}/internal/schema`), so the engine always runs
+    /// the schema the Durable Objects were deployed with.
     #[arg(long, env = "SYNC_SCHEMA_PATH")]
-    pub schema: PathBuf,
+    pub schema: Option<PathBuf>,
     /// SQLite file for checkpoints, counters and quarantine.
     #[arg(long, env = "STATE_PATH", default_value = "data/orbit-state.sqlite")]
     pub state: PathBuf,

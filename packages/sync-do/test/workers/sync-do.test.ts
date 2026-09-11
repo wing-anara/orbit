@@ -263,6 +263,14 @@ describe("internal endpoints", () => {
     expect(res.status).toBe(401)
   })
 
+  it("serves the compiled sync schema to the engine", async () => {
+    const res = await internal("/internal/schema")
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { schema_hash: string; tables: Array<unknown> }
+    expect(body.schema_hash).toBe(schema.schema_hash)
+    expect(body.tables.length).toBe(schema.tables.length)
+  })
+
   it("applies CDC batches with dedupe and reports status", async () => {
     const p = freshPartition()
     // Nothing is cached yet: rows for absent scopes are dropped, but the cursor advances.
