@@ -1,0 +1,31 @@
+[package]
+name = "orbit-distributor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Routes normalized transactions to logical partitions, batches, delivers to Durable Objects, and advances checkpoints"
+
+[dependencies]
+orbit-protocol = { workspace = true }
+orbit-gtid = { workspace = true }
+orbit-vstream = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+indexmap = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+async-trait = { workspace = true }

@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 100,
+  "singleQuote": false,
+  "semi": false,
+  "trailingComma": "all",
+  "ignorePatterns": [
+    "**/*.gen.ts",
+    "**/.wrangler/**",
+    "**/dist/**",
+    "**/generated/**",
+    "**/node_modules/**",
+    "**/orbit.schema.json",
+    "**/schema.introspected.ts",
+    "**/target/**",
+    "**/worker-configuration.d.ts",
+    "pnpm-lock.yaml",
+    "schema/**"
+  ]
+}

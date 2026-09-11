@@ -1,0 +1,74 @@
+[
+  {
+    "status": "applied",
+    "applied_seq": 43,
+    "duplicates": 1,
+    "apply_ms": 12
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "protocol_version_mismatch",
+      "expected": 1,
+      "got": 2
+    }
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "schema_mismatch",
+      "do_schema_hash": "a",
+      "got": "b"
+    }
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "sequence_gap",
+      "applied_seq": 10,
+      "first_seq": 12
+    }
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "sequence_conflict",
+      "seq": 5,
+      "applied_gtid": "u:5",
+      "got_gtid": "u:6"
+    }
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "stale_epoch",
+      "do_epoch": 4,
+      "got": 3
+    }
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "invalid_row",
+      "table": "Chatbot",
+      "seq": 7,
+      "message": "bad"
+    }
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "wrong_partition",
+      "do_partition": "a",
+      "got": "b"
+    }
+  },
+  {
+    "status": "rejected",
+    "reason": {
+      "kind": "internal",
+      "code": "x",
+      "message": "y"
+    }
+  }
+]

@@ -1,0 +1,37 @@
+[
+  {
+    "code": "source_unavailable",
+    "message": "down",
+    "retryable": true
+  },
+  {
+    "code": "source_rejected",
+    "message": "no"
+  },
+  {
+    "code": "normalization",
+    "table": "t",
+    "message": "m"
+  },
+  {
+    "code": "schema_mismatch",
+    "table": "t",
+    "message": "m"
+  },
+  {
+    "code": "unknown_table",
+    "table": "t"
+  },
+  {
+    "code": "unauthorized",
+    "message": "m"
+  },
+  {
+    "code": "timeout",
+    "after_ms": 1000
+  },
+  {
+    "code": "internal",
+    "message": "m"
+  }
+]

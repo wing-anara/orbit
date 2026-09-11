@@ -1,0 +1,32 @@
+{
+  "name": "@orbit/sync-do",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sync Durable Object runtime: relational cache, incremental view maintenance, subscriptions, fills, and the Worker router",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts",
+    "./worker": "./src/worker.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "types": "wrangler types --include-env=false",
+    "test": "vitest run",
+    "test:core": "vitest run --project core"
+  },
+  "dependencies": {
+    "@orbit/protocol": "workspace:*",
+    "@orbit/query": "workspace:*",
+    "@orbit/schema": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "catalog:",
+    "@cloudflare/workers-types": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "^4.1.11",
+    "wrangler": "catalog:"
+  }
+}

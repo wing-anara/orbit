@@ -1,0 +1,24 @@
+{
+  "name": "@orbit/schema",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Typed sync schema definition DSL, compiler to the shared artifact, row codecs and SQLite DDL",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@orbit/protocol": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

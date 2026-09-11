@@ -1,0 +1,9 @@
+target/
+node_modules/
+**/node_modules/
+data/
+.git/
+.env
+**/dist/
+**/.wrangler/
+**/test-results/

@@ -1,0 +1,39 @@
+{
+  "keyspace": "ks",
+  "server_version": "8.0.43-Vitess",
+  "tables": [
+    {
+      "name": "Chatbot",
+      "primary_key": [
+        "id"
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "column_type": "varchar(191)",
+          "data_type": "varchar",
+          "nullable": false,
+          "kind": "string"
+        },
+        {
+          "name": "type",
+          "column_type": "enum('DOCUMENT','GROUP')",
+          "data_type": "enum",
+          "nullable": false,
+          "kind": "string",
+          "enum_values": [
+            "DOCUMENT",
+            "GROUP"
+          ]
+        },
+        {
+          "name": "deleted",
+          "column_type": "tinyint(1)",
+          "data_type": "tinyint",
+          "nullable": true,
+          "kind": "bool"
+        }
+      ]
+    }
+  ]
+}

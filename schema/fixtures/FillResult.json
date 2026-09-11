@@ -1,0 +1,17 @@
+[
+  {
+    "status": "completed",
+    "position": "MySQL56/u:1-9",
+    "keyspace": "ks",
+    "shard": "-",
+    "row_count": 2,
+    "duration_ms": 35
+  },
+  {
+    "status": "failed",
+    "error": {
+      "code": "internal",
+      "message": "m"
+    }
+  }
+]

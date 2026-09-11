@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/orbit-protocol",
+  "crates/orbit-gtid",
+  "crates/orbit-vstream",
+  "crates/orbit-distributor",
+  "crates/orbit-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+orbit-protocol = { path = "crates/orbit-protocol" }
+orbit-gtid = { path = "crates/orbit-gtid" }
+orbit-vstream = { path = "crates/orbit-vstream" }
+orbit-distributor = { path = "crates/orbit-distributor" }
+
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+bytes = "1.12"
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots", "gzip"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+schemars = { version = "1.2", features = ["preserve_order"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+  "http2",
+  "stream",
+] }
+axum = "0.8"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2.0"
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive", "env"] }
+base64 = "0.23"
+uuid = { version = "1.26", features = ["v4"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = [
+  "http-listener",
+] }
+sha2 = "0.11"
+rand = "0.10"
+proptest = "1.11"
+insta = { version = "1.48", features = ["json"] }
+indexmap = { version = "2", features = ["serde"] }
+async-trait = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (build, clippy, fmt, unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Protocol schema is current
+        run: |
+          cargo run -q -p orbit-protocol --bin orbit-protocol-schema -- /tmp/protocol.schema.json
+          diff -u schema/protocol.schema.json /tmp/protocol.schema.json
+
+  rust-vitess:
+    name: Rust integration (real Vitess)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mysql-client
+      - run: docker compose -f infra/vitess/docker-compose.yml up -d --wait
+      - run: mysql -h 127.0.0.1 -P 33577 -u root orbit < infra/vitess/schema.sql
+      - run: ORBIT_TEST_VITESS=1 cargo test -p orbit-vstream --test live_vitess -- --test-threads=1
+      - run: ORBIT_TEST_VITESS=1 ORBIT_TEST_VITESS_DISRUPTIVE=1 cargo test -p orbit-vstream --test disruptive -- --test-threads=1
+
+  typescript:
+    name: TypeScript (typecheck, lint, format, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Generated protocol is current
+        run: pnpm codegen:check
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm format
+      - run: pnpm test
+
+  typescript-vitess:
+    name: TypeScript integration (real Vitess)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: sudo apt-get update && sudo apt-get install -y mysql-client
+      - run: pnpm install --frozen-lockfile
+      - run: docker compose -f infra/vitess/docker-compose.yml up -d --wait
+      - run: mysql -h 127.0.0.1 -P 33577 -u root orbit < infra/vitess/schema.sql
+      - run: ORBIT_TEST_VITESS=1 pnpm --filter @orbit/mutators test
+
+  image:
+    name: Engine container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t orbit-server .
+      - run: docker run --rm orbit-server orbit-server --help

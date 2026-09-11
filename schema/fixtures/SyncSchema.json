@@ -1,0 +1,176 @@
+{
+  "format_version": 1,
+  "schema_hash": "872253d7d99ab1c3494481c4f18bbef5644439c58d031a5f2d00e72a53e1fff4",
+  "app": "fixture",
+  "keyspace": "ks",
+  "partition": {
+    "name": "org",
+    "key_kind": "string",
+    "placement": {
+      "strategy": "one_per_partition",
+      "version": 1
+    }
+  },
+  "tables": [
+    {
+      "name": "organization",
+      "primary_key": [
+        "id"
+      ],
+      "partition_column": "id",
+      "columns": [
+        {
+          "name": "id",
+          "kind": "string",
+          "nullable": false,
+          "source_type": "varchar(191)"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "nullable": false,
+          "source_type": "text"
+        },
+        {
+          "name": "created_at",
+          "kind": "datetime",
+          "nullable": false,
+          "source_type": "timestamp"
+        },
+        {
+          "name": "hipaa_enabled",
+          "kind": "bool",
+          "nullable": false,
+          "source_type": "tinyint(1)"
+        }
+      ],
+      "relations": []
+    },
+    {
+      "name": "Chatbot",
+      "primary_key": [
+        "id"
+      ],
+      "partition_column": "organizationId",
+      "columns": [
+        {
+          "name": "id",
+          "kind": "string",
+          "nullable": false,
+          "source_type": "varchar(191)"
+        },
+        {
+          "name": "organizationId",
+          "kind": "string",
+          "nullable": true,
+          "source_type": "varchar(191)"
+        },
+        {
+          "name": "groupId",
+          "kind": "string",
+          "nullable": true,
+          "source_type": "varchar(191)"
+        },
+        {
+          "name": "type",
+          "kind": "string",
+          "nullable": false,
+          "source_type": "enum('DOCUMENT','GROUP')",
+          "enum_values": [
+            "DOCUMENT",
+            "GROUP"
+          ]
+        },
+        {
+          "name": "displayOrder",
+          "kind": "int",
+          "nullable": true,
+          "source_type": "int"
+        },
+        {
+          "name": "contents",
+          "kind": "json",
+          "nullable": true,
+          "source_type": "json"
+        },
+        {
+          "name": "createdAt",
+          "kind": "datetime",
+          "nullable": false,
+          "source_type": "datetime(3)"
+        },
+        {
+          "name": "score",
+          "kind": "float",
+          "nullable": true,
+          "source_type": "double"
+        },
+        {
+          "name": "big",
+          "kind": "bigint",
+          "nullable": true,
+          "source_type": "bigint unsigned"
+        },
+        {
+          "name": "price",
+          "kind": "decimal",
+          "nullable": true,
+          "source_type": "decimal(10,2)"
+        },
+        {
+          "name": "blob",
+          "kind": "bytes",
+          "nullable": true,
+          "source_type": "blob"
+        },
+        {
+          "name": "day",
+          "kind": "date",
+          "nullable": true,
+          "source_type": "date"
+        },
+        {
+          "name": "at",
+          "kind": "time",
+          "nullable": true,
+          "source_type": "time(3)"
+        }
+      ],
+      "relations": [
+        {
+          "name": "folder",
+          "kind": "one",
+          "target_table": "Chatbot",
+          "from_columns": [
+            "groupId"
+          ],
+          "to_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "organization",
+          "kind": "one",
+          "target_table": "organization",
+          "from_columns": [
+            "organizationId"
+          ],
+          "to_columns": [
+            "id"
+          ]
+        },
+        {
+          "name": "documents",
+          "kind": "many",
+          "target_table": "Chatbot",
+          "from_columns": [
+            "id"
+          ],
+          "to_columns": [
+            "groupId"
+          ]
+        }
+      ]
+    }
+  ]
+}

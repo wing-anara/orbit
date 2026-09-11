@@ -1,0 +1,153 @@
+{
+  "protocol_version": 1,
+  "schema_hash": "872253d7d99ab1c3494481c4f18bbef5644439c58d031a5f2d00e72a53e1fff4",
+  "stream_epoch": 3,
+  "partition": "org_1",
+  "transactions": [
+    {
+      "seq": 42,
+      "keyspace": "ks",
+      "shard": "-",
+      "gtid": "a2523813-adbe-11f1-b19c-0a2250a7ed6c:275",
+      "position": "MySQL56/a2523813-adbe-11f1-b19c-0a2250a7ed6c:1-275",
+      "commit_timestamp": 1789119616,
+      "changes": [
+        {
+          "table": "Chatbot",
+          "op": "insert",
+          "key": [
+            "c1"
+          ],
+          "after": {
+            "id": "c1",
+            "organizationId": "org_1",
+            "groupId": null,
+            "type": "DOCUMENT",
+            "displayOrder": 3,
+            "contents": {
+              "blocks": [
+                1,
+                2,
+                {
+                  "t": "x"
+                }
+              ],
+              "s": "he\"llo 😀"
+            },
+            "createdAt": "2026-01-02 03:04:05.678",
+            "score": 1.5,
+            "big": "18446744073709551615",
+            "price": "1234.50",
+            "blob": "AP8Q",
+            "day": "2026-01-02",
+            "at": "13:14:15.123"
+          }
+        },
+        {
+          "table": "Chatbot",
+          "op": "update",
+          "key": [
+            "c1"
+          ],
+          "before": {
+            "id": "c1",
+            "organizationId": "org_1",
+            "groupId": null,
+            "type": "DOCUMENT",
+            "displayOrder": 3,
+            "contents": {
+              "blocks": [
+                1,
+                2,
+                {
+                  "t": "x"
+                }
+              ],
+              "s": "he\"llo 😀"
+            },
+            "createdAt": "2026-01-02 03:04:05.678",
+            "score": 1.5,
+            "big": "18446744073709551615",
+            "price": "1234.50",
+            "blob": "AP8Q",
+            "day": "2026-01-02",
+            "at": "13:14:15.123"
+          },
+          "after": {
+            "id": "c1",
+            "organizationId": "org_1",
+            "groupId": null,
+            "type": "DOCUMENT",
+            "displayOrder": 3,
+            "contents": {
+              "blocks": [
+                1,
+                2,
+                {
+                  "t": "x"
+                }
+              ],
+              "s": "he\"llo 😀"
+            },
+            "createdAt": "2026-01-02 03:04:05.678",
+            "score": 1.5,
+            "big": "18446744073709551615",
+            "price": "1234.50",
+            "blob": "AP8Q",
+            "day": "2026-01-02",
+            "at": "13:14:15.123"
+          }
+        },
+        {
+          "table": "Chatbot",
+          "op": "delete",
+          "key": [
+            "c1"
+          ],
+          "before": {
+            "id": "c1",
+            "organizationId": "org_1",
+            "groupId": null,
+            "type": "DOCUMENT",
+            "displayOrder": 3,
+            "contents": {
+              "blocks": [
+                1,
+                2,
+                {
+                  "t": "x"
+                }
+              ],
+              "s": "he\"llo 😀"
+            },
+            "createdAt": "2026-01-02 03:04:05.678",
+            "score": 1.5,
+            "big": "18446744073709551615",
+            "price": "1234.50",
+            "blob": "AP8Q",
+            "day": "2026-01-02",
+            "at": "13:14:15.123"
+          }
+        }
+      ],
+      "trace": {
+        "subscriber_received_at_ms": 1700000000123,
+        "distributor_dispatched_at_ms": 1700000000456
+      }
+    },
+    {
+      "seq": 43,
+      "keyspace": "ks",
+      "shard": "-",
+      "gtid": "a2523813-adbe-11f1-b19c-0a2250a7ed6c:275",
+      "position": "MySQL56/a2523813-adbe-11f1-b19c-0a2250a7ed6c:1-275",
+      "commit_timestamp": 1789119616,
+      "changes": [],
+      "trace": {
+        "subscriber_received_at_ms": 1700000000123,
+        "distributor_dispatched_at_ms": 1700000000456
+      }
+    }
+  ],
+  "delivery_id": "d-1"
+}

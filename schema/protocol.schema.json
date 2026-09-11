@@ -1,0 +1,1130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orbit.dev/schemas/protocol.json",
+  "title": "orbit protocol",
+  "x-internal-protocol-version": 1,
+  "x-sync-schema-format-version": 1,
+  "x-roots": [
+    "SyncSchema",
+    "IntrospectedSchema",
+    "CdcBatch",
+    "CdcBatchAck",
+    "SourceTransaction",
+    "FillRequest",
+    "FillPollResponse",
+    "FillChunk",
+    "FillResult",
+    "EngineError"
+  ],
+  "$defs": {
+    "SyncSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Artifact format version. See `SYNC_SCHEMA_FORMAT_VERSION`."
+        },
+        "schema_hash": {
+          "type": "string",
+          "description": "SHA-256 hex of the canonical artifact without this field."
+        },
+        "app": {
+          "type": "string",
+          "description": "Application-chosen name, used in metrics and Durable Object namespaces."
+        },
+        "keyspace": {
+          "type": "string",
+          "description": "Vitess keyspace the tables live in."
+        },
+        "partition": {
+          "$ref": "#/$defs/PartitionConfig"
+        },
+        "tables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TableSchema"
+          },
+          "description": "Tables in dependency-friendly order (parents before children where relations exist)."
+        }
+      },
+      "required": [
+        "format_version",
+        "schema_hash",
+        "app",
+        "keyspace",
+        "partition",
+        "tables"
+      ],
+      "description": "The compiled sync schema. `schema_hash` is computed by [`SyncSchema::compute_hash`] over the\ncanonical JSON of every other field."
+    },
+    "PartitionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Human name of the logical partition key, for example `organization`."
+        },
+        "key_kind": {
+          "$ref": "#/$defs/ValueKind",
+          "description": "Value kind of the partition key. Only `string`, `int` and `bigint` are allowed."
+        },
+        "placement": {
+          "$ref": "#/$defs/PlacementConfig",
+          "description": "Physical placement strategy. Changing it invalidates every Durable Object's state."
+        }
+      },
+      "required": [
+        "name",
+        "key_kind",
+        "placement"
+      ],
+      "description": "Logical partitioning and physical placement configuration."
+    },
+    "ValueKind": {
+      "type": "string",
+      "enum": [
+        "bool",
+        "int",
+        "bigint",
+        "float",
+        "decimal",
+        "string",
+        "bytes",
+        "json",
+        "datetime",
+        "date",
+        "time"
+      ],
+      "description": "How a column's values are encoded on the wire and typed in consumers."
+    },
+    "PlacementConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "strategy": {
+              "type": "string",
+              "const": "one_per_partition"
+            }
+          },
+          "required": [
+            "strategy",
+            "version"
+          ],
+          "description": "One Durable Object per logical partition. `version` namespaces the DO names so a future\nstrategy can migrate without colliding with old objects."
+        }
+      ]
+    },
+    "TableSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Source table name in the keyspace."
+        },
+        "primary_key": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Primary key column names in key order. Must be non-empty and be a subset of `columns`."
+        },
+        "partition_column": {
+          "type": "string",
+          "description": "Column that holds the logical partition key. Must be in `columns`. Rows with a NULL\npartition value are not routed anywhere and are counted as `unpartitioned`.\n\nWhen `partition_parent` is set, this column holds the primary key of a row of the parent\ntable instead, and the row's partition is derived from that parent row."
+        },
+        "partition_parent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Derived partitioning. When set, `partition_column` holds the primary key value of a row of\nthis table (a synced table that is partitioned directly, with no `partition_parent` of its\nown), and the row's partition is the partition of that parent row. The parent's primary\nkey must be a single `string`, `int` or `bigint` column, and `partition_column` must have\nthe same kind. Only one level is allowed. A row whose parent is NULL or unknown is not\nrouted and is counted as `unresolved_parent`."
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnSchema"
+          },
+          "description": "Synced columns, in order. Source columns not listed are ignored."
+        },
+        "relations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RelationSchema"
+          },
+          "description": "Declared relations to other synced tables, usable in query includes."
+        }
+      },
+      "required": [
+        "name",
+        "primary_key",
+        "partition_column",
+        "columns",
+        "relations"
+      ]
+    },
+    "ColumnSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ValueKind"
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "source_type": {
+          "type": "string",
+          "description": "Full MySQL column type as introspected, for example `varchar(191)` or `enum('A','B')`."
+        },
+        "enum_values": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Allowed values for enum columns, in definition order (index 1 is the first value)."
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "nullable",
+        "source_type"
+      ]
+    },
+    "RelationSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/RelationKind"
+        },
+        "target_table": {
+          "type": "string"
+        },
+        "from_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "to_columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "target_table",
+        "from_columns",
+        "to_columns"
+      ]
+    },
+    "RelationKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "one",
+          "description": "`from_columns` on this table reference `to_columns` (the primary key) on the target."
+        },
+        {
+          "type": "string",
+          "const": "many",
+          "description": "`to_columns` on the target reference `from_columns` (the primary key) on this table."
+        }
+      ]
+    },
+    "IntrospectedSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keyspace": {
+          "type": "string"
+        },
+        "server_version": {
+          "type": "string",
+          "description": "Server version string, for example `8.0.43-Vitess`."
+        },
+        "tables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IntrospectedTable"
+          }
+        }
+      },
+      "required": [
+        "keyspace",
+        "server_version",
+        "tables"
+      ],
+      "description": "Raw metadata read from `information_schema`. Produced by `orbit-server schema introspect`\nand consumed by the TypeScript sync config DSL."
+    },
+    "IntrospectedTable": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "primary_key": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IntrospectedColumn"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "primary_key",
+        "columns"
+      ]
+    },
+    "IntrospectedColumn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "column_type": {
+          "type": "string",
+          "description": "`information_schema.COLUMNS.COLUMN_TYPE`, for example `varchar(191)`."
+        },
+        "data_type": {
+          "type": "string",
+          "description": "`information_schema.COLUMNS.DATA_TYPE`, for example `varchar`."
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/ValueKind",
+          "description": "The value kind the engine infers for this column. `tinyint(1)` maps to `bool`."
+        },
+        "enum_values": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "column_type",
+        "data_type",
+        "nullable",
+        "kind"
+      ]
+    },
+    "CdcBatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "schema_hash": {
+          "type": "string"
+        },
+        "stream_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "partition": {
+          "type": "string",
+          "description": "Partition key rendered as a string (`int`/`bigint` keys use decimal digits)."
+        },
+        "transactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PartitionTransaction"
+          }
+        },
+        "delivery_id": {
+          "type": "string",
+          "description": "Unique id of this delivery attempt, for log correlation only."
+        }
+      },
+      "required": [
+        "protocol_version",
+        "schema_hash",
+        "stream_epoch",
+        "partition",
+        "transactions",
+        "delivery_id"
+      ],
+      "description": "Delivery unit from the distributor to one Durable Object. Transactions are contiguous in\n`seq` and in stream order."
+    },
+    "PartitionTransaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Dense per-partition sequence assigned by the distributor."
+        },
+        "keyspace": {
+          "type": "string"
+        },
+        "shard": {
+          "type": "string"
+        },
+        "gtid": {
+          "type": "string"
+        },
+        "position": {
+          "type": "string"
+        },
+        "commit_timestamp": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RowChange"
+          }
+        },
+        "trace": {
+          "$ref": "#/$defs/TraceContext"
+        }
+      },
+      "required": [
+        "seq",
+        "keyspace",
+        "shard",
+        "gtid",
+        "position",
+        "commit_timestamp",
+        "changes",
+        "trace"
+      ],
+      "description": "The slice of one source transaction that belongs to one logical partition."
+    },
+    "RowChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "op": {
+          "$ref": "#/$defs/RowOp"
+        },
+        "key": {
+          "type": "array",
+          "items": true,
+          "description": "Primary key of the row *after* the change for insert/update, *before* for delete."
+        },
+        "before": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Present for update and delete."
+        },
+        "after": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Present for insert and update."
+        }
+      },
+      "required": [
+        "table",
+        "op",
+        "key"
+      ],
+      "description": "One row change inside a source transaction. Images are full rows (Vitess requires\n`binlog_row_image=FULL`), projected to the sync schema's columns."
+    },
+    "RowOp": {
+      "type": "string",
+      "enum": [
+        "insert",
+        "update",
+        "delete"
+      ]
+    },
+    "TraceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "subscriber_received_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "distributor_dispatched_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "description": "Timestamps collected as a change travels through the pipeline (unix milliseconds)."
+    },
+    "CdcBatchAck": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "applied_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "duplicates": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "Transactions the DO skipped as duplicates."
+            },
+            "apply_ms": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "description": "Milliseconds the DO spent applying, for latency metrics."
+            },
+            "status": {
+              "type": "string",
+              "const": "applied"
+            }
+          },
+          "required": [
+            "status",
+            "applied_seq",
+            "duplicates",
+            "apply_ms"
+          ],
+          "description": "Every transaction in the batch is now durably reflected (or was already)."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/RejectReason"
+            },
+            "status": {
+              "type": "string",
+              "const": "rejected"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "description": "The DO refused the batch. The distributor must not advance past it."
+        }
+      ],
+      "description": "Response of a Durable Object to a `CdcBatch`."
+    },
+    "RejectReason": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "expected": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "got": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "protocol_version_mismatch"
+            }
+          },
+          "required": [
+            "kind",
+            "expected",
+            "got"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "do_schema_hash": {
+              "type": "string"
+            },
+            "got": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "schema_mismatch"
+            }
+          },
+          "required": [
+            "kind",
+            "do_schema_hash",
+            "got"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "applied_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "first_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "sequence_gap"
+            }
+          },
+          "required": [
+            "kind",
+            "applied_seq",
+            "first_seq"
+          ],
+          "description": "The batch's first `seq` is beyond `applied_seq + 1`."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "applied_gtid": {
+              "type": "string"
+            },
+            "got_gtid": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "sequence_conflict"
+            }
+          },
+          "required": [
+            "kind",
+            "seq",
+            "applied_gtid",
+            "got_gtid"
+          ],
+          "description": "A duplicate `seq` carried a different `gtid` than the one already applied."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "do_epoch": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "got": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "stale_epoch"
+            }
+          },
+          "required": [
+            "kind",
+            "do_epoch",
+            "got"
+          ],
+          "description": "The DO is already on a newer epoch and refuses older streams."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "table": {
+              "type": "string"
+            },
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "message": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "invalid_row"
+            }
+          },
+          "required": [
+            "kind",
+            "table",
+            "seq",
+            "message"
+          ],
+          "description": "A row failed validation against the sync schema."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "do_partition": {
+              "type": "string"
+            },
+            "got": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "wrong_partition"
+            }
+          },
+          "required": [
+            "kind",
+            "do_partition",
+            "got"
+          ],
+          "description": "Partition in the batch does not match the DO's partition."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "internal"
+            }
+          },
+          "required": [
+            "kind",
+            "code",
+            "message"
+          ],
+          "description": "Any other failure with a stable, machine-readable code."
+        }
+      ]
+    },
+    "SourceTransaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keyspace": {
+          "type": "string"
+        },
+        "shard": {
+          "type": "string"
+        },
+        "gtid": {
+          "type": "string",
+          "description": "The single transaction id added by this step, `uuid:gno`."
+        },
+        "position": {
+          "type": "string",
+          "description": "Full shard position after this transaction, `MySQL56/...`."
+        },
+        "commit_timestamp": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Commit time from the binlog, unix seconds."
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RowChange"
+          }
+        },
+        "trace": {
+          "$ref": "#/$defs/TraceContext",
+          "description": "Subscriber-side observability. Not part of identity."
+        }
+      },
+      "required": [
+        "keyspace",
+        "shard",
+        "gtid",
+        "position",
+        "commit_timestamp",
+        "changes",
+        "trace"
+      ],
+      "description": "A committed source transaction as observed on one shard stream, after normalization and\nprojection to the sync schema. Transactions that touch no synced table still appear (with\nno changes) so the checkpoint can advance; the distributor drops them before delivery."
+    },
+    "FillRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fill_id": {
+          "type": "string",
+          "description": "Unique id chosen by the requesting Durable Object."
+        },
+        "schema_hash": {
+          "type": "string"
+        },
+        "partition": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        },
+        "requested_at_ms": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Unix milliseconds when the DO registered the request."
+        }
+      },
+      "required": [
+        "fill_id",
+        "schema_hash",
+        "partition",
+        "table",
+        "requested_at_ms"
+      ]
+    },
+    "FillPollResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FillRequest"
+          }
+        }
+      },
+      "required": [
+        "requests"
+      ],
+      "description": "Long-poll response listing fills the Rust server should execute next."
+    },
+    "FillChunk": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fill_id": {
+              "type": "string"
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "rows"
+            }
+          },
+          "required": [
+            "type",
+            "fill_id",
+            "rows"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fill_id": {
+              "type": "string"
+            },
+            "result": {
+              "$ref": "#/$defs/FillResult"
+            },
+            "type": {
+              "type": "string",
+              "const": "done"
+            }
+          },
+          "required": [
+            "type",
+            "fill_id",
+            "result"
+          ]
+        }
+      ],
+      "description": "One NDJSON line of a fill upload."
+    },
+    "FillResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "position": {
+              "type": "string",
+              "description": "Shard position (`MySQL56/...`) at which the delivered rows are exact."
+            },
+            "keyspace": {
+              "type": "string"
+            },
+            "shard": {
+              "type": "string"
+            },
+            "row_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "duration_ms": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "status": {
+              "type": "string",
+              "const": "completed"
+            }
+          },
+          "required": [
+            "status",
+            "position",
+            "keyspace",
+            "shard",
+            "row_count",
+            "duration_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/EngineError"
+            },
+            "status": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "required": [
+            "status",
+            "error"
+          ]
+        }
+      ]
+    },
+    "EngineError": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "code": {
+              "type": "string",
+              "const": "source_unavailable"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "description": "The authoritative database or Vitess refused or dropped the request."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "code": {
+              "type": "string",
+              "const": "source_rejected"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "description": "The table or filter is rejected by Vitess (for example after a schema change)."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "table": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "code": {
+              "type": "string",
+              "const": "normalization"
+            }
+          },
+          "required": [
+            "code",
+            "table",
+            "message"
+          ],
+          "description": "A row could not be normalized to the sync schema."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "table": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "code": {
+              "type": "string",
+              "const": "schema_mismatch"
+            }
+          },
+          "required": [
+            "code",
+            "table",
+            "message"
+          ],
+          "description": "The live schema no longer matches the sync schema."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "table": {
+              "type": "string"
+            },
+            "code": {
+              "type": "string",
+              "const": "unknown_table"
+            }
+          },
+          "required": [
+            "code",
+            "table"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "code": {
+              "type": "string",
+              "const": "unauthorized"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "after_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "code": {
+              "type": "string",
+              "const": "timeout"
+            }
+          },
+          "required": [
+            "code",
+            "after_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "code": {
+              "type": "string",
+              "const": "internal"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ]
+        }
+      ],
+      "description": "Error carried in fill results and internal HTTP error responses."
+    }
+  }
+}

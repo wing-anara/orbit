@@ -1,0 +1,22 @@
+[package]
+name = "orbit-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Source of truth for the cross-language sync schema, CDC and delivery protocol types"
+
+[[bin]]
+name = "orbit-protocol-schema"
+path = "src/bin/export_schema.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true, features = ["indexmap2"] }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

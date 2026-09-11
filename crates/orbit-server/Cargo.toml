@@ -1,0 +1,29 @@
+[package]
+name = "orbit-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The sync engine server: VStream subscriber, distributor, fill worker, metrics"
+
+[[bin]]
+name = "orbit-server"
+path = "src/main.rs"
+
+[dependencies]
+orbit-protocol = { workspace = true }
+orbit-gtid = { workspace = true }
+orbit-vstream = { workspace = true }
+orbit-distributor = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+reqwest = { workspace = true }
+tonic = { workspace = true }
+uuid = { workspace = true }

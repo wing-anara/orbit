@@ -1,0 +1,23 @@
+{
+  "name": "@orbit/codegen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generates Effect Schema definitions from the Rust protocol JSON Schema",
+  "type": "module",
+  "scripts": {
+    "generate": "tsx src/cli.ts generate",
+    "check": "tsx src/cli.ts check",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

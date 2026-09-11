@@ -1,0 +1,29 @@
+# Local Vitess cluster for development and integration tests.
+#
+# Ports (PORT=33574):
+#   33574  vtcombo HTTP status page
+#   33575  vtgate gRPC (VStream, Execute)
+#   33577  vtgate MySQL protocol
+#
+# Load the fixture schema with:  pnpm vitess:schema
+services:
+  vitess:
+    image: vitess/vttestserver:v24.0.3-mysql80
+    container_name: orbit-vitess
+    ports:
+      - "33574:33574"
+      - "33575:33575"
+      - "33577:33577"
+    environment:
+      PORT: "33574"
+      KEYSPACES: "orbit"
+      NUM_SHARDS: "1"
+      MYSQL_MAX_CONNECTIONS: "1000"
+      MYSQL_BIND_HOST: "0.0.0.0"
+      VTCOMBO_BIND_HOST: "0.0.0.0"
+      ENABLE_DIRECT_DDL: "true"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-P33577"]
+      interval: 5s
+      timeout: 2s
+      retries: 30

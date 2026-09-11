@@ -1,0 +1,22 @@
+// Test-only Worker configuration for the sync engine's own Durable Object tests.
+// Applications embed the engine in their own Worker and declare the bindings there.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "orbit-sync-do-test",
+  "main": "test/worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ORBIT_SYNC", "class_name": "SyncDurableObject" },
+      { "name": "ORBIT_FILL_REGISTRY", "class_name": "FillRegistryDurableObject" },
+    ],
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SyncDurableObject", "FillRegistryDurableObject"] },
+  ],
+  "vars": {
+    "ORBIT_INTERNAL_SECRET": "test-secret",
+    "ORBIT_TOKEN_SECRET": "test-token-secret",
+  },
+}

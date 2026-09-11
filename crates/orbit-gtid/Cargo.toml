@@ -1,0 +1,13 @@
+[package]
+name = "orbit-gtid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MySQL 5.6+ GTID set parsing, comparison and containment as used by Vitess positions"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

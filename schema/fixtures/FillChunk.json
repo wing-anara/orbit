@@ -1,0 +1,79 @@
+[
+  {
+    "type": "rows",
+    "fill_id": "f-1",
+    "rows": [
+      {
+        "id": "c1",
+        "organizationId": "org_1",
+        "groupId": null,
+        "type": "DOCUMENT",
+        "displayOrder": 3,
+        "contents": {
+          "blocks": [
+            1,
+            2,
+            {
+              "t": "x"
+            }
+          ],
+          "s": "he\"llo 😀"
+        },
+        "createdAt": "2026-01-02 03:04:05.678",
+        "score": 1.5,
+        "big": "18446744073709551615",
+        "price": "1234.50",
+        "blob": "AP8Q",
+        "day": "2026-01-02",
+        "at": "13:14:15.123"
+      },
+      {
+        "id": "c2",
+        "organizationId": "org_1",
+        "groupId": null,
+        "type": "DOCUMENT",
+        "displayOrder": 3,
+        "contents": {
+          "blocks": [
+            1,
+            2,
+            {
+              "t": "x"
+            }
+          ],
+          "s": "he\"llo 😀"
+        },
+        "createdAt": "2026-01-02 03:04:05.678",
+        "score": 1.5,
+        "big": "18446744073709551615",
+        "price": "1234.50",
+        "blob": "AP8Q",
+        "day": "2026-01-02",
+        "at": "13:14:15.123"
+      }
+    ]
+  },
+  {
+    "type": "done",
+    "fill_id": "f-1",
+    "result": {
+      "status": "completed",
+      "position": "MySQL56/u:1-9",
+      "keyspace": "ks",
+      "shard": "-",
+      "row_count": 2,
+      "duration_ms": 35
+    }
+  },
+  {
+    "type": "done",
+    "fill_id": "f-1",
+    "result": {
+      "status": "failed",
+      "error": {
+        "code": "timeout",
+        "after_ms": 5
+      }
+    }
+  }
+]

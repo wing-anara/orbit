@@ -1,0 +1,40 @@
+{
+  "name": "@orbit/client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser sync client: OPFS-backed SQLite cache, live queries, reconnect and resume",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./react": "./src/react.ts",
+    "./worker": "./src/worker/sqlite.worker.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@orbit/mutators": "workspace:*",
+    "@orbit/protocol": "workspace:*",
+    "@orbit/query": "workspace:*",
+    "@orbit/schema": "workspace:*",
+    "@sqlite.org/sqlite-wasm": "catalog:",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@orbit/sync-do": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "react": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
+}

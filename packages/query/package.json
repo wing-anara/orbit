@@ -1,0 +1,25 @@
+{
+  "name": "@orbit/query",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Typed query builder, validation/planning against the sync schema, and SQLite compilation",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@orbit/protocol": "workspace:*",
+    "@orbit/schema": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "extends": ["./node_modules/@effect/tsgo/oxlint-presets/recommended.json"],
+  "env": {
+    "browser": true,
+    "node": true,
+    "es2024": true
+  },
+  "plugins": ["typescript", "unicorn", "oxc", "import", "vitest"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "typescript/consistent-type-imports": "error",
+    "typescript/no-unsafe-type-assertion": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    "typescript/switch-exhaustiveness-check": [
+      "error",
+      {
+        "considerDefaultExhaustiveForUnions": true
+      }
+    ],
+    "typescript/no-unnecessary-type-assertion": "error",
+    "no-console": "error",
+    "unicorn/no-null": "off",
+    "unicorn/prefer-top-level-await": "off",
+    "unicorn/no-array-callback-reference": "off",
+    "unicorn/no-array-for-each": "off",
+    "import/no-cycle": "error",
+    "no-underscore-dangle": [
+      "error",
+      {
+        "allow": ["_tag", "__key"]
+      }
+    ],
+    "typescript/consistent-return": "off",
+    "unicorn/require-post-message-target-origin": "off"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx", "**/test/**", "**/e2e/**"],
+      "rules": {
+        "no-console": "off",
+        "typescript/no-non-null-assertion": "off",
+        "typescript/no-unsafe-type-assertion": "off",
+        "typescript/no-base-to-string": "off",
+        "typescript/restrict-template-expressions": "off",
+        "typescript/no-unnecessary-type-assertion": "off",
+        "typescript/require-array-sort-compare": "off",
+        "typescript/no-misused-spread": "off",
+        "unicorn/no-array-sort": "off",
+        "unicorn/consistent-function-scoping": "off",
+        "unicorn/no-useless-fallback-in-spread": "off",
+        "unicorn/no-useless-spread": "off",
+        "vitest/require-to-throw-message": "off",
+        "vitest/no-conditional-expect": "off",
+        "no-underscore-dangle": "off"
+      }
+    },
+    {
+      "files": ["packages/client/src/react/**"],
+      "rules": {
+        "typescript/no-floating-promises": "off",
+        "typescript/no-misused-promises": "off"
+      }
+    }
+  ],
+  "ignorePatterns": [
+    "**/*.gen.ts",
+    "**/.wrangler/**",
+    "**/dist/**",
+    "**/generated/**",
+    "**/node_modules/**",
+    "**/routeTree.gen.ts",
+    "**/schema.introspected.ts",
+    "**/target/**",
+    "**/worker-configuration.d.ts"
+  ]
+}

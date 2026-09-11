@@ -1,0 +1,29 @@
+{
+  "name": "orbit",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "pnpm -r --workspace-concurrency=4 run typecheck",
+    "lint": "oxlint --type-aware .",
+    "format": "oxfmt --check .",
+    "format:fix": "oxfmt .",
+    "test": "pnpm -r --workspace-concurrency=1 run test",
+    "codegen": "pnpm --filter @orbit/codegen run generate",
+    "codegen:check": "pnpm --filter @orbit/codegen run check",
+    "vitess:up": "docker compose -f infra/vitess/docker-compose.yml up -d --wait",
+    "vitess:down": "docker compose -f infra/vitess/docker-compose.yml down -v",
+    "vitess:schema": "mysql -h 127.0.0.1 -P 33577 -u root orbit < infra/vitess/schema.sql",
+    "postinstall": "effect-tsgo patch"
+  },
+  "devDependencies": {
+    "@effect/tsgo": "catalog:",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "oxlint-tsgolint": "catalog:",
+    "typescript": "catalog:"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "packageManager": "pnpm@11.18.0"
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@orbit/mutators",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Custom mutators: shared definitions that run optimistically in the browser and authoritatively on the application's server",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@orbit/protocol": "workspace:*",
+    "@orbit/query": "workspace:*",
+    "@orbit/schema": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "mysql2": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
