@@ -407,6 +407,37 @@ describe("SyncEngine: subscriptions and incremental maintenance", () => {
     ).toEqual(["d2", "d3", "f1", "org_1"])
   })
 
+  it("a delete followed by an insert of the same key in one transaction ships the final image", () => {
+    const { engine } = makeEngine()
+    liveScope(engine, "organization", [organization("org_1")])
+    liveScope(engine, "Chatbot", [
+      chatbot("f1", { type: "GROUP" }),
+      chatbot("d1", { groupId: "f1", displayOrder: 1 }),
+    ])
+    const sub = engine.subscribe(documentsInFolder("f1"))
+    expect(Result.isSuccess(sub)).toBe(true)
+    if (!Result.isSuccess(sub)) return
+    const id = sub.success.subscription
+    const same = chatbot("d1", { groupId: "f1", displayOrder: 1 })
+    const r1 = engine.applyBatch(
+      batch(schema, "org_1", [txn(1, [remove("Chatbot", same), insert("Chatbot", same)])]),
+    )
+    const d1 = deltas(r1.events)[0]!
+    expect(d1.memberships).toEqual([])
+    expect(d1.rows).toEqual([
+      { table: "Chatbot", key: ["d1"], row: expect.objectContaining({ id: "d1" }) },
+    ])
+    expect(engine.membershipOf(id).some((m) => m.table === "Chatbot" && m.key[0] === "d1")).toBe(
+      true,
+    )
+    // The reverse order still ships the delete.
+    const gone = chatbot("d9", { groupId: "f1", displayOrder: 2 })
+    const r2 = engine.applyBatch(
+      batch(schema, "org_1", [txn(2, [insert("Chatbot", gone), remove("Chatbot", gone)])]),
+    )
+    expect(deltas(r2.events)[0]!.rows).toEqual([{ table: "Chatbot", key: ["d9"], row: null }])
+  })
+
   it("rejects unsupported queries explicitly and shares identical subscriptions", () => {
     const { engine } = makeEngine()
     liveScope(engine, "Chatbot", [])

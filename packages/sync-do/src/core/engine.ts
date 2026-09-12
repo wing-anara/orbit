@@ -948,7 +948,9 @@ export class SyncEngine {
         })
     }
     // Rows that changed and are members of any subscription travel with their new image; deleted
-    // rows travel as null so clients drop them regardless of membership.
+    // rows travel as null so clients drop them regardless of membership. Changes are folded in
+    // transaction order per key: a delete followed by an insert of the same key travels as the
+    // final image, never as the delete.
     for (const [tableName, changes] of touched) {
       const table = this.rt.table(tableName)
       if (table === undefined) continue
@@ -959,7 +961,8 @@ export class SyncEngine {
           rowUpdates.set(ref, { table: tableName, key: change.key, row: null })
           continue
         }
-        if (rowUpdates.has(ref)) continue
+        const existing = rowUpdates.get(ref)
+        if (existing !== undefined && existing.row !== null) continue
         const isMember =
           this.db.query(`SELECT 1 AS x FROM membership WHERE tbl = ? AND key = ? LIMIT 1`, [
             tableName,
