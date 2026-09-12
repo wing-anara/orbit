@@ -69,6 +69,14 @@ describe("planQuery", () => {
     expect(p.key).toContain('"table":"Chatbot"')
   })
 
+  it("allows LIKE over a JSON column, which is stored as text", () => {
+    const r = planQuery(rt, {
+      table: "Chatbot",
+      where: { op: "like", column: "contents", pattern: "%Ada%" },
+    })
+    expect(Result.isSuccess(r)).toBe(true)
+  })
+
   it("rejects unsupported forms explicitly", () => {
     const failures = [
       { table: "nope" },

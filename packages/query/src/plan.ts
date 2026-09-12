@@ -117,8 +117,9 @@ const valueMatchesKind = (kind: ValueKind, value: Scalar): boolean => {
 /** Ops allowed per kind. Range comparisons need a total order that SQLite reproduces. */
 const allowedOps = (kind: ValueKind): ReadonlySet<string> => {
   switch (kind) {
+    // JSON travels and is stored as text, so LIKE over that text is the one search it allows.
     case "json":
-      return new Set(["isNull", "isNotNull"])
+      return new Set(["isNull", "isNotNull", "like"])
     case "bytes":
     case "decimal":
       return new Set(["eq", "ne", "in", "isNull", "isNotNull"])
