@@ -47,6 +47,7 @@ fn schema() -> SyncSchema {
             "varchar(64)".into()
         },
         enum_values: None,
+        derived: None,
     };
     let mut s = SyncSchema {
         format_version: 1,

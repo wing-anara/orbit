@@ -111,6 +111,41 @@ pub struct ColumnSchema {
     /// Allowed values for enum columns, in definition order (index 1 is the first value).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<String>>,
+    /// Set when the engine computes this column from a source column instead of reading it.
+    /// A derived column is a non-nullable `bool`; the source column itself need not be synced,
+    /// so its value never leaves the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<DerivedColumn>,
+}
+
+/// How the engine computes a derived column. Both the live stream and every fill apply the rule
+/// to the raw source cell, so the value is the same on every path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedColumn {
+    /// Source column in the live table.
+    pub from: String,
+    pub rule: DerivedRule,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DerivedRule {
+    /// `true` when the source cell is not NULL.
+    NotNull,
+    /// `true` when the source cell is not NULL and its text starts with `prefix`.
+    StartsWith { prefix: String },
+}
+
+impl DerivedRule {
+    /// Applies the rule to a raw source cell (`None` is SQL NULL).
+    pub fn apply(&self, raw: Option<&[u8]>) -> bool {
+        match (self, raw) {
+            (_, None) => false,
+            (DerivedRule::NotNull, Some(_)) => true,
+            (DerivedRule::StartsWith { prefix }, Some(bytes)) => bytes.starts_with(prefix.as_bytes()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -180,6 +215,28 @@ impl SyncSchema {
             let cols: IndexMap<&str, &ColumnSchema> = t.columns.iter().map(|c| (c.name.as_str(), c)).collect();
             if cols.len() != t.columns.len() {
                 errors.push(SchemaValidationError::DuplicateColumn { table: t.name.clone() });
+            }
+            for c in &t.columns {
+                let Some(derived) = &c.derived else { continue };
+                if c.kind != ValueKind::Bool || c.nullable {
+                    errors.push(SchemaValidationError::DerivedColumnShape {
+                        table: t.name.clone(),
+                        column: c.name.clone(),
+                    });
+                }
+                let source_is_derived = cols.get(derived.from.as_str()).is_some_and(|s| s.derived.is_some());
+                if derived.from == c.name || source_is_derived {
+                    errors.push(SchemaValidationError::DerivedFromDerived {
+                        table: t.name.clone(),
+                        column: c.name.clone(),
+                    });
+                }
+                if t.primary_key.contains(&c.name) || t.partition_column == c.name {
+                    errors.push(SchemaValidationError::DerivedKeyColumn {
+                        table: t.name.clone(),
+                        column: c.name.clone(),
+                    });
+                }
             }
             if t.primary_key.is_empty() {
                 errors.push(SchemaValidationError::EmptyPrimaryKey { table: t.name.clone() });
@@ -350,6 +407,12 @@ pub enum SchemaValidationError {
         column: String,
         kind: ValueKind,
     },
+    #[error("table {table}: derived column {column} must be a non-nullable bool")]
+    DerivedColumnShape { table: String, column: String },
+    #[error("table {table}: derived column {column} must derive from a plain source column")]
+    DerivedFromDerived { table: String, column: String },
+    #[error("table {table}: derived column {column} cannot be a primary key or partition column")]
+    DerivedKeyColumn { table: String, column: String },
     #[error("table {table}: partition column {column} has kind {got:?}, expected {expected:?}")]
     PartitionColumnKind {
         table: String,
@@ -551,6 +614,7 @@ mod tests {
                             nullable: false,
                             source_type: "varchar(191)".into(),
                             enum_values: None,
+                            derived: None,
                         },
                         ColumnSchema {
                             name: "name".into(),
@@ -558,6 +622,7 @@ mod tests {
                             nullable: false,
                             source_type: "text".into(),
                             enum_values: None,
+                            derived: None,
                         },
                     ],
                     relations: vec![],
@@ -574,6 +639,7 @@ mod tests {
                             nullable: false,
                             source_type: "varchar(191)".into(),
                             enum_values: None,
+                            derived: None,
                         },
                         ColumnSchema {
                             name: "organizationId".into(),
@@ -581,6 +647,7 @@ mod tests {
                             nullable: true,
                             source_type: "varchar(191)".into(),
                             enum_values: None,
+                            derived: None,
                         },
                         ColumnSchema {
                             name: "groupId".into(),
@@ -588,6 +655,7 @@ mod tests {
                             nullable: true,
                             source_type: "varchar(191)".into(),
                             enum_values: None,
+                            derived: None,
                         },
                         ColumnSchema {
                             name: "type".into(),
@@ -595,6 +663,7 @@ mod tests {
                             nullable: false,
                             source_type: "enum('DOCUMENT','GROUP')".into(),
                             enum_values: Some(vec!["DOCUMENT".into(), "GROUP".into()]),
+                            derived: None,
                         },
                         ColumnSchema {
                             name: "deleted".into(),
@@ -602,6 +671,7 @@ mod tests {
                             nullable: false,
                             source_type: "tinyint(1)".into(),
                             enum_values: None,
+                            derived: None,
                         },
                     ],
                     relations: vec![
@@ -636,6 +706,69 @@ mod tests {
         let mut changed = sample();
         changed.tables[1].columns.pop();
         assert_ne!(changed.compute_hash(), s.schema_hash);
+    }
+
+    #[test]
+    fn derived_columns_must_be_plain_bools_off_the_key() {
+        let derived = |name: &str, from: &str, kind: ValueKind, nullable: bool| ColumnSchema {
+            name: name.into(),
+            kind,
+            nullable,
+            source_type: "derived".into(),
+            enum_values: None,
+            derived: Some(DerivedColumn {
+                from: from.into(),
+                rule: DerivedRule::NotNull,
+            }),
+        };
+        let mut ok = sample();
+        ok.tables[0]
+            .columns
+            .push(derived("named", "name", ValueKind::Bool, false));
+        ok.schema_hash = ok.compute_hash();
+        ok.validate().unwrap();
+
+        let mut bad = sample();
+        bad.tables[0]
+            .columns
+            .push(derived("wrong", "name", ValueKind::String, true));
+        bad.tables[0]
+            .columns
+            .push(derived("self_ref", "self_ref", ValueKind::Bool, false));
+        bad.tables[0]
+            .columns
+            .push(derived("chained", "wrong", ValueKind::Bool, false));
+        bad.tables[0]
+            .columns
+            .push(derived("keyed", "name", ValueKind::Bool, false));
+        bad.tables[0].primary_key.push("keyed".into());
+        bad.schema_hash = bad.compute_hash();
+        let errs = bad.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, SchemaValidationError::DerivedColumnShape { column, .. } if column == "wrong"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, SchemaValidationError::DerivedFromDerived { column, .. } if column == "self_ref"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, SchemaValidationError::DerivedFromDerived { column, .. } if column == "chained"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, SchemaValidationError::DerivedKeyColumn { column, .. } if column == "keyed"))
+        );
+        assert_eq!(
+            DerivedRule::StartsWith { prefix: "gs://".into() }.apply(Some(b"gs://x")),
+            true
+        );
+        assert_eq!(
+            DerivedRule::StartsWith { prefix: "gs://".into() }.apply(Some(b"s3://x")),
+            false
+        );
+        assert_eq!(DerivedRule::NotNull.apply(None), false);
     }
 
     #[test]
@@ -676,6 +809,7 @@ mod tests {
                     nullable: false,
                     source_type: "varchar(191)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "entityId".into(),
@@ -683,6 +817,7 @@ mod tests {
                     nullable: false,
                     source_type: "varchar(191)".into(),
                     enum_values: None,
+                    derived: None,
                 },
             ],
             relations: vec![],

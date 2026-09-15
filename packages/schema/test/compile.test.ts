@@ -263,6 +263,79 @@ describe("runtime", () => {
     expect(compatibility(artifact, newer)).toMatchObject({ compatible: false })
   })
 
+  it("derived columns compile to non-nullable bools with their rule and type as booleans", async () => {
+    const withDerived = defineSyncSchema({
+      app: "fixture",
+      introspected,
+      partition: { name: "org", kind: "string" },
+      tables: {
+        Chatbot: {
+          partitionBy: "organizationId",
+          columns: ["id", "organizationId", "type"],
+          derived: {
+            hasContents: { from: "contents", rule: { kind: "not_null" } },
+            isDocument: { from: "type", rule: { kind: "starts_with", prefix: "DOC" } },
+          },
+        },
+      },
+    })
+    const artifact = await Effect.runPromise(compileSyncSchema(withDerived))
+    const table = artifact.tables.find((t) => t.name === "Chatbot")
+    expect(table?.columns.map((c) => c.name)).toEqual([
+      "id",
+      "organizationId",
+      "type",
+      "hasContents",
+      "isDocument",
+    ])
+    expect(table?.columns.find((c) => c.name === "hasContents")).toEqual({
+      name: "hasContents",
+      kind: "bool",
+      nullable: false,
+      source_type: "derived",
+      derived: { from: "contents", rule: { kind: "not_null" } },
+    })
+    // The source column is not synced: only the booleans reach the cache.
+    expect(table?.columns.some((c) => c.name === "contents")).toBe(false)
+    type Row = RowOf<typeof withDerived, "Chatbot">
+    const row: Row = {
+      id: "c1",
+      organizationId: "o",
+      type: "DOCUMENT",
+      hasContents: true,
+      isDocument: false,
+    }
+    // @ts-expect-error a derived column is a boolean
+    const bad: Row = { ...row, hasContents: "yes" }
+    expect([row, bad].length).toBe(2)
+
+    const broken = defineSyncSchema({
+      app: "fixture",
+      introspected,
+      partition: { name: "org", kind: "string" },
+      tables: {
+        Chatbot: {
+          partitionBy: "organizationId",
+          derived: {
+            type: { from: "contents", rule: { kind: "not_null" } },
+            // @ts-expect-error not a column
+            missing: { from: "nope", rule: { kind: "not_null" } },
+          },
+        },
+      },
+    })
+    const result = await Effect.runPromise(Effect.result(compileSyncSchema(broken)))
+    expect(result._tag).toBe("Failure")
+    if (result._tag === "Failure") {
+      expect(result.failure.problems).toContain(
+        "table Chatbot: derived column type has the name of a source column",
+      )
+      expect(result.failure.problems).toContain(
+        "table Chatbot: derived column missing reads unknown column nope",
+      )
+    }
+  })
+
   it("migration planning", async () => {
     const artifact = await Effect.runPromise(compileSyncSchema(definition))
     expect(planMigration(artifact, [], null).action).toBe("create")

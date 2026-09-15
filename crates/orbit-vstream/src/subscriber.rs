@@ -387,6 +387,7 @@ mod tests {
                     nullable: false,
                     source_type: "varchar(1)".into(),
                     enum_values: None,
+                    derived: None,
                 }],
                 relations: vec![],
             }],

@@ -200,6 +200,17 @@
             "type": "string"
           },
           "description": "Allowed values for enum columns, in definition order (index 1 is the first value)."
+        },
+        "derived": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DerivedColumn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when the engine computes this column from a source column instead of reading it.\nA derived column is a non-nullable `bool`; the source column itself need not be synced,\nso its value never leaves the engine."
         }
       },
       "required": [
@@ -207,6 +218,60 @@
         "kind",
         "nullable",
         "source_type"
+      ]
+    },
+    "DerivedColumn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Source column in the live table."
+        },
+        "rule": {
+          "$ref": "#/$defs/DerivedRule"
+        }
+      },
+      "required": [
+        "from",
+        "rule"
+      ],
+      "description": "How the engine computes a derived column. Both the live stream and every fill apply the rule\nto the raw source cell, so the value is the same on every path."
+    },
+    "DerivedRule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "not_null"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "description": "`true` when the source cell is not NULL."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prefix": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "starts_with"
+            }
+          },
+          "required": [
+            "kind",
+            "prefix"
+          ],
+          "description": "`true` when the source cell is not NULL and its text starts with `prefix`."
+        }
       ]
     },
     "RelationSchema": {

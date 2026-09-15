@@ -279,13 +279,16 @@ pub async fn run_derived_fill(
             .filter_map(|row| row.into_iter().next().flatten())
             .collect();
 
-        // 3. The child rows, in chunks, projected like CDC rows.
-        let columns = table_schema
-            .columns
-            .iter()
-            .map(|c| quote_ident(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // 3. The child rows, in chunks, projected like CDC rows. Derived columns read their
+        //    source column, selected once.
+        let mut selected: Vec<&str> = Vec::with_capacity(table_schema.columns.len());
+        for c in &table_schema.columns {
+            let source = c.derived.as_ref().map_or(c.name.as_str(), |d| d.from.as_str());
+            if !selected.contains(&source) {
+                selected.push(source);
+            }
+        }
+        let columns = selected.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
         let mut rows: Vec<Row> = Vec::new();
         for chunk in keys.chunks(DERIVED_FILL_CHUNK) {
             let list = chunk

@@ -74,6 +74,17 @@ export interface RelationConfig<Tables extends string> {
   readonly toColumns: ReadonlyArray<string>
 }
 
+/** How the engine computes a derived column from the raw cell of its source column. */
+export type DerivedRule =
+  | { readonly kind: "not_null" }
+  | { readonly kind: "starts_with"; readonly prefix: string }
+
+export interface DerivedColumnConfig<I extends IntrospectedShape, N extends string> {
+  /** Source column of the live table. It need not be synced; then its value stays in the engine. */
+  readonly from: ColumnNamesOf<I, N>
+  readonly rule: DerivedRule
+}
+
 export interface TableConfig<I extends IntrospectedShape, N extends string, Tables extends string> {
   /**
    * Column holding the partition key. With `partitionVia`, the column holds the primary key of
@@ -87,6 +98,11 @@ export interface TableConfig<I extends IntrospectedShape, N extends string, Tabl
   readonly partitionVia?: Tables
   /** Columns to sync; defaults to all columns. Primary key and partition columns are always included. */
   readonly columns?: ReadonlyArray<ColumnNamesOf<I, N>>
+  /**
+   * Non-nullable boolean columns the engine computes from a source column (see
+   * docs/adding-tables.md, "Derived columns"). Keys are the new column names.
+   */
+  readonly derived?: Readonly<Record<string, DerivedColumnConfig<I, N>>>
   readonly relations?: Readonly<Record<string, RelationConfig<Tables>>>
 }
 
@@ -123,7 +139,11 @@ type SelectedColumns<I extends IntrospectedShape, N extends string, Cfg> = Cfg e
       | (Cfg extends { readonly partitionBy: infer P extends string } ? P : never)
   : ColumnNamesOf<I, N>
 
-/** The row type of a synced table. */
+type DerivedNames<Cfg> = Cfg extends { readonly derived: infer R }
+  ? Extract<keyof R, string>
+  : never
+
+/** The row type of a synced table: the selected columns plus the derived booleans. */
 export type RowOf<D, N extends string> =
   D extends SyncSchemaDefinition<infer I, infer T>
     ? N extends keyof T
@@ -131,7 +151,7 @@ export type RowOf<D, N extends string> =
           readonly [C in Extract<SelectedColumns<I, N, T[N]>, ColumnNamesOf<I, N>>]: CellType<
             ColumnOf<I, N, C>
           >
-        }
+        } & { readonly [K in DerivedNames<T[N]>]: boolean }
       : never
     : never
 

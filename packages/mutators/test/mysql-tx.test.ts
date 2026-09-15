@@ -24,6 +24,62 @@ const colOf = (name: string) => itemTable.columns.find((c) => c.name === name)!
 const ITEM_COLUMNS =
   "`id`, `org`, `name`, `flag`, `n`, `big`, `price`, `meta`, `at`, `day`, `tm`, `data`, `score`, `parentId`"
 
+describe("createMysqlTx derived columns", () => {
+  const withDerived: typeof schema = {
+    ...schema,
+    tables: schema.tables.map((t) =>
+      t.name !== "_orbit_mut"
+        ? t
+        : {
+            ...t,
+            columns: [
+              ...t.columns,
+              {
+                name: "hasMeta",
+                kind: "bool",
+                nullable: false,
+                source_type: "derived",
+                derived: { from: "meta", rule: { kind: "not_null" } },
+              },
+            ],
+          },
+    ),
+  }
+  const drt = new SchemaRuntime(withDerived)
+
+  it("drops derived columns from writes and computes them on reads", async () => {
+    const { tx, log } = fakeTx(() => [
+      {
+        id: "i1",
+        org: "org_1",
+        name: "n",
+        flag: 1,
+        n: null,
+        big: null,
+        price: null,
+        meta: null,
+        at: null,
+        day: null,
+        tm: null,
+        data: null,
+        score: null,
+        parentId: null,
+        hasMeta: 0,
+      },
+    ])
+    const m = createMysqlTx<Sync>(drt, tx, "m")
+    await m.insert("_orbit_mut", { id: "i1", org: "org_1", name: "n", hasMeta: true } as never)
+    await m.update("_orbit_mut", { id: "i1" }, { hasMeta: false, name: "m" } as never)
+    const row = (await m.get("_orbit_mut", { id: "i1" })) as Record<string, unknown> | null
+    expect(log[0]?.sql).toBe("INSERT INTO `_orbit_mut` (`id`, `org`, `name`) VALUES (?, ?, ?)")
+    expect(log[1]?.sql).toBe("UPDATE `_orbit_mut` SET `name` = ? WHERE `id` = ?")
+    expect(log[2]?.sql).toBe(
+      `SELECT ${ITEM_COLUMNS}, (\`meta\` IS NOT NULL) AS \`hasMeta\` FROM \`_orbit_mut\` WHERE \`id\` = ?`,
+    )
+    expect(row?.["hasMeta"]).toBe(false)
+  })
+})
+
 describe("createMysqlTx writes", () => {
   it("inserts only the given columns with wire values converted per kind", async () => {
     const { tx, log } = fakeTx()

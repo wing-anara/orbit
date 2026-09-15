@@ -45,6 +45,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: false,
                         source_type: "varchar(191)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "name".into(),
@@ -52,6 +53,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: false,
                         source_type: "text".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "created_at".into(),
@@ -59,6 +61,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: false,
                         source_type: "timestamp".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "hipaa_enabled".into(),
@@ -66,6 +69,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: false,
                         source_type: "tinyint(1)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                 ],
                 relations: vec![],
@@ -82,6 +86,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: false,
                         source_type: "varchar(191)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "organizationId".into(),
@@ -89,6 +94,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "varchar(191)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "groupId".into(),
@@ -96,6 +102,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "varchar(191)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "type".into(),
@@ -103,6 +110,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: false,
                         source_type: "enum('DOCUMENT','GROUP')".into(),
                         enum_values: Some(vec!["DOCUMENT".into(), "GROUP".into()]),
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "displayOrder".into(),
@@ -110,6 +118,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "int".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "contents".into(),
@@ -117,6 +126,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "json".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "createdAt".into(),
@@ -124,6 +134,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: false,
                         source_type: "datetime(3)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "score".into(),
@@ -131,6 +142,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "double".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "big".into(),
@@ -138,6 +150,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "bigint unsigned".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "price".into(),
@@ -145,6 +158,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "decimal(10,2)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "blob".into(),
@@ -152,6 +166,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "blob".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "day".into(),
@@ -159,6 +174,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "date".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "at".into(),
@@ -166,6 +182,7 @@ fn sample_schema() -> SyncSchema {
                         nullable: true,
                         source_type: "time(3)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                 ],
                 relations: vec![

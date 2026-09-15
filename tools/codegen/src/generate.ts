@@ -110,10 +110,18 @@ export const emitExpr = (schema: JsonSchema, path: string, indent: string): stri
   if (schema === false) throw new CodegenError(`${path}: the 'false' schema has no representation`)
   if (schema.$ref !== undefined) return refName(schema.$ref)
   if (schema.oneOf !== undefined || schema.anyOf !== undefined) {
-    const members = (schema.oneOf ?? schema.anyOf ?? []).map((m, i) =>
-      emitExpr(m, `${path}[${i}]`, indent + "  "),
-    )
-    return `Schema.Union([\n${members.map((m) => `${indent}  ${m},`).join("\n")}\n${indent}])`
+    // `Option<T>` of a referenced type serializes as `anyOf: [T, null]`.
+    const all = schema.oneOf ?? schema.anyOf ?? []
+    const isNull = (m: JsonSchema) => isObjectSchema(m) && m.type === "null"
+    const nullable = all.some(isNull)
+    const members = all
+      .filter((m) => !isNull(m))
+      .map((m, i) => emitExpr(m, `${path}[${i}]`, indent + "  "))
+    const inner =
+      members.length === 1
+        ? (members[0] ?? "")
+        : `Schema.Union([\n${members.map((m) => `${indent}  ${m},`).join("\n")}\n${indent}])`
+    return nullable ? `Schema.NullOr(${inner})` : inner
   }
   if (schema.const !== undefined) {
     if (

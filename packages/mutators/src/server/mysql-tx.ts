@@ -15,6 +15,7 @@ import {
   attachIncludes,
   compileIncludeSelect,
   compileSelect,
+  derivedColumnSql,
   flattenIncludes,
   flattenNode,
   mysqlDialect,
@@ -73,6 +74,8 @@ export const createMysqlTx = <D>(rt: SchemaRuntime, sql: SqlTx, mutator: string)
     for (const [name, value] of entriesOf(values)) {
       if (value === undefined) continue
       const column = columnOf(table, name)
+      // The engine computes derived columns; a mutator's value for one is local-only.
+      if (column.derived !== undefined && column.derived !== null) continue
       columns.push(name)
       slots.push(placeholder(column, value))
       params.push(toParam(column, value))
@@ -193,7 +196,12 @@ export const createMysqlTx = <D>(rt: SchemaRuntime, sql: SqlTx, mutator: string)
   async function get(name: string, key: object): Promise<object | null> {
     const table = tableOf(name)
     const where = whereKey(table, key)
-    const columns = table.columns.map((c) => ident(c.name)).join(", ")
+    const columns = table.columns
+      .map((c) => {
+        const derived = derivedColumnSql(mysqlDialect, c, null)
+        return derived === null ? ident(c.name) : `${derived} AS ${ident(c.name)}`
+      })
+      .join(", ")
     const rows = await sql.query(
       `SELECT ${columns} FROM ${ident(name)} WHERE ${where.sql}`,
       where.params,

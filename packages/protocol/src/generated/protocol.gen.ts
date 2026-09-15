@@ -162,6 +162,30 @@ export const CdcBatchAck = Schema.Union([
 ])
 export type CdcBatchAck = typeof CdcBatchAck.Type
 
+export const DerivedRule = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("not_null"),
+  }),
+  Schema.Struct({
+    prefix: Schema.String,
+    kind: Schema.Literal("starts_with"),
+  }),
+])
+export type DerivedRule = typeof DerivedRule.Type
+
+/**
+ * How the engine computes a derived column. Both the live stream and every fill apply the rule
+ * to the raw source cell, so the value is the same on every path.
+ */
+export const DerivedColumn = Schema.Struct({
+  /**
+   * Source column in the live table.
+   */
+  from: Schema.String,
+  rule: DerivedRule,
+})
+export type DerivedColumn = typeof DerivedColumn.Type
+
 /**
  * How a column's values are encoded on the wire and typed in consumers.
  */
@@ -180,6 +204,12 @@ export const ColumnSchema = Schema.Struct({
    * Allowed values for enum columns, in definition order (index 1 is the first value).
    */
   enum_values: Schema.optionalKey(Schema.NullOr(Schema.Array(Schema.String))),
+  /**
+   * Set when the engine computes this column from a source column instead of reading it.
+   * A derived column is a non-nullable `bool`; the source column itself need not be synced,
+   * so its value never leaves the engine.
+   */
+  derived: Schema.optionalKey(Schema.NullOr(DerivedColumn)),
 })
 export type ColumnSchema = typeof ColumnSchema.Type
 
@@ -324,12 +354,10 @@ export const IntrospectedSchema = Schema.Struct({
 })
 export type IntrospectedSchema = typeof IntrospectedSchema.Type
 
-export const PlacementConfig = Schema.Union([
-  Schema.Struct({
+export const PlacementConfig = Schema.Struct({
     version: NonNegativeInt,
     strategy: Schema.Literal("one_per_partition"),
-  }),
-])
+  })
 export type PlacementConfig = typeof PlacementConfig.Type
 
 /**

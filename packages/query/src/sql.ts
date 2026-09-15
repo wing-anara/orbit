@@ -12,6 +12,7 @@
  */
 
 import type {
+  ColumnSchema,
   ComparisonOp,
   Predicate,
   Scalar,
@@ -198,13 +199,41 @@ const compilePredicate = (
   }
 }
 
+const mysqlString = (text: string): string =>
+  `'${text.replaceAll("\\", "\\\\").replaceAll("'", "''")}'`
+
+/**
+ * The expression that computes a derived column from its source column in MySQL, where only the
+ * source column exists. Null for plain columns and for the local cache, which stores the value.
+ */
+export const derivedColumnSql = (
+  dialect: Dialect,
+  column: ColumnSchema,
+  alias: string | null,
+): string | null => {
+  const derived = column.derived
+  if (derived === undefined || derived === null || dialect.name !== "mysql") return null
+  const src =
+    alias === null ? dialect.ident(derived.from) : `${alias}.${dialect.ident(derived.from)}`
+  switch (derived.rule.kind) {
+    case "not_null":
+      return `(${src} IS NOT NULL)`
+    case "starts_with": {
+      const prefix = derived.rule.prefix
+      return `(${src} IS NOT NULL AND LEFT(${src}, ${Array.from(prefix).length}) = ${mysqlString(prefix)})`
+    }
+  }
+}
+
 /** Select list that returns wire-shaped values: bigint as text, everything else raw. */
 const selectList = (dialect: Dialect, table: TableSchema, alias: string): string => {
-  const cols = table.columns.map((c) =>
-    c.kind === "bigint" && dialect.name === "sqlite"
+  const cols = table.columns.map((c) => {
+    const derived = derivedColumnSql(dialect, c, alias)
+    if (derived !== null) return `${derived} AS ${dialect.ident(c.name)}`
+    return c.kind === "bigint" && dialect.name === "sqlite"
       ? `CAST(${alias}.${dialect.ident(c.name)} AS TEXT) AS ${dialect.ident(c.name)}`
-      : `${alias}.${dialect.ident(c.name)}`,
-  )
+      : `${alias}.${dialect.ident(c.name)}`
+  })
   if (dialect.hasKeyColumn)
     cols.unshift(`${alias}.${dialect.ident(KEY_COLUMN)} AS ${dialect.ident(KEY_COLUMN)}`)
   return cols.join(", ")

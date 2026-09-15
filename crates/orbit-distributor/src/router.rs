@@ -264,6 +264,7 @@ mod tests {
                         nullable: false,
                         source_type: "varchar(1)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "org".into(),
@@ -271,6 +272,7 @@ mod tests {
                         nullable: true,
                         source_type: "varchar(1)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                 ],
                 relations: vec![],
@@ -395,6 +397,7 @@ mod tests {
                     nullable: false,
                     source_type: "varchar(1)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "pid".into(),
@@ -402,6 +405,7 @@ mod tests {
                     nullable: true,
                     source_type: "varchar(1)".into(),
                     enum_values: None,
+                    derived: None,
                 },
             ],
             relations: vec![],

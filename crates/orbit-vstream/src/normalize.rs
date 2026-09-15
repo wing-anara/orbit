@@ -39,15 +39,26 @@ impl TableProjection {
     pub fn build(schema: &TableSchema, fields: &TableFields) -> Result<Self, VStreamError> {
         let mut columns = Vec::with_capacity(schema.columns.len());
         for col in &schema.columns {
+            // A derived column reads its source cell; the source need not be synced.
+            let source = col.derived.as_ref().map_or(col.name.as_str(), |d| d.from.as_str());
             let (idx, field) = fields
                 .fields
                 .iter()
                 .enumerate()
-                .find(|(_, f)| f.name == col.name)
+                .find(|(_, f)| f.name == source)
                 .ok_or_else(|| VStreamError::SchemaMismatch {
                     table: schema.name.clone(),
-                    message: format!("synced column {} is missing from the live table", col.name),
+                    message: format!("synced column {source} is missing from the live table"),
                 })?;
+            if col.derived.is_some() {
+                columns.push(ProjectedColumn {
+                    schema: col.clone(),
+                    field_index: idx,
+                    live_enum_values: None,
+                    is_set: false,
+                });
+                continue;
+            }
             let live_kind = live_kind(field);
             if live_kind != col.kind {
                 return Err(VStreamError::SchemaMismatch {
@@ -127,6 +138,9 @@ impl TableProjection {
     }
 
     fn cell(&self, col: &ProjectedColumn, raw: Option<&[u8]>) -> Result<CellValue, VStreamError> {
+        if let Some(derived) = &col.schema.derived {
+            return Ok(CellValue::Bool(derived.rule.apply(raw)));
+        }
         let Some(bytes) = raw else {
             if !col.schema.nullable {
                 return Err(self.norm_err(&col.schema.name, "NULL in a non-nullable column"));
@@ -277,13 +291,19 @@ pub fn kind_from_vitess_type(ty: i32) -> ValueKind {
 pub fn query_fields(schema: &TableSchema, fields: &[Field]) -> Result<TableFields, VStreamError> {
     let mut out = Vec::with_capacity(schema.columns.len());
     for col in &schema.columns {
+        let source = col.derived.as_ref().map_or(col.name.as_str(), |d| d.from.as_str());
         let field = fields
             .iter()
-            .find(|f| f.name == col.name)
+            .find(|f| f.name == source)
             .ok_or_else(|| VStreamError::SchemaMismatch {
                 table: schema.name.clone(),
-                message: format!("synced column {} is missing from the query result", col.name),
+                message: format!("synced column {source} is missing from the query result"),
             })?;
+        if col.derived.is_some() {
+            // The rule reads the raw cell; its type does not matter.
+            out.push(field.clone());
+            continue;
+        }
         let live = if field.column_type.is_empty() {
             let vitess_kind = kind_from_vitess_type(field.r#type);
             let compatible = vitess_kind == col.kind || (col.kind == ValueKind::Bool && vitess_kind == ValueKind::Int);
@@ -349,6 +369,7 @@ mod tests {
                         nullable: false,
                         source_type: "varchar(32)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "org".into(),
@@ -356,6 +377,7 @@ mod tests {
                         nullable: false,
                         source_type: "varchar(32)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "e".into(),
@@ -363,6 +385,7 @@ mod tests {
                         nullable: false,
                         source_type: "enum('A','B','C')".into(),
                         enum_values: Some(vec!["A".into(), "B".into(), "C".into()]),
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "s".into(),
@@ -370,6 +393,7 @@ mod tests {
                         nullable: true,
                         source_type: "set('x','y','z')".into(),
                         enum_values: Some(vec!["x".into(), "y".into(), "z".into()]),
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "b".into(),
@@ -377,6 +401,7 @@ mod tests {
                         nullable: false,
                         source_type: "tinyint(1)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "j".into(),
@@ -384,6 +409,7 @@ mod tests {
                         nullable: true,
                         source_type: "json".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "d".into(),
@@ -391,6 +417,7 @@ mod tests {
                         nullable: true,
                         source_type: "decimal(12,4)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "f".into(),
@@ -398,6 +425,7 @@ mod tests {
                         nullable: true,
                         source_type: "float".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "bl".into(),
@@ -405,6 +433,7 @@ mod tests {
                         nullable: true,
                         source_type: "blob".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "bu".into(),
@@ -412,6 +441,7 @@ mod tests {
                         nullable: true,
                         source_type: "bigint unsigned".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "n".into(),
@@ -419,6 +449,7 @@ mod tests {
                         nullable: true,
                         source_type: "int".into(),
                         enum_values: None,
+                        derived: None,
                     },
                 ],
                 relations: vec![],
@@ -487,6 +518,80 @@ mod tests {
         assert_eq!(row["n"], -5);
         assert_eq!(p.key_of(&row), vec![CellValue::from("r1")]);
         assert_eq!(p.partition_of(&row), "org1");
+    }
+
+    #[test]
+    fn derives_bool_columns_from_an_unsynced_source() {
+        use orbit_protocol::schema::{DerivedColumn, DerivedRule};
+        let mut schema = table_schema();
+        schema.columns.push(ColumnSchema {
+            name: "has_doc".into(),
+            kind: ValueKind::Bool,
+            nullable: false,
+            source_type: "derived".into(),
+            enum_values: None,
+            derived: Some(DerivedColumn {
+                from: "doc".into(),
+                rule: DerivedRule::NotNull,
+            }),
+        });
+        schema.columns.push(ColumnSchema {
+            name: "legacy_doc".into(),
+            kind: ValueKind::Bool,
+            nullable: false,
+            source_type: "derived".into(),
+            enum_values: None,
+            derived: Some(DerivedColumn {
+                from: "doc".into(),
+                rule: DerivedRule::StartsWith { prefix: "gs://".into() },
+            }),
+        });
+        let mut fields = live_fields(true);
+        fields.fields.push(field("doc", "text", PbType::Text));
+        let p = TableProjection::build(&schema, &fields).unwrap();
+        let mut cells: Vec<Option<&str>> = vec![
+            Some("r1"),
+            None,
+            Some("org1"),
+            Some("A"),
+            None,
+            Some("0"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        cells.push(Some("gs://bucket/file.pdf"));
+        let row = p.project(&raw(&cells)).unwrap();
+        assert!(!row.contains_key("doc"));
+        assert_eq!(row["has_doc"], true);
+        assert_eq!(row["legacy_doc"], true);
+        cells[12] = Some("s3://bucket/file.pdf");
+        let row = p.project(&raw(&cells)).unwrap();
+        assert_eq!(row["has_doc"], true);
+        assert_eq!(row["legacy_doc"], false);
+        cells[12] = None;
+        let row = p.project(&raw(&cells)).unwrap();
+        assert_eq!(row["has_doc"], false);
+        assert_eq!(row["legacy_doc"], false);
+
+        // A missing source field is a schema mismatch, like any other synced column.
+        let err = TableProjection::build(&schema, &live_fields(true)).unwrap_err();
+        assert!(matches!(err, VStreamError::SchemaMismatch { .. }));
+
+        // Query results (derived fills) need the source field too, and skip the kind check.
+        let mut query = Vec::new();
+        for f in &live_fields(true).fields {
+            query.push(Field {
+                column_type: String::new(),
+                ..f.clone()
+            });
+        }
+        query.push(field("doc", "", PbType::Text));
+        let checked = query_fields(&schema, &query).unwrap();
+        assert!(checked.fields.iter().filter(|f| f.name == "doc").count() >= 1);
     }
 
     #[test]

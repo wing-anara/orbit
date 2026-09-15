@@ -12,7 +12,7 @@ import {
   type TableSchema,
 } from "@orbit/protocol"
 
-import type { IntrospectedShape, SyncSchemaDefinition } from "./define.ts"
+import type { DerivedRule, IntrospectedShape, SyncSchemaDefinition } from "./define.ts"
 
 export class SchemaCompileError extends Data.TaggedError("SchemaCompileError")<{
   readonly problems: ReadonlyArray<string>
@@ -60,6 +60,7 @@ const structuralProblems = <I extends IntrospectedShape, T>(
             partitionBy: string
             partitionVia?: string
             columns?: ReadonlyArray<string>
+            derived?: Record<string, { from: string; rule: DerivedRule }>
             relations?: Record<
               string,
               {
@@ -116,6 +117,14 @@ const structuralProblems = <I extends IntrospectedShape, T>(
     }
     for (const c of tcfg.columns ?? [])
       if (!columns.has(c)) problems.push(`table ${name}: column ${c} does not exist`)
+    for (const [dname, d] of Object.entries(tcfg.derived ?? {})) {
+      if (columns.has(dname))
+        problems.push(`table ${name}: derived column ${dname} has the name of a source column`)
+      if (!columns.has(d.from))
+        problems.push(`table ${name}: derived column ${dname} reads unknown column ${d.from}`)
+      if (it.primary_key.includes(dname) || dname === tcfg.partitionBy)
+        problems.push(`table ${name}: derived column ${dname} cannot be a key column`)
+    }
     for (const pk of it.primary_key) {
       const col = columns.get(pk)
       if (col?.kind === "json" || col?.kind === "float")
@@ -173,6 +182,7 @@ const toArtifact = <I extends IntrospectedShape, T>(
             partitionBy: string
             partitionVia?: string
             columns?: ReadonlyArray<string>
+            derived?: Record<string, { from: string; rule: DerivedRule }>
             relations?: Record<
               string,
               {
@@ -201,6 +211,15 @@ const toArtifact = <I extends IntrospectedShape, T>(
         source_type: c.column_type,
         ...(c.enum_values === undefined ? {} : { enum_values: [...c.enum_values] }),
       }))
+    // Derived columns come last, as plain non-nullable bools with the rule the engine applies.
+    for (const [dname, d] of Object.entries(tcfg.derived ?? {}))
+      columns.push({
+        name: dname,
+        kind: "bool",
+        nullable: false,
+        source_type: "derived",
+        derived: { from: d.from, rule: d.rule },
+      })
     const relations: Array<RelationSchema> = Object.entries(tcfg.relations ?? {}).map(
       ([rname, rel]) => ({
         name: rname,

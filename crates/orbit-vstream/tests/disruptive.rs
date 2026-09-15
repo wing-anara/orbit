@@ -46,6 +46,7 @@ fn schema() -> SyncSchema {
                     nullable: false,
                     source_type: "varchar(64)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "org".into(),
@@ -53,6 +54,7 @@ fn schema() -> SyncSchema {
                     nullable: false,
                     source_type: "varchar(64)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "n".into(),
@@ -60,6 +62,7 @@ fn schema() -> SyncSchema {
                     nullable: true,
                     source_type: "int".into(),
                     enum_values: None,
+                    derived: None,
                 },
             ],
             relations: vec![],

@@ -41,6 +41,7 @@ fn schema() -> SyncSchema {
                     nullable: false,
                     source_type: "varchar(1)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "org".into(),
@@ -48,6 +49,7 @@ fn schema() -> SyncSchema {
                     nullable: true,
                     source_type: "varchar(1)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "n".into(),
@@ -55,6 +57,7 @@ fn schema() -> SyncSchema {
                     nullable: true,
                     source_type: "int".into(),
                     enum_values: None,
+                    derived: None,
                 },
             ],
             relations: vec![],
@@ -656,6 +659,7 @@ fn derived_schema() -> SyncSchema {
         nullable,
         source_type: "varchar(8)".into(),
         enum_values: None,
+        derived: None,
     };
     let mut s = SyncSchema {
         format_version: 1,

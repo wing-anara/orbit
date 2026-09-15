@@ -44,6 +44,7 @@ fn schema() -> SyncSchema {
                     nullable: false,
                     source_type: "varchar(64)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "org".into(),
@@ -51,6 +52,7 @@ fn schema() -> SyncSchema {
                     nullable: false,
                     source_type: "varchar(64)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "n".into(),
@@ -58,6 +60,7 @@ fn schema() -> SyncSchema {
                     nullable: true,
                     source_type: "int".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "flag".into(),
@@ -65,6 +68,7 @@ fn schema() -> SyncSchema {
                     nullable: false,
                     source_type: "tinyint(1)".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "doc".into(),
@@ -72,6 +76,7 @@ fn schema() -> SyncSchema {
                     nullable: true,
                     source_type: "json".into(),
                     enum_values: None,
+                    derived: None,
                 },
                 ColumnSchema {
                     name: "created".into(),
@@ -79,6 +84,7 @@ fn schema() -> SyncSchema {
                     nullable: true,
                     source_type: "datetime(3)".into(),
                     enum_values: None,
+                    derived: None,
                 },
             ],
             relations: vec![],
@@ -324,6 +330,7 @@ async fn schema_drift_is_a_fatal_error() {
         nullable: true,
         source_type: "text".into(),
         enum_values: None,
+        derived: None,
     });
     schema.schema_hash = schema.compute_hash();
     let start = current_position(&config(), &schema).await.unwrap();
@@ -352,6 +359,7 @@ fn derived_schema() -> SyncSchema {
         nullable,
         source_type: source_type.into(),
         enum_values: None,
+        derived: None,
     };
     let mut s = SyncSchema {
         format_version: 1,

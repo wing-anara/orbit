@@ -526,6 +526,51 @@ describe("relation predicates and nested includes", () => {
     expect(all(missing)).toEqual([])
   })
 
+  it("computes derived columns from their source in MySQL and reads them stored in SQLite", () => {
+    const withDerived: typeof schema = {
+      ...schema,
+      tables: schema.tables.map((t) =>
+        t.name !== "Chatbot"
+          ? t
+          : {
+              ...t,
+              columns: [
+                ...t.columns,
+                {
+                  name: "hasContents",
+                  kind: "bool",
+                  nullable: false,
+                  source_type: "derived",
+                  derived: { from: "contents", rule: { kind: "not_null" } },
+                },
+                {
+                  name: "isGroupType",
+                  kind: "bool",
+                  nullable: false,
+                  source_type: "derived",
+                  derived: { from: "type", rule: { kind: "starts_with", prefix: "GR'OU\\P" } },
+                },
+              ],
+            },
+      ),
+    }
+    const drt = new SchemaRuntime(withDerived)
+    const planned = planQuery(drt, {
+      table: "Chatbot",
+      where: { op: "eq", column: "hasContents", value: true },
+    })
+    if (Result.isFailure(planned)) throw new Error(planned.failure.message)
+    const mysql = compileSelect(planned.success, { dialect: mysqlDialect })
+    expect(mysql.sql).toContain("(t.`contents` IS NOT NULL) AS `hasContents`")
+    expect(mysql.sql).toContain(
+      "(t.`type` IS NOT NULL AND LEFT(t.`type`, 7) = 'GR''OU\\\\P') AS `isGroupType`",
+    )
+    expect(mysql.sql).toContain("WHERE (t.`hasContents` = ?)")
+    const sqlite = compileSelect(planned.success)
+    expect(sqlite.sql).toContain('t."hasContents", t."isGroupType" FROM')
+    expect(sqlite.sql).not.toContain("IS NOT NULL) AS")
+  })
+
   it("compiles the MySQL dialect without engine columns", () => {
     const p = plan({
       table: "Chatbot",

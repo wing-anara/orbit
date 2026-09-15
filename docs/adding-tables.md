@@ -45,6 +45,33 @@ The compiler reports every problem at once.
 
 Use the smallest column set the application needs. Every synced column is stored in the Durable Object and in each browser.
 
+## Derived columns
+
+A derived column is a non-nullable `bool` the engine computes from one source column of the live table. The source column does not have to be synced. When it is not, its value never leaves the Rust process: the Durable Object and the browser only see the boolean.
+
+```ts
+Chatbot: {
+  partitionBy: "organizationId",
+  columns: ["id", "name", "type", "organizationId"],
+  derived: {
+    hasDocumentUpload: { from: "documentUrl", rule: { kind: "not_null" } },
+    legacyGcsDocument: {
+      from: "documentUrl",
+      rule: { kind: "starts_with", prefix: "https://storage.googleapis.com" },
+    },
+  },
+},
+```
+
+Two rules exist:
+
+- `not_null`: `true` when the source cell is not `NULL`.
+- `starts_with`: `true` when the source cell is not `NULL` and its text starts with `prefix`.
+
+The engine applies the rule to the raw source cell on every path: the live stream (`crates/orbit-vstream/src/normalize.rs`) and every fill. The artifact lists a derived column after the selected columns, with `kind: "bool"`, `nullable: false`, `source_type: "derived"`, and the rule under `derived`. Queries treat it as a plain boolean column. A derived column cannot be a primary key or the partition column, and it cannot derive from another derived column.
+
+Mutators see derived columns in `RowOf` as `boolean`, so an optimistic insert can carry the value the browser should show. The server side drops derived columns from `INSERT` and `UPDATE` statements and reads them back through the same rule, so the database stays the source of truth.
+
 ## Supported column kinds
 
 The introspection maps MySQL types to a `ValueKind` (`crates/orbit-protocol/src/schema.rs`, `infer_kind`):

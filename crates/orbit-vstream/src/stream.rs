@@ -357,6 +357,7 @@ mod tests {
                         nullable: false,
                         source_type: "varchar(32)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "org".into(),
@@ -364,6 +365,7 @@ mod tests {
                         nullable: false,
                         source_type: "varchar(32)".into(),
                         enum_values: None,
+                        derived: None,
                     },
                     ColumnSchema {
                         name: "n".into(),
@@ -371,6 +373,7 @@ mod tests {
                         nullable: true,
                         source_type: "int".into(),
                         enum_values: None,
+                        derived: None,
                     },
                 ],
                 relations: vec![],
