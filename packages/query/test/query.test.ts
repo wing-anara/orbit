@@ -571,6 +571,22 @@ describe("relation predicates and nested includes", () => {
     expect(sqlite.sql).not.toContain("IS NOT NULL) AS")
   })
 
+  it("orders text columns case-insensitively in the cache only", () => {
+    const p = plan({
+      table: "Chatbot",
+      orderBy: [
+        { column: "type", direction: "asc" },
+        { column: "displayOrder", direction: "desc" },
+      ],
+    })
+    expect(compileSelect(p).sql).toContain(
+      'ORDER BY t."type" COLLATE NOCASE ASC, t."displayOrder" DESC',
+    )
+    expect(compileSelect(p, { dialect: mysqlDialect }).sql).toContain(
+      "ORDER BY t.`type` ASC, t.`displayOrder` DESC",
+    )
+  })
+
   it("compiles the MySQL dialect without engine columns", () => {
     const p = plan({
       table: "Chatbot",

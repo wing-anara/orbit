@@ -239,9 +239,20 @@ const selectList = (dialect: Dialect, table: TableSchema, alias: string): string
   return cols.join(", ")
 }
 
+/**
+ * Text columns order case-insensitively in the cache, as MySQL's default collation does, so a
+ * window and the server agree on which rows are first. `NOCASE` folds ASCII only; accents
+ * still order by code point.
+ */
 const orderClause = (dialect: Dialect, planned: PlannedQuery, alias: string): string =>
   planned.orderBy
-    .map((o) => `${alias}.${dialect.ident(o.column)} ${o.direction === "asc" ? "ASC" : "DESC"}`)
+    .map((o) => {
+      const collate =
+        dialect.name === "sqlite" && kindOf(planned.table, o.column) === "string"
+          ? " COLLATE NOCASE"
+          : ""
+      return `${alias}.${dialect.ident(o.column)}${collate} ${o.direction === "asc" ? "ASC" : "DESC"}`
+    })
     .join(", ")
 
 const keyOrder = (dialect: Dialect, table: TableSchema, alias: string): string =>
