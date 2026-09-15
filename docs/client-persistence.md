@@ -84,7 +84,7 @@ The `opfs` database persists these values across reloads:
 - `meta.cursor`, the cursor of the last applied snapshot or delta.
 - `meta.schema_hash` and `meta.partition`.
 
-On open, `ClientEngine.open` restores the persisted subscriptions. Each one is registered with zero application references and gets status `stale` when it was complete, or `pending` otherwise. The engine runs the query against the local store, so the application renders cached rows before the socket opens. The restored cursor is reported in the status.
+On open, `ClientEngine.open` restores the persisted subscriptions. Each one is registered with zero application references and gets status `stale` when it was complete, or `pending` otherwise. The engine runs the query against the local store, so the application renders cached rows before the socket opens. The restored cursor is reported in the status. A restored subscription waits out `queryTtlMs` like a released one: the queries the application subscribes to again within that time stay, the others retire, so a load replays only recent views.
 
 The test `survives a reload` in `packages/client/test/engine.test.ts` confirms this. After a reload the query reports `stale` with the persisted rows. It becomes `live` when the server sends a fresh snapshot.
 
