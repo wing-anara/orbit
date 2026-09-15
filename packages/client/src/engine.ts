@@ -258,6 +258,9 @@ export class ClientEngine {
         const sub = this.register(persisted.id, persisted.ref, planned.success, 0)
         sub.status = persisted.complete ? "stale" : "pending"
         yield* this.refresh(sub)
+        // Restored for the query TTL, like a released query: the views the application opens
+        // again keep it, the rest retires instead of being replayed on every load.
+        yield* this.retain(sub)
       }
       if (this.mutations !== null) yield* this.subscribeClientRow()
       this.updateStatus({ cursor: this.cursor })
@@ -532,6 +535,13 @@ export class ClientEngine {
     return Effect.gen({ self: this }, function* () {
       sub.refs -= 1
       if (sub.refs > 0) return
+      yield* this.retain(sub)
+    })
+  }
+
+  /** Keeps an unreferenced subscription (and its rows) for the query TTL, then retires it. */
+  private retain(sub: Subscription): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function* () {
       const ttl = this.config.queryTtlMs ?? DEFAULT_QUERY_TTL_MS
       if (ttl <= 0) {
         yield* this.retire(sub)

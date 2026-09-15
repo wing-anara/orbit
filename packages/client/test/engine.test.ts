@@ -356,6 +356,37 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it("restored subscriptions retire after the query TTL unless the application references them", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const driver = reloadable(nodeAsyncDriver())
+    const first = makeClient(server, driver, 60)
+    await Effect.runPromise(first.engine.open())
+    const byId = (limit: number) => ({
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" as const }],
+      limit,
+    })
+    const one = await Effect.runPromise(first.engine.subscribe(byId(1)))
+    const two = await Effect.runPromise(first.engine.subscribe(byId(2)))
+    await waitFor(() => server.pendingFills.length === 1, 2000, "fill request")
+    server.completeFill("Chatbot", [chatbot("a"), chatbot("b")])
+    await Effect.runPromise(first.engine.awaitLive(one.id))
+    await Effect.runPromise(first.engine.awaitLive(two.id))
+    await Effect.runPromise(first.engine.close())
+
+    // The reload replays both, references only the first: the second retires after the TTL.
+    const second = makeClient(server, driver, 60)
+    await Effect.runPromise(second.engine.open())
+    const again = await Effect.runPromise(second.engine.subscribe(byId(1)))
+    expect(again.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a"])
+    await Effect.runPromise(second.engine.awaitLive(again.id))
+    await settle(150)
+    const persisted = await driver.query(`SELECT id FROM subscriptions`)
+    expect(persisted.map((r) => r["id"])).toEqual([again.id])
+    expect(again.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a"])
+    await Effect.runPromise(second.engine.close())
+  })
+
   it("reconnects after a drop and resumes with a consistent snapshot", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const { engine, log } = makeClient(server)
