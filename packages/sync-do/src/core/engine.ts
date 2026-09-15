@@ -785,11 +785,15 @@ export class SyncEngine {
         for (const request of requests) events.push({ type: "fill_needed", request })
         if (pending.length > 0)
           return { subscription: p.key, status: "pending", query: p.query, events }
+        // The base's members need no row images: the client has them.
+        const held = seed && base !== null ? this.heldBy(base.id) : undefined
         const snapshot =
           existing?.live !== true
-            ? this.materialize({ id: p.key, planned: p, live: false })
-            : this.snapshot(p.key)
-        events.push(seed ? this.extend(snapshot, base.id) : snapshot)
+            ? this.materialize({ id: p.key, planned: p, live: false }, held)
+            : this.snapshot(p.key, held)
+        events.push(
+          held === undefined || base === null ? snapshot : this.extend(snapshot, base.id, held),
+        )
         return { subscription: p.key, status: "live", query: p.query, events }
       }),
     )
@@ -800,18 +804,13 @@ export class SyncEngine {
    * a subset of the result (a different query, or a result that shrank), the snapshot stays
    * complete: the client then replaces its membership as usual.
    */
-  private extend(event: EngineEvent, base: string): EngineEvent {
+  private extend(event: EngineEvent, base: string, held: ReadonlySet<string>): EngineEvent {
     if (event.type !== "snapshot") return event
-    const held = new Set<string>()
-    for (const row of this.db.query(
-      `SELECT DISTINCT tbl, key FROM membership WHERE subscription = ?`,
-      [base],
-    ))
-      held.add(memberRef(asString(row["tbl"]), asString(row["key"])))
     const wanted = new Set(
       event.members.map((m) => memberRef(m.table, SchemaRuntime.keyString(m.key))),
     )
-    for (const ref of held) if (!wanted.has(ref)) return event
+    // Without the subset property the reduced rows are incomplete: rebuild the full snapshot.
+    for (const ref of held) if (!wanted.has(ref)) return this.snapshot(event.subscription)
     const fresh = (table: string, key: RowKey) =>
       !held.has(memberRef(table, SchemaRuntime.keyString(key)))
     return {
@@ -820,6 +819,17 @@ export class SyncEngine {
       members: event.members.filter((m) => fresh(m.table, m.key)),
       basedOn: base,
     }
+  }
+
+  /** The member references a subscription holds, as `memberRef` strings. */
+  private heldBy(id: string): ReadonlySet<string> {
+    const held = new Set<string>()
+    for (const row of this.db.query(
+      `SELECT DISTINCT tbl, key FROM membership WHERE subscription = ?`,
+      [id],
+    ))
+      held.add(memberRef(asString(row["tbl"]), asString(row["key"])))
+    return held
   }
 
   unsubscribe(id: string): void {
@@ -888,7 +898,7 @@ export class SyncEngine {
    * already present are left alone so a re-materialization of an unchanged result writes
    * nothing but the rows that differ.
    */
-  private materialize(sub: SubscriptionRow): EngineEvent {
+  private materialize(sub: SubscriptionRow, skip?: ReadonlySet<string>): EngineEvent {
     const { members } = this.evaluate(sub.planned)
     const wanted = new Set(members.map((m) => [m.path, m.table, m.key].join(" ")))
     const present = new Set<string>()
@@ -917,11 +927,14 @@ export class SyncEngine {
       )
     }
     this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [sub.id])
-    return this.snapshotFrom(sub.id, members)
+    return this.snapshotFrom(sub.id, members, skip)
   }
 
-  /** Snapshot of a live subscription at the current cursor. */
-  snapshot(id: string): EngineEvent {
+  /**
+   * Snapshot of a live subscription at the current cursor. Members in `skip` are listed without
+   * a row image (a base subscription the client already holds).
+   */
+  snapshot(id: string, skip?: ReadonlySet<string>): EngineEvent {
     const sub = this.subscription(id)
     if (sub === null)
       return {
@@ -936,7 +949,7 @@ export class SyncEngine {
         error: { code: "internal", message: "subscription is pending" },
       }
     const { members } = this.evaluate(sub.planned)
-    return this.snapshotFrom(id, members)
+    return this.snapshotFrom(id, members, skip)
   }
 
   private snapshotFrom(
@@ -946,6 +959,7 @@ export class SyncEngine {
       readonly key: string
       readonly record: SqlRecord
     }>,
+    skip?: ReadonlySet<string>,
   ): EngineEvent {
     // A row can be reached as a primary row and through an include (self relations); membership
     // is a set, so it is listed once.
@@ -959,6 +973,7 @@ export class SyncEngine {
       if (seen.has(ref)) continue
       seen.add(ref)
       refs.push({ table: m.table, key: parseKey(m.key) })
+      if (skip?.has(ref)) continue
       rows.push({ table: m.table, key: parseKey(m.key), row: rowFromRecord(table, m.record) })
     }
     return { type: "snapshot", subscription: id, cursor: this.appliedSeq, rows, members: refs }
