@@ -430,6 +430,32 @@ export class LocalStore {
     })
   }
 
+  /**
+   * The subscriptions whose membership references any of `refs`: the ones a delta over those
+   * rows can change. A subscription that references none of them keeps its result as it is.
+   */
+  subscriptionsHolding(
+    refs: ReadonlyArray<MemberRef>,
+  ): Effect.Effect<ReadonlySet<string>, StoreError> {
+    return Effect.tryPromise({
+      try: async () => {
+        const held = new Set<string>()
+        const CHUNK = 200
+        for (let i = 0; i < refs.length; i += CHUNK) {
+          const chunk = refs.slice(i, i + CHUNK)
+          const rows = await this.driver.query(
+            `SELECT DISTINCT subscription FROM membership WHERE ${chunk.map(() => "(tbl = ? AND key = ?)").join(" OR ")}`,
+            chunk.flatMap((r) => [r.table, SchemaRuntime.keyString(r.key)]),
+          )
+          for (const row of rows)
+            if (typeof row["subscription"] === "string") held.add(row["subscription"])
+        }
+        return held
+      },
+      catch: (e) => this.fail(e),
+    })
+  }
+
   /** Runs a planned query against everything cached locally (completeness is the caller's concern). */
   readLocal(planned: PlannedQuery): Effect.Effect<ReadonlyArray<ResultNode>, StoreError> {
     return this.read(planned, {})

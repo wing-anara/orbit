@@ -269,6 +269,57 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it("re-runs only the queries a delta can change", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine } = makeClient(server)
+    await Effect.runPromise(engine.open())
+    const groupA = await Effect.runPromise(
+      engine.subscribe({
+        table: "Chatbot",
+        where: { op: "eq", column: "groupId", value: "a" },
+        orderBy: [{ column: "id", direction: "asc" }],
+      }),
+    )
+    const groupB = await Effect.runPromise(
+      engine.subscribe({
+        table: "Chatbot",
+        where: { op: "eq", column: "groupId", value: "b" },
+        orderBy: [{ column: "id", direction: "asc" }],
+      }),
+    )
+    await waitFor(() => server.pendingFills.length === 1, 2000, "fill request")
+    server.completeFill("Chatbot", [
+      chatbot("a", { type: "GROUP" }),
+      chatbot("b", { type: "GROUP" }),
+      chatbot("d1", { groupId: "a" }),
+      chatbot("d2", { groupId: "b" }),
+    ])
+    await Effect.runPromise(engine.awaitLive(groupA.id))
+    await Effect.runPromise(engine.awaitLive(groupB.id))
+    let notifiedA = 0
+    let notifiedB = 0
+    groupA.subscribe(() => notifiedA++)
+    groupB.subscribe(() => notifiedB++)
+    const snapshotB = groupB.getSnapshot()
+    // A change to a row only group A holds refreshes A and leaves B's snapshot untouched.
+    server.commit([
+      update(
+        "Chatbot",
+        chatbot("d1", { groupId: "a" }),
+        chatbot("d1", { groupId: "a", displayOrder: 5 }),
+      ),
+    ])
+    await waitFor(
+      () => groupA.getSnapshot().rows[0]?.row["displayOrder"] === 5,
+      2000,
+      "update delta",
+    )
+    expect(notifiedA).toBeGreaterThan(0)
+    expect(notifiedB).toBe(0)
+    expect(groupB.getSnapshot()).toBe(snapshotB)
+    await Effect.runPromise(engine.close())
+  })
+
   it("reconnects after a drop and resumes with a consistent snapshot", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const { engine, log } = makeClient(server)

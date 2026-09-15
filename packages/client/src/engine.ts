@@ -611,15 +611,19 @@ export class ClientEngine {
                 yield* this.refreshTables(null, true)
                 return
               }
-              const touched = new Set<string>(message.rows.map((r) => r.table))
+              // Only the subscriptions this delta can change re-run their query: those whose
+              // membership changed and those that hold one of the rows. A large window over
+              // a busy table does not pay for every unrelated change.
               const touchedSubs = new Set<string>(message.memberships.map((m) => m.subscriptionId))
+              const holders =
+                message.rows.length === 0
+                  ? new Set<string>()
+                  : yield* this.store.subscriptionsHolding(
+                      message.rows.map((r) => ({ table: r.table, key: r.key })),
+                    )
               for (const sub of this.subscriptions.values()) {
                 if (sub.status !== "live") continue
-                if (
-                  !touchedSubs.has(sub.id) &&
-                  ![...sub.planned.tables].some((t) => touched.has(t))
-                )
-                  continue
+                if (!touchedSubs.has(sub.id) && !holders.has(sub.id)) continue
                 yield* this.refresh(sub)
               }
             }),
