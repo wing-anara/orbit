@@ -143,6 +143,8 @@ export class FakeSyncServer {
   readonly pendingFills: Array<{ fill_id: string; table: string }> = []
   /** Every reference the server received, in order (for assertions on the wire form). */
   readonly receivedRefs: Array<QueryRef> = []
+  /** The `basedOn` of every subscribe, null when absent, in the order received. */
+  readonly receivedBases: Array<string | null> = []
   /** When false, new sockets never open (simulates the server being unreachable). */
   reachable = true
   /** When true, `close()` leaves the socket in CLOSING forever (a browser that is offline). */
@@ -252,7 +254,7 @@ export class FakeSyncServer {
     if (!session.helloDone) return
     switch (msg.type) {
       case "subscribe":
-        this.subscribe(session, msg.id, msg.query)
+        this.subscribe(session, msg.id, msg.query, msg.basedOn)
         return
       case "unsubscribe": {
         const cs = session.clientSubs.get(msg.id)
@@ -311,14 +313,18 @@ export class FakeSyncServer {
     })
   }
 
-  private subscribe(session: Session, clientSubId: string, ref: QueryRef): void {
+  private subscribe(session: Session, clientSubId: string, ref: QueryRef, basedOn?: string): void {
     this.receivedRefs.push(ref)
+    this.receivedBases.push(basedOn ?? null)
     const query = this.resolve(ref, session)
     if (Result.isFailure(query)) {
       session.socket.deliver({ type: "subscription_error", id: clientSubId, error: query.failure })
       return
     }
-    const outcome = this.engine.subscribe(query.success)
+    const base = basedOn === undefined ? undefined : session.clientSubs.get(basedOn)
+    const outcome = this.engine.subscribe(query.success, {
+      ...(base === undefined || base.status !== "live" ? {} : { basedOn: base.subscription }),
+    })
     if (Result.isFailure(outcome)) {
       session.socket.deliver({
         type: "subscription_error",
@@ -337,7 +343,31 @@ export class FakeSyncServer {
       status: outcome.success.status,
       query: outcome.success.query,
     })
-    this.dispatch(outcome.success.events)
+    // As in the Durable Object: the snapshot of the new subscription goes to this session only,
+    // reduced to the members its base does not hold when the engine extended it.
+    const others: Array<EngineEvent> = []
+    for (const event of outcome.success.events) {
+      if (event.type !== "snapshot" || event.subscription !== outcome.success.subscription) {
+        others.push(event)
+        continue
+      }
+      const cs = session.clientSubs.get(clientSubId)
+      if (cs !== undefined) cs.status = "live"
+      session.socket.deliver({
+        type: "snapshot",
+        subscriptionId: clientSubId,
+        cursor: event.cursor,
+        rows: event.rows,
+        members: event.members,
+        complete: true,
+        ...(event.basedOn !== undefined &&
+        event.basedOn === base?.subscription &&
+        basedOn !== undefined
+          ? { basedOn }
+          : {}),
+      })
+    }
+    this.dispatch(others)
   }
 
   private subscribed(

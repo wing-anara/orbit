@@ -126,12 +126,15 @@ export class MutatorError extends Data.TaggedError("MutatorError")<{
 const isJsonObject = (v: JsonValue): v is { readonly [key: string]: JsonValue } =>
   typeof v === "object" && v !== null && !Array.isArray(v)
 
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v)
+
 /** `undefined` properties are absent on the wire, as `JSON.stringify` treats them. */
 const dropUndefined = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(dropUndefined)
-  if (value !== null && typeof value === "object")
+  if (isRecord(value))
     return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
+      Object.entries(value)
         .filter(([, v]) => v !== undefined)
         .map(([k, v]) => [k, dropUndefined(v)]),
     )

@@ -87,6 +87,13 @@ interface Subscription {
   pendingChunks: { rows: Array<RowUpdate>; members: Array<MemberRef> } | null
   /** Set while the subscription has no references and waits out `queryTtlMs`. */
   retention: ReturnType<typeof setTimeout> | null
+  /** The query as planned locally at registration; identifies a grown window of it. */
+  readonly localQuery: Query
+  /**
+   * The subscription this one extends (`subscribe.basedOn`), pinned until the snapshot arrives
+   * so its rows stay in the cache for the copy of its membership.
+   */
+  basedOn: string | null
 }
 
 export interface EngineConfig {
@@ -421,9 +428,44 @@ export class ClientEngine {
       snapshot: { status: "pending", rows: [], error: null, cursor: null },
       pendingChunks: null,
       retention: null,
+      localQuery: planned.query,
+      basedOn: null,
     }
     this.subscriptions.set(id, sub)
     return sub
+  }
+
+  /**
+   * The live subscription a new one extends: the same query with a smaller limit (a window
+   * that grows on scroll). The largest such window is the base; the server then sends only the
+   * rows the base does not hold.
+   */
+  private growthBase(sub: Subscription): Subscription | null {
+    const limit = sub.localQuery.limit
+    if (limit === undefined) return null
+    const shape = JSON.stringify({ ...sub.localQuery, limit: undefined })
+    let base: Subscription | null = null
+    for (const other of this.subscriptions.values()) {
+      if (other === sub || other.status !== "live") continue
+      const otherLimit = other.localQuery.limit
+      if (otherLimit === undefined || otherLimit >= limit) continue
+      if (isNamedQueryRef(other.ref) !== isNamedQueryRef(sub.ref)) continue
+      if (isNamedQueryRef(other.ref) && isNamedQueryRef(sub.ref) && other.ref.name !== sub.ref.name)
+        continue
+      if (JSON.stringify({ ...other.localQuery, limit: undefined }) !== shape) continue
+      if (base === null || (base.localQuery.limit ?? 0) < otherLimit) base = other
+    }
+    return base
+  }
+
+  /** Releases the pin a subscription holds on its base. */
+  private unpin(sub: Subscription): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function* () {
+      if (sub.basedOn === null) return
+      const base = this.subscriptions.get(sub.basedOn)
+      sub.basedOn = null
+      if (base !== undefined) yield* this.release(base)
+    })
   }
 
   /** Subscribes to a raw query. Identical queries share one subscription. Returns the handle. */
@@ -450,7 +492,19 @@ export class ClientEngine {
       if (fresh) {
         yield* this.store.registerSubscription(id, wire, planned.success.query)
         yield* this.refresh(sub)
-        if (this.send !== null) yield* this.send({ type: "subscribe", id, query: wire })
+        const base = this.growthBase(sub)
+        if (base !== null) {
+          // A reference of its own keeps the base (and its rows) until the snapshot arrives.
+          this.register(base.id, base.ref, base.planned, 1)
+          sub.basedOn = base.id
+        }
+        if (this.send !== null)
+          yield* this.send({
+            type: "subscribe",
+            id,
+            query: wire,
+            ...(base === null ? {} : { basedOn: base.id }),
+          })
         this.updateStatus({ pendingSubscriptions: this.pendingCount() })
       }
       return this.handle(sub)
@@ -499,6 +553,7 @@ export class ClientEngine {
   private retire(sub: Subscription): Effect.Effect<void> {
     return Effect.gen({ self: this }, function* () {
       this.subscriptions.delete(sub.id)
+      yield* this.unpin(sub)
       if (this.send !== null) yield* this.send({ type: "unsubscribe", id: sub.id })
       yield* this.lock.runEffect(this.store.removeSubscription(sub.id)).pipe(Effect.ignore)
       this.updateStatus({ pendingSubscriptions: this.pendingCount() })
@@ -581,9 +636,26 @@ export class ClientEngine {
             return
           }
           sub.pendingChunks = null
+          const basedOn = message.basedOn ?? null
+          if (basedOn !== null && (basedOn !== sub.basedOn || !this.subscriptions.has(basedOn))) {
+            // The server extended a base this client no longer holds (a reconnect in between):
+            // ask for the complete result instead.
+            yield* this.unpin(sub)
+            if (this.send !== null) {
+              yield* this.send({ type: "unsubscribe", id: sub.id })
+              yield* this.send({ type: "subscribe", id: sub.id, query: sub.ref })
+            }
+            return
+          }
           yield* this.lock.runEffect(
             Effect.gen({ self: this }, function* () {
-              yield* this.store.applySnapshot(sub.id, message.cursor, chunks.rows, chunks.members)
+              yield* this.store.applySnapshot(
+                sub.id,
+                message.cursor,
+                chunks.rows,
+                chunks.members,
+                basedOn,
+              )
               this.cursor = message.cursor
               sub.status = "live"
               sub.error = null
@@ -592,11 +664,13 @@ export class ClientEngine {
               else yield* this.refresh(sub)
             }),
           )
+          yield* this.unpin(sub)
           this.updateStatus({ cursor: this.cursor, pendingSubscriptions: this.pendingCount() })
           this.log("snapshot.applied", {
             subscription: sub.id,
             rows: chunks.rows.length,
             cursor: message.cursor,
+            ...(basedOn === null ? {} : { basedOn }),
           })
           return
         }
@@ -649,6 +723,7 @@ export class ClientEngine {
           sub.status = "error"
           sub.error = message.error
           sub.snapshot = { ...sub.snapshot, status: "error", error: message.error }
+          yield* this.unpin(sub)
           for (const l of sub.listeners) l()
           this.log("subscription.error", { subscription: sub.id, code: message.error.code })
           this.updateStatus({ pendingSubscriptions: this.pendingCount() })

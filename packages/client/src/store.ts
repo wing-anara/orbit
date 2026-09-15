@@ -362,10 +362,21 @@ export class LocalStore {
     cursor: number,
     rows: ReadonlyArray<RowUpdate>,
     members: ReadonlyArray<MemberRef>,
+    // A subscription whose membership the snapshot extends: copied in one statement, so a
+    // grown window costs the new members only (see `snapshot.basedOn` in the protocol).
+    basedOn: string | null = null,
   ): Effect.Effect<void, StoreError> {
     const statements: Array<Statement> = [
       ...this.gcStatementsForSubscription(subscription),
       { sql: `DELETE FROM membership WHERE subscription = ?`, params: [subscription] },
+      ...(basedOn === null
+        ? []
+        : [
+            {
+              sql: `INSERT OR IGNORE INTO membership (subscription, tbl, key) SELECT ?, tbl, key FROM membership WHERE subscription = ?`,
+              params: [subscription, basedOn],
+            },
+          ]),
       ...members.map((m) => ({
         sql: `INSERT OR IGNORE INTO membership (subscription, tbl, key) VALUES (?, ?, ?)`,
         params: [subscription, m.table, SchemaRuntime.keyString(m.key)],

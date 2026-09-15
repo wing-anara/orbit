@@ -53,6 +53,12 @@ export const SubscribeMessage = Schema.Struct({
   id: Schema.String,
   /** A named query (the default) or a raw query when the server allows ad-hoc queries. */
   query: QueryRef,
+  /**
+   * A live subscription of this session whose result the new one extends (the same query with a
+   * larger limit). The server may answer with a snapshot that carries only the members the base
+   * does not hold (`snapshot.basedOn`); the client keeps the base until that snapshot arrives.
+   */
+  basedOn: Schema.optionalKey(Schema.String),
 })
 export type SubscribeMessage = typeof SubscribeMessage.Type
 
@@ -143,6 +149,12 @@ export const ServerMessage = Schema.Union([
     rows: Schema.Array(RowUpdate),
     members: Schema.Array(MemberRef),
     complete: Schema.Boolean,
+    /**
+     * When present, the membership of the subscription is the membership of `basedOn` (another
+     * subscription of the session, at this cursor) plus `members`; `rows` carries only the rows
+     * of `members`. The client copies the base membership first.
+     */
+    basedOn: Schema.optionalKey(Schema.String),
   }),
   /**
    * Changes produced by exactly one source transaction. Applied atomically on the client.

@@ -458,6 +458,45 @@ describe("SyncEngine: subscriptions and incremental maintenance", () => {
     expect(engine.status().subscriptions).toBe(0)
   })
 
+  it("extends a live window in place: seeded membership, snapshot of the extra members only", () => {
+    const { engine } = makeEngine()
+    liveScope(engine, "Chatbot", [chatbot("a"), chatbot("b"), chatbot("c"), chatbot("d")])
+    const byId = (limit: number): Query => ({
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" }],
+      limit,
+    })
+    const small = engine.subscribe(byId(2))
+    if (!Result.isSuccess(small)) throw new Error("subscribe failed")
+    const grown = engine.subscribe(byId(3), { basedOn: small.success.subscription })
+    if (!Result.isSuccess(grown)) throw new Error("subscribe failed")
+    const snapshot = grown.success.events.find((e) => e.type === "snapshot")
+    if (snapshot?.type !== "snapshot") throw new Error("no snapshot")
+    expect(snapshot.basedOn).toBe(small.success.subscription)
+    expect(snapshot.members.map((m) => m.key)).toEqual([["c"]])
+    expect(snapshot.rows.map((r) => r.key)).toEqual([["c"]])
+    expect(engine.membershipOf(grown.success.subscription)).toEqual(
+      engine.recompute(grown.success.subscription),
+    )
+    expect(engine.membershipOf(grown.success.subscription).length).toBe(3)
+    // A base that is not a subset of the result: the snapshot stays complete and the seeded
+    // members that do not belong are gone.
+    const other = engine.subscribe({
+      table: "Chatbot",
+      where: { op: "eq", column: "id", value: "d" },
+    })
+    if (!Result.isSuccess(other)) throw new Error("subscribe failed")
+    const full = engine.subscribe(byId(1), { basedOn: other.success.subscription })
+    if (!Result.isSuccess(full)) throw new Error("subscribe failed")
+    const fullSnapshot = full.success.events.find((e) => e.type === "snapshot")
+    if (fullSnapshot?.type !== "snapshot") throw new Error("no snapshot")
+    expect(fullSnapshot.basedOn).toBeUndefined()
+    expect(fullSnapshot.rows.map((r) => r.key)).toEqual([["a"]])
+    expect(engine.membershipOf(full.success.subscription)).toEqual(
+      engine.recompute(full.success.subscription),
+    )
+  })
+
   it("keeps subscriptions pending until every table they touch is live", () => {
     const { engine } = makeEngine()
     liveScope(engine, "Chatbot", [chatbot("d1", { groupId: "f1" })])

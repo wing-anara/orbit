@@ -65,6 +65,8 @@ The server does not resume from `cursor`. It always answers with a fresh snapsho
 
 Large results arrive in chunks of `snapshotChunkRows` (default 500). Only the last chunk carries `members`. The client buffers chunks and applies them as one unit when `complete` is `true`. The row set replaces the client's previous membership for the subscription.
 
+A window that grows on scroll is the same query with a larger limit. The client sends `subscribe` with `basedOn`: the id of the live subscription it extends, which it keeps until the answer arrives. The server seeds the new membership from the base and answers with `snapshot.basedOn` set: `members` and `rows` are then only those the base does not hold, and the client copies the base membership before it applies them. The server omits `basedOn` (a complete snapshot) when the session does not hold the base live, or when the base is not a subset of the result. A client that receives `basedOn` for a base it no longer holds unsubscribes and subscribes again without `basedOn`. On reconnect the client replays its subscriptions without `basedOn`.
+
 `delta` carries the changes of exactly one source transaction.
 
 | Field         | Meaning                                                |

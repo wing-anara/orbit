@@ -658,6 +658,41 @@ describe("client sessions", () => {
     client.ws.close(1000)
   })
 
+  it("extends a window in place when the client names its base", async () => {
+    const p = freshPartition()
+    const client = await connect(p, await token([p]))
+    const byId = (limit: number) => ({
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" }],
+      limit,
+    })
+    client.send(hello(p, [{ id: "w1", query: byId(2) }]))
+    await client.next("welcome")
+    const req = (await pollFills()).requests.find((r) => r.partition === p)!
+    await uploadFill(req.fill_id, [chatbot("a"), chatbot("b"), chatbot("c"), chatbot("d")], 0)
+    expect((await client.next("snapshot")).rows.map((r) => r.key[0])).toEqual(["a", "b"])
+    client.send({ type: "subscribe", id: "w2", query: byId(3) as never, basedOn: "w1" })
+    // The queue still holds w1's own `subscribed` messages.
+    for (;;) {
+      const subscribed = await client.next("subscribed")
+      if (subscribed.id !== "w2") continue
+      expect(subscribed.status).toBe("live")
+      break
+    }
+    const grown = await client.next("snapshot")
+    expect(grown.basedOn).toBe("w1")
+    expect(grown.rows.map((r) => r.key[0])).toEqual(["c"])
+    expect(grown.members.map((m) => m.key[0])).toEqual(["c"])
+    // A base the session does not hold is ignored: the snapshot is complete.
+    client.send({ type: "subscribe", id: "w3", query: byId(4) as never, basedOn: "nope" })
+    await client.next("subscribed")
+    const chunks = [await client.next("snapshot")]
+    while (!chunks[chunks.length - 1]?.complete) chunks.push(await client.next("snapshot"))
+    expect(chunks.every((c) => c.basedOn === undefined)).toBe(true)
+    expect(chunks.flatMap((c) => c.rows).length).toBe(4)
+    client.ws.close(1000)
+  })
+
   it("epoch changes reset scopes and re-bootstrap subscriptions", async () => {
     const p = freshPartition()
     const client = await connect(p, await token([p]))

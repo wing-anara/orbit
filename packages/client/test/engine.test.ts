@@ -320,6 +320,42 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it("grows a window in place: the server sends only the new rows, the base stays until then", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine, log } = makeClient(server)
+    await Effect.runPromise(engine.open())
+    const byId = (limit: number) => ({
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" as const }],
+      limit,
+    })
+    const small = await Effect.runPromise(engine.subscribe(byId(2)))
+    await waitFor(() => server.pendingFills.length === 1, 2000, "fill request")
+    server.completeFill("Chatbot", [chatbot("a"), chatbot("b"), chatbot("c"), chatbot("d")])
+    await Effect.runPromise(engine.awaitLive(small.id))
+    // Release the base first: with a zero TTL it would retire at once, but the grown window
+    // pins it until the extending snapshot has copied its membership.
+    const grown = await Effect.runPromise(engine.subscribe(byId(3)))
+    await Effect.runPromise(small.release())
+    await Effect.runPromise(engine.awaitLive(grown.id))
+    expect(server.receivedBases.at(-1)).toBe(small.id)
+    const applied = log.find(([e, d]) => e === "snapshot.applied" && d["subscription"] === grown.id)
+    expect(applied?.[1]).toMatchObject({ rows: 1, basedOn: small.id })
+    expect(grown.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a", "b", "c"])
+    // The base retired once the pin was released; the grown window keeps every row.
+    await waitFor(
+      () => !server.receivedRefs.some(() => false) && engine.getStatus().pendingSubscriptions === 0,
+    )
+    await settle(50)
+    expect(grown.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a", "b", "c"])
+    // A window that grows again extends the largest live window.
+    const larger = await Effect.runPromise(engine.subscribe(byId(4)))
+    await Effect.runPromise(engine.awaitLive(larger.id))
+    expect(server.receivedBases.at(-1)).toBe(grown.id)
+    expect(larger.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a", "b", "c", "d"])
+    await Effect.runPromise(engine.close())
+  })
+
   it("reconnects after a drop and resumes with a consistent snapshot", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const { engine, log } = makeClient(server)

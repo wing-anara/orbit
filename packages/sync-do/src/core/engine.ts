@@ -93,6 +93,11 @@ export type EngineEvent =
       readonly cursor: number
       readonly rows: ReadonlyArray<RowUpdate>
       readonly members: ReadonlyArray<MemberRef>
+      /**
+       * When set, `rows` and `members` are only those the base subscription does not hold; the
+       * full membership is the base's plus `members` (see `SubscribeOptions.basedOn`).
+       */
+      readonly basedOn?: string
     }
   | { readonly type: "fill_needed"; readonly request: FillRequest }
   | {
@@ -108,6 +113,16 @@ export interface SubscribeOutcome {
   /** The normalized query the subscription materializes. */
   readonly query: Query
   readonly events: ReadonlyArray<EngineEvent>
+}
+
+export interface SubscribeOptions {
+  /**
+   * A live subscription whose result the new one extends: the same query with a larger limit.
+   * Its membership seeds the new subscription, so materialization writes only the extra
+   * members, and the snapshot carries only those (`basedOn` on the event). When the base is not
+   * a subset of the new result, the snapshot is complete and `basedOn` is absent.
+   */
+  readonly basedOn?: string
 }
 
 export interface EngineStatus {
@@ -728,7 +743,10 @@ export class SyncEngine {
    * Registers a query. The subscription id is the query's canonical key, so identical queries
    * from different clients share one materialization.
    */
-  subscribe(query: Query): Result.Result<SubscribeOutcome, SyncError> {
+  subscribe(
+    query: Query,
+    options: SubscribeOptions = {},
+  ): Result.Result<SubscribeOutcome, SyncError> {
     const planned = planQuery(this.rt, query)
     if (Result.isFailure(planned)) {
       return Result.fail<SyncError>({
@@ -743,11 +761,23 @@ export class SyncEngine {
         const events: Array<EngineEvent> = []
         this.plans.set(p.key, p)
         const existing = this.subscription(p.key)
+        const base =
+          options.basedOn === undefined || options.basedOn === p.key
+            ? null
+            : this.subscription(options.basedOn)
+        const seed = base !== null && base.live
         if (existing === null) {
           this.db.run(
             `INSERT INTO subscriptions (id, query, tables, live, created_at) VALUES (?, ?, ?, 0, ?)`,
             [p.key, JSON.stringify(p.query), JSON.stringify([...p.tables]), this.deps.now()],
           )
+          // The base's members are the new subscription's first guess: materialization then
+          // writes only the members that differ instead of the whole window again.
+          if (seed)
+            this.db.run(
+              `INSERT OR IGNORE INTO membership (subscription, path, tbl, key) SELECT ?, path, tbl, key FROM membership WHERE subscription = ?`,
+              [p.key, base.id],
+            )
         } else {
           this.db.run(`UPDATE subscriptions SET orphaned_at = NULL WHERE id = ?`, [p.key])
         }
@@ -755,14 +785,41 @@ export class SyncEngine {
         for (const request of requests) events.push({ type: "fill_needed", request })
         if (pending.length > 0)
           return { subscription: p.key, status: "pending", query: p.query, events }
-        if (existing?.live !== true) {
-          events.push(this.materialize({ id: p.key, planned: p, live: false }))
-        } else {
-          events.push(this.snapshot(p.key))
-        }
+        const snapshot =
+          existing?.live !== true
+            ? this.materialize({ id: p.key, planned: p, live: false })
+            : this.snapshot(p.key)
+        events.push(seed ? this.extend(snapshot, base.id) : snapshot)
         return { subscription: p.key, status: "live", query: p.query, events }
       }),
     )
+  }
+
+  /**
+   * Reduces a snapshot to the members the base subscription does not hold. When the base is not
+   * a subset of the result (a different query, or a result that shrank), the snapshot stays
+   * complete: the client then replaces its membership as usual.
+   */
+  private extend(event: EngineEvent, base: string): EngineEvent {
+    if (event.type !== "snapshot") return event
+    const held = new Set<string>()
+    for (const row of this.db.query(
+      `SELECT DISTINCT tbl, key FROM membership WHERE subscription = ?`,
+      [base],
+    ))
+      held.add(memberRef(asString(row["tbl"]), asString(row["key"])))
+    const wanted = new Set(
+      event.members.map((m) => memberRef(m.table, SchemaRuntime.keyString(m.key))),
+    )
+    for (const ref of held) if (!wanted.has(ref)) return event
+    const fresh = (table: string, key: RowKey) =>
+      !held.has(memberRef(table, SchemaRuntime.keyString(key)))
+    return {
+      ...event,
+      rows: event.rows.filter((r) => fresh(r.table, r.key)),
+      members: event.members.filter((m) => fresh(m.table, m.key)),
+      basedOn: base,
+    }
   }
 
   unsubscribe(id: string): void {

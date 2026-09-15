@@ -589,7 +589,18 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
         this.send(ws, { type: "subscription_error", id: sub.id, error: query.failure })
         return
       }
-      const outcome = engine.subscribe(query.success)
+      // A base is honoured only when this session holds it live: its members are then known to
+      // the client at every cursor the snapshot can be taken at.
+      const base =
+        sub.basedOn === undefined
+          ? null
+          : (sessions
+              .clientSubsOf(session)
+              .find((s) => s.clientSubId === sub.basedOn && s.status === "live") ?? null)
+      const outcome = engine.subscribe(
+        query.success,
+        base === null ? {} : { basedOn: base.subscription },
+      )
       if (Result.isFailure(outcome)) {
         this.send(ws, { type: "subscription_error", id: sub.id, error: outcome.failure })
         return
@@ -612,7 +623,17 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
           continue
         }
         sessions.markLive(event.subscription)
-        this.sendSnapshot(ws, row, sub.id, event.cursor, event.rows, event.members)
+        this.sendSnapshot(
+          ws,
+          row,
+          sub.id,
+          event.cursor,
+          event.rows,
+          event.members,
+          event.basedOn !== undefined && event.basedOn === base?.subscription
+            ? sub.basedOn
+            : undefined,
+        )
       }
       this.dispatch(others)
     }
@@ -743,8 +764,10 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       cursor: number,
       rows: ReadonlyArray<RowUpdate>,
       members: ReadonlyArray<MemberRef>,
+      basedOn?: string,
     ): void {
       const projected = this.projectRows(session, rows)
+      const extension = basedOn === undefined ? {} : { basedOn }
       if (projected.length <= snapshotChunkRows) {
         this.send(ws, {
           type: "snapshot",
@@ -753,6 +776,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
           rows: projected,
           members,
           complete: true,
+          ...extension,
         })
         return
       }
@@ -760,6 +784,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
         const last = i + snapshotChunkRows >= projected.length
         this.send(ws, {
           type: "snapshot",
+          ...extension,
           subscriptionId: clientSubId,
           cursor,
           rows: projected.slice(i, i + snapshotChunkRows),
