@@ -94,7 +94,11 @@ export interface EngineConfig {
   readonly partition: string
   readonly driver: AsyncSqlDriver
   /** Resolves the WebSocket URL (with token) for each connection attempt. */
-  readonly url: () => Promise<string>
+  /** The socket URL and the subprotocols to offer; called on every connection attempt. */
+  readonly target: () => Promise<{
+    readonly url: string
+    readonly protocols: ReadonlyArray<string>
+  }>
   /** Overrides the client id persisted in the local database. */
   readonly clientId?: string
   /** The client's own view of its identity, for local resolution only; the server decides. */
@@ -103,7 +107,7 @@ export interface EngineConfig {
   readonly pushUrl?: string
   readonly fetch?: typeof fetch
   readonly storageMode?: "opfs" | "memory"
-  readonly makeWebSocket?: (url: string) => WebSocket
+  readonly makeWebSocket?: (url: string, protocols: ReadonlyArray<string>) => WebSocket
   readonly backoffMinMs?: number
   readonly backoffMaxMs?: number
   /**
@@ -288,9 +292,9 @@ export class ClientEngine {
       const scope = yield* Scope.make()
       this.scope = scope
       const connection = yield* makeConnection({
-        url: () =>
+        target: () =>
           Effect.tryPromise({
-            try: () => this.config.url(),
+            try: () => this.config.target(),
             catch: (e) =>
               new ConnectionError({
                 message: e instanceof Error ? e.message : String(e),

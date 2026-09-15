@@ -38,12 +38,18 @@ export class ConnectionError extends Data.TaggedError("ConnectionError")<{
   readonly fatal: boolean
 }> {}
 
+/** Where one connection attempt goes: the URL and the subprotocols to offer (the token rides in them). */
+export interface ConnectionTarget {
+  readonly url: string
+  readonly protocols: ReadonlyArray<string>
+}
+
 export interface ConnectionConfig {
-  /** WebSocket URL including partition and token query parameters (or a function producing it). */
-  readonly url: () => Effect.Effect<string, ConnectionError>
+  /** Produces the target of every attempt, so a short-lived token is fetched fresh each time. */
+  readonly target: () => Effect.Effect<ConnectionTarget, ConnectionError>
   /** Called on every (re)connect so the caller can send `hello`. */
   readonly onOpen: (send: (m: ClientMessageType) => void) => Effect.Effect<void>
-  readonly makeWebSocket?: (url: string) => WebSocket
+  readonly makeWebSocket?: (url: string, protocols: ReadonlyArray<string>) => WebSocket
   readonly backoffMinMs?: number
   readonly backoffMaxMs?: number
   /**
@@ -104,7 +110,9 @@ export const makeConnection = (
     // `offline` event (that event is not reliable while the page is busy).
     const pingInterval = config.pingIntervalMs ?? 10_000
     const pongTimeout = config.pongTimeoutMs ?? 5_000
-    const makeWebSocket = config.makeWebSocket ?? ((url: string) => new WebSocket(url))
+    const makeWebSocket =
+      config.makeWebSocket ??
+      ((url: string, protocols: ReadonlyArray<string>) => new WebSocket(url, [...protocols]))
     const hasWindow = typeof window !== "undefined" && typeof window.addEventListener === "function"
 
     /** Resolves when the browser reports it is back online (never, outside a browser). */
@@ -138,8 +146,8 @@ export const makeConnection = (
         // The browser already knows it is offline: do not open a socket that cannot connect.
         // The loop then waits for the `online` event instead of a full backoff.
         if (hasWindow && !navigator.onLine) return { code: 4001, reason: "offline", opened: false }
-        const url = yield* config.url()
-        const ws = makeWebSocket(url)
+        const target = yield* config.target()
+        const ws = makeWebSocket(target.url, target.protocols)
         yield* Ref.set(socket, ws)
         let opened = false
         let lastPongAt = 0

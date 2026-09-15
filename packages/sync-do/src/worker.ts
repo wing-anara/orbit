@@ -14,6 +14,7 @@
 
 import { Effect, Exit, ManagedRuntime, Schema, type Layer } from "effect"
 import { SyncSchema } from "@orbit/protocol"
+import { WS_TOKEN_PREFIX } from "@orbit/protocol/client"
 
 import { Authorizer, grantAllows, type Grant } from "./authorizer.ts"
 import { AuthError, InternalAuthError, PartitionDenied } from "./errors.ts"
@@ -46,6 +47,24 @@ const constantTimeEqual = (a: string, b: string): boolean => {
 const bearer = (request: Request): string | null => {
   const h = request.headers.get("authorization")
   return h?.startsWith("Bearer ") === true ? h.slice(7) : null
+}
+
+/** Every subprotocol the client offered, in order. */
+export const offeredSubprotocols = (request: Request): ReadonlyArray<string> =>
+  (request.headers.get("sec-websocket-protocol") ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p !== "")
+
+/**
+ * The token of a WebSocket upgrade. Browsers cannot set headers on an upgrade, so the client
+ * offers the token as a subprotocol entry, which keeps it out of the URL (and of request logs).
+ * The query string and the bearer header remain for other clients.
+ */
+const socketToken = (request: Request, url: URL): string | null => {
+  const offered = offeredSubprotocols(request).find((p) => p.startsWith(WS_TOKEN_PREFIX))
+  if (offered !== undefined) return decodeURIComponent(offered.slice(WS_TOKEN_PREFIX.length))
+  return url.searchParams.get("token") ?? bearer(request)
 }
 
 export const createOrbitHandler = <Env extends OrbitWorkerEnv>(config: OrbitHandlerConfig<Env>) => {
@@ -99,7 +118,7 @@ export const createOrbitHandler = <Env extends OrbitWorkerEnv>(config: OrbitHand
     Effect.gen(function* () {
       const url = new URL(request.url)
       const partition = url.searchParams.get("partition")
-      const token = url.searchParams.get("token") ?? bearer(request)
+      const token = socketToken(request, url)
       if (partition === null || partition === "")
         return yield* new AuthError({ reason: "malformed", message: "partition is required" })
       if (token === null)
@@ -130,7 +149,10 @@ export const createOrbitHandler = <Env extends OrbitWorkerEnv>(config: OrbitHand
         return json({ error: "internal" }, 500)
       }
       const { grant, partition } = exit.value
-      return forward(env, partition, "/ws", request, { "x-orbit-subject": grant.subject })
+      return forward(env, partition, "/ws", request, {
+        "x-orbit-subject": grant.subject,
+        "x-orbit-expires": grant.expiresAt === null ? "" : String(grant.expiresAt),
+      })
     }
 
     if (path.startsWith("/internal/")) {

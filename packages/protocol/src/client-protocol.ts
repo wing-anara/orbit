@@ -82,6 +82,7 @@ export const SyncErrorCode = Schema.Literals([
   "protocol_version_mismatch",
   "schema_mismatch",
   "unauthorized",
+  "session_expired",
   "partition_denied",
   "unsupported_query",
   "unknown_query",
@@ -181,11 +182,21 @@ export const CloseCode = {
   protocolVersionMismatch: 4400,
   unauthorized: 4401,
   partitionDenied: 4403,
+  /** The token's expiry passed. Not fatal: the client reconnects with a fresh token. */
+  sessionExpired: 4408,
   schemaMismatch: 4409,
   invalidMessage: 4422,
   overloaded: 4429,
   internal: 4500,
 } as const
+
+/** Subprotocol the client offers to select the Orbit protocol; the server echoes it. */
+export const WS_SUBPROTOCOL = "orbit"
+/**
+ * Subprotocol entry that carries the token: `orbit.token.<token>`. Browsers cannot set headers
+ * on a WebSocket upgrade, and a token in the URL lands in request logs; a subprotocol does not.
+ */
+export const WS_TOKEN_PREFIX = "orbit.token."
 
 export const encodeClientMessage = Schema.encodeUnknownSync(ClientMessage)
 export const decodeClientMessage = Schema.decodeUnknownSync(ClientMessage)

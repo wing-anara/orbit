@@ -137,7 +137,7 @@ Live queries and `client.read` compile against the views, so rows written by pen
 
 `packages/client/src/connection.ts` owns the socket. It runs a loop of connection attempts:
 
-1. Ask the application for a fresh URL. `getToken` runs on every attempt, so a short-lived token is fine.
+1. Ask the application for a fresh token. `getToken` runs on every attempt, so a short-lived token is fine. The token is offered as the WebSocket subprotocol `orbit.token.<token>` next to `orbit`, never in the URL (see [auth.md](auth.md)).
 2. Open the socket. On `open`, call `sendHello`. The engine sends its cursor and every active subscription, and marks every live query `stale`.
 3. Wait for `close`.
 4. If the close code is 4400, 4401, 4403, or 4409, stop. The status becomes `closed` with `fatal: true`.

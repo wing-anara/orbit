@@ -33,12 +33,14 @@ import {
   type SchemaSummary,
   type SubscribeMessage,
   type SyncError,
+  WS_SUBPROTOCOL,
 } from "@orbit/protocol/client"
 import { resolveNamedQuery, type AnyDefinedQueries } from "@orbit/query"
 import { compatibility, projectRow } from "@orbit/schema"
 
 import { SyncEngine, type EngineEvent } from "./core/engine.ts"
 import { durableObjectDriver } from "./do-driver.ts"
+import { offeredSubprotocols } from "./worker.ts"
 import { log } from "./log.ts"
 import {
   encodeAttachment,
@@ -329,14 +331,62 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket")
         return Response.json({ error: "expected websocket" }, { status: 426 })
       const subject = request.headers.get("x-orbit-subject") ?? ""
+      const expires = Number(request.headers.get("x-orbit-expires") ?? "")
+      const expiresAt = Number.isFinite(expires) && expires > 0 ? expires : undefined
+      const now = Date.now()
+      if (expiresAt !== undefined && expiresAt <= now)
+        return Response.json({ error: "unauthorized", reason: "expired" }, { status: 401 })
       const pair = new WebSocketPair()
       const client = pair[0]
       const server = pair[1]
       const session = crypto.randomUUID()
-      const attachment: SocketAttachment = { session, subject, partition, hello: false }
+      const attachment: SocketAttachment = {
+        session,
+        subject,
+        partition,
+        hello: false,
+        ...(expiresAt === undefined ? {} : { expiresAt }),
+      }
       server.serializeAttachment(encodeAttachment(attachment))
       this.ctx.acceptWebSocket(server)
-      return new Response(null, { status: 101, webSocket: client })
+      // The alarm closes the socket when the grant expires; the client reconnects with a new token.
+      if (expiresAt !== undefined) void this.scheduleAlarm(expiresAt)
+      // A client that offered the Orbit subprotocol (the token travels in it) expects the echo.
+      const headers = new Headers()
+      if (offeredSubprotocols(request).includes(WS_SUBPROTOCOL))
+        headers.set("sec-websocket-protocol", WS_SUBPROTOCOL)
+      return new Response(null, { status: 101, webSocket: client, headers })
+    }
+
+    /** Closes the socket when the grant behind it has expired. Returns true when it did. */
+    private expireIfDue(ws: WebSocket, attachment: SocketAttachment, now: number): boolean {
+      if (attachment.expiresAt === undefined || attachment.expiresAt > now) return false
+      this.send(ws, {
+        type: "error",
+        error: { code: "session_expired", message: "the token behind this session expired" },
+        fatal: false,
+      })
+      try {
+        ws.close(CloseCode.sessionExpired, "session_expired")
+      } catch {
+        // already closed
+      }
+      return true
+    }
+
+    /**
+     * Closes every socket whose grant expired and returns the next expiry to wake up for, or
+     * null when no live socket expires.
+     */
+    private sweepExpiredSockets(now: number): number | null {
+      let next: number | null = null
+      for (const ws of this.ctx.getWebSockets()) {
+        const attachment = readAttachment(ws)
+        if (attachment === null || attachment.expiresAt === undefined) continue
+        if (this.expireIfDue(ws, attachment, now)) continue
+        next = next === null ? attachment.expiresAt : Math.min(next, attachment.expiresAt)
+      }
+      return next
     }
 
     override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -345,6 +395,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
         ws.close(CloseCode.internal, "missing session")
         return
       }
+      if (this.expireIfDue(ws, attachment, Date.now())) return
       const text = typeof message === "string" ? message : new TextDecoder().decode(message)
       let parsed: unknown
       try {
@@ -764,9 +815,11 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
      * and drops subscriptions whose grace period passed.
      */
     override async alarm(): Promise<void> {
+      const now = Date.now()
+      const nextExpiry = this.sweepExpiredSockets(now)
+      if (nextExpiry !== null) await this.scheduleAlarm(nextExpiry)
       const engine = this.engine
       if (engine === null) return
-      const now = Date.now()
       const dropped = engine.sweepOrphans(now - subscriptionGraceMs)
       if (dropped.length > 0)
         log({

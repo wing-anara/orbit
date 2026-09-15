@@ -22,6 +22,7 @@
 
 import { Effect } from "effect"
 import type { SyncSchema } from "@orbit/protocol"
+import { WS_SUBPROTOCOL, WS_TOKEN_PREFIX } from "@orbit/protocol/client"
 import type { DefinedMutators, MutatorArgs, MutatorDefinitions } from "@orbit/mutators"
 import { NamedQueryCall, type IncludeShape, type ResultRow, type TypedQuery } from "@orbit/query"
 import type { SyncSchemaDefinition } from "@orbit/schema"
@@ -66,7 +67,7 @@ export interface OrbitClientConfig<D, M extends MutatorDefinitions<D> = Record<n
   /** Overrides the client id persisted in the local database. */
   readonly clientId?: string
   readonly onLog?: (event: string, data: Record<string, unknown>) => void
-  readonly makeWebSocket?: (url: string) => WebSocket
+  readonly makeWebSocket?: (url: string, protocols: ReadonlyArray<string>) => WebSocket
   readonly backoffMinMs?: number
   readonly backoffMaxMs?: number
   /** How long a released query stays cached and current (default five minutes). */
@@ -175,10 +176,14 @@ export const createOrbitClient = async <
     partition: config.partition,
     driver,
     storageMode: mode,
-    url: async () => {
+    target: async () => {
       const token = await config.getToken()
       const base = config.url.replace(/^http/, "ws").replace(/\/$/, "")
-      return `${base}/ws?partition=${encodeURIComponent(config.partition)}&token=${encodeURIComponent(token)}`
+      // The token travels as a subprotocol entry, not in the URL, so request logs never see it.
+      return {
+        url: `${base}/ws?partition=${encodeURIComponent(config.partition)}`,
+        protocols: [WS_SUBPROTOCOL, `${WS_TOKEN_PREFIX}${encodeURIComponent(token)}`],
+      }
     },
     ...(config.clientId === undefined ? {} : { clientId: config.clientId }),
     ...(config.subject === undefined ? {} : { subject: config.subject }),

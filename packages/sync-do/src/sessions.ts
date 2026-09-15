@@ -23,6 +23,8 @@ export const SocketAttachment = Schema.Struct({
   subject: Schema.String,
   partition: Schema.String,
   hello: Schema.Boolean,
+  /** When the grant behind the socket expires (unix ms); absent when it does not expire. */
+  expiresAt: Schema.optionalKey(Schema.Finite),
 })
 export type SocketAttachment = typeof SocketAttachment.Type
 

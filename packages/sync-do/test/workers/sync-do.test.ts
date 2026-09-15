@@ -328,6 +328,48 @@ describe("client sessions", () => {
     expect(expired.status).toBe(401)
   })
 
+  it("takes the token from the subprotocol and echoes the Orbit subprotocol", async () => {
+    const p = freshPartition()
+    const res = await SELF.fetch(`${base}/ws?partition=${encodeURIComponent(p)}`, {
+      headers: {
+        upgrade: "websocket",
+        "sec-websocket-protocol": `orbit, orbit.token.${encodeURIComponent(await token([p]))}`,
+      },
+    })
+    expect(res.status).toBe(101)
+    expect(res.headers.get("sec-websocket-protocol")).toBe("orbit")
+    const ws = res.webSocket
+    if (ws === null) throw new Error("no websocket")
+    ws.accept()
+    const client = new Client(ws)
+    client.send(hello(p))
+    await client.next("welcome")
+    client.ws.close(1000)
+
+    const missing = await SELF.fetch(`${base}/ws?partition=${encodeURIComponent(p)}`, {
+      headers: { upgrade: "websocket", "sec-websocket-protocol": "orbit" },
+    })
+    expect(missing.status).toBe(401)
+  })
+
+  it("closes a socket with 4408 once the grant behind it expires", async () => {
+    const p = freshPartition()
+    const client = await connect(p, await token([p], "user-1", 1))
+    client.send(hello(p))
+    await client.next("welcome")
+    const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+    // The alarm is due at the expiry; before then it leaves the socket alone.
+    await runDurableObjectAlarm(stub)
+    client.send({ type: "ping", sentAt: Date.now() })
+    await client.next("pong")
+    await new Promise((r) => setTimeout(r, 1_100))
+    await runDurableObjectAlarm(stub)
+    const err = await client.next("error")
+    expect(err.error.code).toBe("session_expired")
+    expect(err.fatal).toBe(false)
+    expect((await client.waitClosed()).code).toBe(4408)
+  })
+
   it("closes on protocol version mismatch and schema mismatch", async () => {
     const p = freshPartition()
     const c1 = await connect(p, await token([p]))

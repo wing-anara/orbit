@@ -29,6 +29,8 @@ export interface Grant {
   readonly subject: string
   readonly partitions: ReadonlyArray<string> | "*"
   readonly claims: Readonly<Record<string, string>>
+  /** When the grant stops being valid, unix milliseconds; `null` when it does not expire. */
+  readonly expiresAt: number | null
 }
 
 export const grantAllows = (grant: Grant, partition: string): boolean =>
@@ -125,7 +127,12 @@ export const hmacAuthorizer = (
           )
           if (parsed.exp * 1000 < now())
             return yield* new AuthError({ reason: "expired", message: "token expired" })
-          return { subject: parsed.sub, partitions: parsed.partitions, claims: parsed.claims ?? {} }
+          return {
+            subject: parsed.sub,
+            partitions: parsed.partitions,
+            claims: parsed.claims ?? {},
+            expiresAt: parsed.exp * 1000,
+          }
         })
       return { authorize }
     }),

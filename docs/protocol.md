@@ -94,17 +94,18 @@ Mutations do not travel over the WebSocket. The client pushes them to the applic
 
 `CloseCode` defines these values:
 
-| Code | Name                      | When the Durable Object sends it                                                                 |
-| ---- | ------------------------- | ------------------------------------------------------------------------------------------------ |
-| 4400 | `protocolVersionMismatch` | `hello.protocolVersion` is not `1`.                                                              |
-| 4401 | `unauthorized`            | Defined. Not sent by the current Durable Object; the Worker rejects before the upgrade.          |
-| 4403 | `partitionDenied`         | `hello.partition` differs from the authorized partition.                                         |
-| 4409 | `schemaMismatch`          | The client schema is not additively compatible (see [schema-evolution.md](schema-evolution.md)). |
-| 4422 | `invalidMessage`          | Non-JSON, a message that fails validation, or a message before `hello`.                          |
-| 4429 | `overloaded`              | Defined. Not sent by the current code.                                                           |
-| 4500 | `internal`                | Missing session attachment, or an operator reset of the partition.                               |
+| Code | Name                      | When the Durable Object sends it                                                                        |
+| ---- | ------------------------- | ------------------------------------------------------------------------------------------------------- |
+| 4400 | `protocolVersionMismatch` | `hello.protocolVersion` is not `1`.                                                                     |
+| 4401 | `unauthorized`            | Defined. Not sent by the current Durable Object; the Worker rejects before the upgrade.                 |
+| 4403 | `partitionDenied`         | `hello.partition` differs from the authorized partition.                                                |
+| 4408 | `sessionExpired`          | The grant behind the socket expired (see [auth.md](auth.md)). The client reconnects with a fresh token. |
+| 4409 | `schemaMismatch`          | The client schema is not additively compatible (see [schema-evolution.md](schema-evolution.md)).        |
+| 4422 | `invalidMessage`          | Non-JSON, a message that fails validation, or a message before `hello`.                                 |
+| 4429 | `overloaded`              | Defined. Not sent by the current code.                                                                  |
+| 4500 | `internal`                | Missing session attachment, or an operator reset of the partition.                                      |
 
-The client treats 4400, 4401, 4403, and 4409 as fatal. It stops reconnecting and exposes `fatalError` in the status. Every other close triggers reconnect with backoff (see [client-persistence.md](client-persistence.md)).
+The client treats 4400, 4401, 4403, and 4409 as fatal. It stops reconnecting and exposes `fatalError` in the status. Every other close, 4408 included, triggers reconnect with backoff (see [client-persistence.md](client-persistence.md)).
 
 ### Message flow
 

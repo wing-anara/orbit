@@ -27,6 +27,7 @@ interface Grant {
   readonly subject: string
   readonly partitions: ReadonlyArray<string> | "*"
   readonly claims: Readonly<Record<string, string>>
+  readonly expiresAt: number | null   // unix milliseconds; null when the grant does not expire
 }
 
 class Authorizer extends Context.Service<Authorizer, {
@@ -61,7 +62,7 @@ TokenPayload {
 4. The payload decodes with the `TokenPayload` schema.
 5. `exp * 1000` is not in the past.
 
-The result is a `Grant` with `subject: sub`, the partitions, and the claims or `{}`.
+The result is a `Grant` with `subject: sub`, the partitions, the claims or `{}`, and `expiresAt: exp * 1000`.
 
 `signToken(secret, payload)` mints a token. The application backend calls it. The browser never signs a token and never decides which partition it may open.
 
@@ -84,18 +85,18 @@ For `GET {prefix}/ws` the router:
 
 1. Requires a WebSocket upgrade. Otherwise it answers `426`.
 2. Reads `partition` from the query string. A missing partition is a `malformed` `AuthError`.
-3. Reads `token` from the query string, or from `Authorization: Bearer` when the query string has none.
+3. Reads the token from the `Sec-WebSocket-Protocol` entry that starts with `orbit.token.` (the browser client sends it this way, so the token never appears in a URL or a request log). When no such entry exists, it reads `token` from the query string, then `Authorization: Bearer`.
 4. Calls `authorize`. A failure answers `401` with `{ error: "unauthorized", reason }`.
 5. Calls `grantAllows`. A denial answers `403` with `{ error: "partition_denied", partition }`.
-6. Forwards the request to the Durable Object for the partition, with the headers `x-orbit-partition` and `x-orbit-subject`.
+6. Forwards the request to the Durable Object for the partition, with the headers `x-orbit-partition`, `x-orbit-subject` and `x-orbit-expires` (the grant's expiry in unix milliseconds, empty when it does not expire).
 
 The Durable Object name is `${app}/p${placementVersion}/${partition}` (see [placement.md](placement.md)). The client never sees it.
 
 ## What the Durable Object trusts
 
-The Durable Object reads `x-orbit-partition` and `x-orbit-subject` from the forwarded request. It does not verify the token itself. This is safe only because the Durable Object is reachable through the Worker binding alone. The Worker sets both headers after authorization. A client cannot set them, because the Worker overwrites `x-orbit-partition` on every forward and sets `x-orbit-subject` only on the authorized `/ws` path.
+The Durable Object reads `x-orbit-partition`, `x-orbit-subject` and `x-orbit-expires` from the forwarded request. It does not verify the token itself. This is safe only because the Durable Object is reachable through the Worker binding alone. The Worker sets both headers after authorization. A client cannot set them, because the Worker overwrites `x-orbit-partition` on every forward and sets `x-orbit-subject` only on the authorized `/ws` path.
 
-The Durable Object adds one check of its own. `hello.partition` must equal the partition in the socket attachment. A mismatch closes the socket with code 4403.
+The Durable Object adds two checks of its own. `hello.partition` must equal the partition in the socket attachment; a mismatch closes the socket with code 4403. The expiry is stored in the socket attachment; an alarm closes the socket with code 4408 (`sessionExpired`) when it passes, and a message that arrives after the expiry gets the same close. The client treats 4408 as a normal reconnect and presents a fresh token. A client that offered the `orbit` subprotocol gets it echoed in the upgrade response, as browsers require.
 
 The subject is stored in the `sessions` table for diagnostics.
 
@@ -141,7 +142,7 @@ Set them in `.dev.vars` for local development, or with `wrangler secret put` for
 
 ## Limits of the model
 
-- Authorization happens at connection time. A revoked membership does not close an open socket. The socket stays open until the client reconnects and presents a new token.
+- Authorization happens at connection time. A revoked membership does not close an open socket before the grant expires. The socket lives at most until the token's `exp`; a short token lifetime bounds the window.
 - The `"*"` partition grant gives access to every partition. Use it only for trusted services.
 - There is no rate limit and no per-subject quota. Close code 4429 (`overloaded`) is defined but not sent.
 - The token travels in the URL query string. Make sure the Worker does not log full request URLs.
