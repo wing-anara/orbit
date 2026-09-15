@@ -126,9 +126,21 @@ export class MutatorError extends Data.TaggedError("MutatorError")<{
 const isJsonObject = (v: JsonValue): v is { readonly [key: string]: JsonValue } =>
   typeof v === "object" && v !== null && !Array.isArray(v)
 
+/** `undefined` properties are absent on the wire, as `JSON.stringify` treats them. */
+const dropUndefined = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(dropUndefined)
+  if (value !== null && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => [k, dropUndefined(v)]),
+    )
+  return value
+}
+
 /** Wire form of encoded arguments: a JSON object, or `{ value }` for a scalar or array codec. */
 export const wireArgs = (encoded: unknown): Record<string, JsonValue> => {
-  const json: JsonValue = Schema.decodeUnknownSync(JsonValue)(encoded)
+  const json: JsonValue = Schema.decodeUnknownSync(JsonValue)(dropUndefined(encoded))
   return isJsonObject(json) ? { ...json } : { value: json }
 }
 
