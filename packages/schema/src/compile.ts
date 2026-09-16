@@ -59,6 +59,7 @@ const structuralProblems = <I extends IntrospectedShape, T>(
         | {
             partitionBy: string
             partitionVia?: string
+            partitionRoutes?: ReadonlyArray<ReadonlyArray<string>>
             columns?: ReadonlyArray<string>
             derived?: Record<string, { from: string; rule: DerivedRule }>
             relations?: Record<
@@ -114,6 +115,24 @@ const structuralProblems = <I extends IntrospectedShape, T>(
             `table ${name}: partition column ${tcfg.partitionBy} has kind ${pcol.kind}, but ${tcfg.partitionVia}.${parentKey.name} has kind ${parentKey.kind}`,
           )
       }
+    }
+    for (const path of tcfg.partitionRoutes ?? []) {
+      let current = tcfg
+      let valid = path.length > 0 && path.length <= 8
+      for (const step of path) {
+        const relation = current.relations?.[step]
+        const next =
+          relation === undefined ? undefined : cfg.tables[relation.to as keyof typeof cfg.tables]
+        if (next === undefined) {
+          valid = false
+          break
+        }
+        current = next
+      }
+      if (!valid || current.partitionVia !== undefined)
+        problems.push(
+          `table ${name}: partition route ${JSON.stringify(path)} must contain 1–8 declared relations and end at a directly partitioned table`,
+        )
     }
     for (const c of tcfg.columns ?? [])
       if (!columns.has(c)) problems.push(`table ${name}: column ${c} does not exist`)
@@ -181,6 +200,7 @@ const toArtifact = <I extends IntrospectedShape, T>(
         | {
             partitionBy: string
             partitionVia?: string
+            partitionRoutes?: ReadonlyArray<ReadonlyArray<string>>
             columns?: ReadonlyArray<string>
             derived?: Record<string, { from: string; rule: DerivedRule }>
             relations?: Record<
@@ -235,6 +255,9 @@ const toArtifact = <I extends IntrospectedShape, T>(
       partition_column: tcfg.partitionBy,
       // Present only for derived partitions, so artifacts without them keep their hash.
       ...(tcfg.partitionVia === undefined ? {} : { partition_parent: tcfg.partitionVia }),
+      ...(tcfg.partitionRoutes?.length
+        ? { partition_routes: tcfg.partitionRoutes.map((path) => [...path]) }
+        : {}),
       columns,
       relations,
     })

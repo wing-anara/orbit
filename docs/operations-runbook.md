@@ -53,12 +53,23 @@ The Worker needs the secrets `ORBIT_TOKEN_SECRET` and `ORBIT_INTERNAL_SECRET`. T
 ```bash
 orbit-server schema introspect --keyspace <ks> --out <path> [--table <name>]...
 orbit-server schema validate --schema <path>
+orbit-server schema accept-current --state <path> --worker-url <url>
 orbit-server checkpoint show --state <path> --schema <path>
 orbit-server checkpoint reset --state <path> --schema <path> [--to current|<keyspace>/<shard>@<position>]
 orbit-server quarantine list --state <path> --schema <path>
 orbit-server quarantine replay --state <path> --schema <path> --worker-url <url> --worker-secret <s> --partition <p>
 orbit-server quarantine drop --state <path> --schema <path> --partition <p>
 ```
+
+`schema accept-current` explicitly accepts the schema fetched from the authenticated
+Worker for an existing state file. Supply the internal credential through the
+service's normal credential injection. Stop the engine before running it and
+restart afterwards. This command preserves source positions and the parent
+index while changing the accepted schema hash; it does not deploy either
+component. When relation routing is newly enabled, startup rebuilds the shared
+projection and advances the stream epoch so recipient caches refill. Deploy a
+compatible engine binary before changing the Worker schema, and coordinate the
+schema acceptance and restart with that Worker change.
 
 `checkpoint show` prints the epoch, the positions per shard, the number of partition counters, and the quarantined partitions.
 

@@ -31,6 +31,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub enum StateError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("fanout: {0}")]
+    Fanout(#[from] crate::fanout::FanoutError),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("state was created for schema {stored} but the running schema is {running}")]
@@ -106,6 +108,7 @@ impl StateStore {
             CREATE TABLE IF NOT EXISTS parent_index_ready (tbl TEXT PRIMARY KEY, position TEXT NOT NULL);
             "#,
         )?;
+        crate::fanout_store::initialize(&conn)?;
         Ok(Self { conn })
     }
 
@@ -212,6 +215,7 @@ impl StateStore {
                 stmt.execute(params![e.table, e.key, e.partition])?;
             }
         }
+        crate::fanout_store::prune(&tx, checkpoint)?;
         tx.commit()?;
         Ok(())
     }
@@ -335,6 +339,56 @@ impl StateStore {
         Ok(self
             .conn
             .execute("DELETE FROM quarantine WHERE partition = ?1", params![partition])?)
+    }
+
+    pub fn fanout_ready(&self, schema_hash: &str) -> Result<bool, StateError> {
+        Ok(self.get_meta("fanout_schema_hash")?.as_deref() == Some(schema_hash))
+    }
+
+    pub fn clear_fanout(&self) -> Result<(), StateError> {
+        self.conn.execute_batch("DELETE FROM fanout_rows; DELETE FROM fanout_cells; DELETE FROM fanout_journal; DELETE FROM meta WHERE key='fanout_schema_hash';")?;
+        Ok(())
+    }
+
+    pub fn seed_fanout(
+        &self,
+        schema: &orbit_protocol::schema::SyncSchema,
+        table: &str,
+        rows: &[orbit_protocol::value::Row],
+    ) -> Result<(), StateError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for row in rows {
+            crate::fanout_store::put(&tx, schema, table, row)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_fanout_ready(&self, schema_hash: &str) -> Result<(), StateError> {
+        self.conn.execute("INSERT INTO meta(key,value) VALUES ('fanout_schema_hash',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![schema_hash])?;
+        Ok(())
+    }
+
+    pub fn fanout_has_journal(&self, source: &orbit_protocol::cdc::SourceTransaction) -> Result<bool, StateError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM fanout_journal WHERE keyspace=?1 AND shard=?2 AND gtid=?3",
+                params![source.keyspace, source.shard, source.gtid],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+    pub fn route_fanout(
+        &self,
+        schema: &orbit_protocol::schema::SyncSchema,
+        source: &orbit_protocol::cdc::SourceTransaction,
+        hydrated: &[(String, orbit_protocol::value::Row)],
+    ) -> Result<indexmap::IndexMap<String, Vec<orbit_protocol::cdc::RowChange>>, StateError> {
+        Ok(crate::fanout_store::route_with_hydration(
+            &self.conn, schema, source, hydrated,
+        )?)
     }
 
     fn get_meta(&self, key: &str) -> Result<Option<String>, StateError> {

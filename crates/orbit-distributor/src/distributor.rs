@@ -163,6 +163,7 @@ pub struct DistributorStatus {
 
 pub struct Distributor {
     shared: Arc<Shared>,
+    fanout_source: Option<SubscriberConfig>,
 }
 
 impl Distributor {
@@ -200,6 +201,7 @@ impl Distributor {
         let delivery_permits = Arc::new(Semaphore::new(config.max_concurrent_deliveries));
         let parent_tables = parent_tables(&schema).into_iter().collect();
         Ok(Self {
+            fanout_source: None,
             shared: Arc::new(Shared {
                 schema,
                 config,
@@ -213,6 +215,11 @@ impl Distributor {
                 parent_tables,
             }),
         })
+    }
+
+    pub fn with_fanout_source(mut self, source: SubscriberConfig) -> Self {
+        self.fanout_source = Some(source);
+        self
     }
 
     /// The checkpoint to resume the subscriber from.
@@ -278,7 +285,10 @@ impl Distributor {
                 item = rx.recv() => item.ok_or(DistributorError::StreamClosed)?,
             };
             match item {
-                StreamItem::Transaction(tx) => self.route_transaction(tx)?,
+                StreamItem::Transaction(tx) => tokio::select! {
+                    _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
+                    result = self.route_transaction(tx) => result?,
+                },
                 StreamItem::Position { shard, position } | StreamItem::Ddl { shard, position, .. } => {
                     self.record_position(shard, position);
                 }
@@ -335,8 +345,26 @@ impl Distributor {
         Ok(updates)
     }
 
-    fn route_transaction(&self, tx: SourceTransaction) -> Result<(), DistributorError> {
+    async fn route_transaction(&self, tx: SourceTransaction) -> Result<(), DistributorError> {
         let shared = &self.shared;
+        let hydrate = shared.schema.tables.iter().any(|t| !t.partition_routes.is_empty())
+            && !shared.state.lock().expect("lock").fanout_has_journal(&tx)?
+            && !orbit_vstream::shared_projection::queries(&shared.schema, Some(&tx.changes))?.is_empty();
+        let hydrated = if hydrate {
+            let source = self
+                .fanout_source
+                .as_ref()
+                .ok_or_else(|| VStreamError::Malformed("missing shared-item hydration source".into()))?;
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                orbit_vstream::shared_projection::load(source, &shared.schema, Some(&tx.changes)),
+            )
+            .await
+            .map_err(|_| VStreamError::Timeout(Duration::from_secs(60)))??
+        } else {
+            vec![]
+        };
+
         let parent_updates = self.parent_updates_of(&tx)?;
         let shard = ShardId {
             keyspace: tx.keyspace.clone(),
@@ -373,7 +401,20 @@ impl Distributor {
             if let Some(e) = lookup_error.into_inner() {
                 return Err(e.into());
             }
-            result?
+            let (mut routed, mut stats) = result?;
+            if shared.schema.tables.iter().any(|t| !t.partition_routes.is_empty()) {
+                if !state.fanout_ready(&shared.schema.schema_hash)? {
+                    return Err(StateError::Fanout(crate::fanout::FanoutError::Snapshot(
+                        "fanout graph is not bootstrapped".into(),
+                    ))
+                    .into());
+                }
+                for (partition, changes) in state.route_fanout(&shared.schema, &tx, &hydrated)? {
+                    stats.routed += changes.len() as u64;
+                    routed.entry(partition).or_default().extend(changes);
+                }
+            }
+            (routed, stats)
         };
         metrics::counter!("orbit_distributor_routed_rows_total").increment(stats.routed);
         metrics::counter!("orbit_distributor_unpartitioned_rows_total").increment(stats.unpartitioned);

@@ -37,6 +37,7 @@ fn schema() -> SyncSchema {
             primary_key: vec!["id".into()],
             partition_column: "org".into(),
             partition_parent: None,
+            partition_routes: vec![],
             columns: vec![
                 ColumnSchema {
                     name: "id".into(),
@@ -377,6 +378,7 @@ fn derived_schema() -> SyncSchema {
                 primary_key: vec!["id".into()],
                 partition_column: "org".into(),
                 partition_parent: None,
+                partition_routes: vec![],
                 columns: vec![
                     col("id", ValueKind::String, false, "varchar(64)"),
                     col("org", ValueKind::String, false, "varchar(64)"),
@@ -388,6 +390,7 @@ fn derived_schema() -> SyncSchema {
                 primary_key: vec!["id".into()],
                 partition_column: "parent_id".into(),
                 partition_parent: Some("_orbit_parent".into()),
+                partition_routes: vec![],
                 columns: vec![
                     col("id", ValueKind::String, false, "varchar(64)"),
                     col("parent_id", ValueKind::String, false, "varchar(64)"),

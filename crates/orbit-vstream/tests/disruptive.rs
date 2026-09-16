@@ -39,6 +39,7 @@ fn schema() -> SyncSchema {
             primary_key: vec!["id".into()],
             partition_column: "org".into(),
             partition_parent: None,
+            partition_routes: vec![],
             columns: vec![
                 ColumnSchema {
                     name: "id".into(),

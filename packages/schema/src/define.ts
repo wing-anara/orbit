@@ -96,6 +96,10 @@ export interface TableConfig<I extends IntrospectedShape, N extends string, Tabl
    * single-column primary key (see docs/partitioning.md, "Derived partitions").
    */
   readonly partitionVia?: Tables
+  /** Additional recipient partitions reached by 1–8 declared relations, ending at a directly
+   * partitioned table (for example ["permissions"]). Subscription queries must still enforce
+   * the caller's permission; these paths only control replication into partition caches. */
+  readonly partitionRoutes?: ReadonlyArray<ReadonlyArray<string>>
   /** Columns to sync; defaults to all columns. Primary key and partition columns are always included. */
   readonly columns?: ReadonlyArray<ColumnNamesOf<I, N>>
   /**

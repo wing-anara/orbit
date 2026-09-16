@@ -8,6 +8,9 @@
 
 pub mod delivery;
 pub mod distributor;
+pub mod fanout;
+pub mod fanout_bootstrap;
+pub mod fanout_store;
 pub mod router;
 pub mod state;
 

@@ -65,6 +65,7 @@ fn schema() -> SyncSchema {
                 primary_key: vec!["id".into()],
                 partition_column: "org".into(),
                 partition_parent: None,
+                partition_routes: vec![],
                 columns: vec![col("id", ValueKind::Int, false), col("org", ValueKind::String, true)],
                 relations: vec![],
             },
@@ -73,6 +74,7 @@ fn schema() -> SyncSchema {
                 primary_key: vec!["id".into()],
                 partition_column: "parent_id".into(),
                 partition_parent: Some("_orbit_bs_parent".into()),
+                partition_routes: vec![],
                 columns: vec![
                     col("id", ValueKind::String, false),
                     col("parent_id", ValueKind::Int, false),

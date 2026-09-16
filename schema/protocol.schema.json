@@ -151,6 +151,16 @@
           ],
           "description": "Derived partitioning. When set, `partition_column` holds the primary key value of a row of\nthis table (a synced table that is partitioned directly, with no `partition_parent` of its\nown), and the row's partition is the partition of that parent row. The parent's primary\nkey must be a single `string`, `int` or `bigint` column, and `partition_column` must have\nthe same kind. Only one level is allowed. A row whose parent is NULL or unknown is not\nrouted and is counted as `unresolved_parent`."
         },
+        "partition_routes": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": "Additional partitions reached through declared relation paths. The last table must be\ndirectly partitioned. These routes replicate rows; caller authorization still belongs\nin the subscription query. Empty routes preserve existing schema hashes."
+        },
         "columns": {
           "type": "array",
           "items": {

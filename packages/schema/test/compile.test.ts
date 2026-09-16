@@ -166,6 +166,30 @@ describe("compileSyncSchema", () => {
     expect(artifact).toEqual(expected)
   })
 
+  it("compiles relation partition routes and rejects paths that would widen access", async () => {
+    const withRoutes = (partitionRoutes: ReadonlyArray<ReadonlyArray<string>>) =>
+      defineSyncSchema({
+        ...definition.config,
+        tables: {
+          ...definition.config.tables,
+          Chatbot: { ...definition.config.tables.Chatbot, partitionRoutes },
+        },
+      })
+    const original = await Effect.runPromise(compileSyncSchema(definition))
+    const compiled = await Effect.runPromise(compileSyncSchema(withRoutes([["organization"]])))
+    expect(compiled.tables.find((t) => t.name === "Chatbot")?.partition_routes).toEqual([
+      ["organization"],
+    ])
+    expect(compiled.schema_hash).not.toBe(original.schema_hash)
+    expect((await Effect.runPromise(compileSyncSchema(withRoutes([])))).schema_hash).toBe(
+      original.schema_hash,
+    )
+    for (const route of [[], ["missing"], Array.from({ length: 9 }, () => "folder")])
+      await expect(Effect.runPromise(compileSyncSchema(withRoutes([route])))).rejects.toThrow(
+        "partition route",
+      )
+  })
+
   it("derives row types from the definition", () => {
     const row: ChatbotRow = {
       id: "c1",

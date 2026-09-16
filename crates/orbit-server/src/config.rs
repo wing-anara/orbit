@@ -132,6 +132,15 @@ pub enum SchemaCommand {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Accept the schema currently served by the authenticated Worker for an existing state file.
+    AcceptCurrent {
+        #[arg(long, env = "STATE_PATH", default_value = "data/orbit-state.sqlite")]
+        state: PathBuf,
+        #[arg(long, env = "WORKER_URL")]
+        worker_url: String,
+        #[arg(long, env = "WORKER_SECRET", hide_env_values = true)]
+        worker_secret: String,
+    },
     /// Validate a compiled sync schema artifact.
     Validate {
         #[arg(long)]

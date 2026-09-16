@@ -38,6 +38,7 @@ fn sample_schema() -> SyncSchema {
                 primary_key: vec!["id".into()],
                 partition_column: "id".into(),
                 partition_parent: None,
+                partition_routes: vec![],
                 columns: vec![
                     ColumnSchema {
                         name: "id".into(),
@@ -79,6 +80,7 @@ fn sample_schema() -> SyncSchema {
                 primary_key: vec!["id".into()],
                 partition_column: "organizationId".into(),
                 partition_parent: None,
+                partition_routes: vec![],
                 columns: vec![
                     ColumnSchema {
                         name: "id".into(),

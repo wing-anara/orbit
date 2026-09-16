@@ -449,6 +449,12 @@ export const TableSchema = Schema.Struct({
    */
   partition_parent: Schema.optionalKey(Schema.NullOr(Schema.String)),
   /**
+   * Additional partitions reached through declared relation paths. The last table must be
+   * directly partitioned. These routes replicate rows; caller authorization still belongs
+   * in the subscription query. Empty routes preserve existing schema hashes.
+   */
+  partition_routes: Schema.optionalKey(Schema.Array(Schema.Array(Schema.String))),
+  /**
    * Synced columns, in order. Source columns not listed are ignored.
    */
   columns: Schema.Array(ColumnSchema),

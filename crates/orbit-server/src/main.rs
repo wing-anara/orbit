@@ -122,8 +122,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .await
         .context("bootstrapping parent index")?;
 
-    let distributor =
-        Arc::new(Distributor::new((*schema).clone(), dist_cfg, state, sink).context("initializing distributor")?);
+    orbit_distributor::fanout_bootstrap::bootstrap(&schema, &state, &sub_cfg)
+        .await
+        .context("bootstrapping relation routing")?;
+
+    let distributor = Arc::new(
+        Distributor::new((*schema).clone(), dist_cfg, state, sink)
+            .context("initializing distributor")?
+            .with_fanout_source(sub_cfg.clone()),
+    );
     let checkpoint = distributor.checkpoint();
     info!(checkpoint = %checkpoint.render(), epoch = checkpoint.epoch, "resuming");
 
@@ -203,6 +210,17 @@ async fn schema_command(command: SchemaCommand) -> anyhow::Result<()> {
                 std::fs::write(&out, serde_json::to_string_pretty(&schema)? + "\n")?;
             }
             info!(path = %out.display(), tables = schema.tables.len(), "introspected schema written");
+            Ok(())
+        }
+        SchemaCommand::AcceptCurrent {
+            state,
+            worker_url,
+            worker_secret,
+        } => {
+            let schema = fetch_schema(&worker_url, &worker_secret).await?;
+            let state = StateStore::open(&state).context("opening state store")?;
+            state.migrate_schema(&schema.schema_hash).context("accepting schema")?;
+            println!("accepted schema {}", schema.schema_hash);
             Ok(())
         }
         SchemaCommand::Validate { schema } => {

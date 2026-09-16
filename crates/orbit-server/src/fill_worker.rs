@@ -111,7 +111,21 @@ impl FillWorker {
             .schema
             .table(&req.table)
             .is_some_and(|t| t.partition_parent.is_some());
-        let outcome = if derived {
+        let routed = self
+            .schema
+            .table(&req.table)
+            .is_some_and(|t| !t.partition_routes.is_empty());
+        let outcome = if routed {
+            orbit_vstream::routed_fill::run_routed_fill(
+                &self.subscriber,
+                &self.schema,
+                &req.table,
+                &req.partition,
+                self.timeout,
+                cancel,
+            )
+            .await
+        } else if derived {
             run_derived_fill(
                 &self.subscriber,
                 &self.schema,

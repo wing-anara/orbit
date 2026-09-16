@@ -381,6 +381,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 partition_column: "id".into(),
                 partition_parent: None,
+                partition_routes: vec![],
                 columns: vec![orbit_protocol::schema::ColumnSchema {
                     name: "id".into(),
                     kind: orbit_protocol::schema::ValueKind::String,

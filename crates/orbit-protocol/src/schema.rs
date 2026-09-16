@@ -94,6 +94,11 @@ pub struct TableSchema {
     /// routed and is counted as `unresolved_parent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_parent: Option<String>,
+    /// Additional partitions reached through declared relation paths. The last table must be
+    /// directly partitioned. These routes replicate rows; caller authorization still belongs
+    /// in the subscription query. Empty routes preserve existing schema hashes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_routes: Vec<Vec<String>>,
     /// Synced columns, in order. Source columns not listed are ignored.
     pub columns: Vec<ColumnSchema>,
     /// Declared relations to other synced tables, usable in query includes.
@@ -320,6 +325,30 @@ impl SyncSchema {
                     }
                 }
             }
+            for path in &t.partition_routes {
+                let mut current = t;
+                let mut valid = !path.is_empty() && path.len() <= 8;
+                for step in path {
+                    let next = current
+                        .relations
+                        .iter()
+                        .find(|r| &r.name == step)
+                        .and_then(|r| names.get(r.target_table.as_str()).copied());
+                    match next {
+                        Some(next) => current = next,
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid || current.partition_parent.is_some() {
+                    errors.push(SchemaValidationError::InvalidPartitionRoute {
+                        table: t.name.clone(),
+                        path: path.clone(),
+                    });
+                }
+            }
             let mut rel_names = BTreeSet::new();
             for r in &t.relations {
                 if !rel_names.insert(r.name.as_str()) {
@@ -426,6 +455,10 @@ pub enum SchemaValidationError {
     NestedPartitionParent { table: String, parent: String },
     #[error("table {table}: partition_parent {parent} must have a single string, int or bigint primary key column")]
     PartitionParentKey { table: String, parent: String },
+    #[error(
+        "table {table}: partition route {path:?} must contain 1–8 declared relations and end at a directly partitioned table"
+    )]
+    InvalidPartitionRoute { table: String, path: Vec<String> },
     #[error("table {table}: duplicate relation {relation}")]
     DuplicateRelation { table: String, relation: String },
     #[error("table {table}: relation {relation} targets unknown table {target}")]
@@ -607,6 +640,7 @@ mod tests {
                     primary_key: vec!["id".into()],
                     partition_column: "id".into(),
                     partition_parent: None,
+                    partition_routes: vec![],
                     columns: vec![
                         ColumnSchema {
                             name: "id".into(),
@@ -632,6 +666,7 @@ mod tests {
                     primary_key: vec!["id".into()],
                     partition_column: "organizationId".into(),
                     partition_parent: None,
+                    partition_routes: vec![],
                     columns: vec![
                         ColumnSchema {
                             name: "id".into(),
@@ -802,6 +837,7 @@ mod tests {
             primary_key: vec!["chatbotId".into(), "entityId".into()],
             partition_column: "chatbotId".into(),
             partition_parent: Some(parent.into()),
+            partition_routes: vec![],
             columns: vec![
                 ColumnSchema {
                     name: "chatbotId".into(),
@@ -928,5 +964,31 @@ mod tests {
     fn canonical_json_sorts_keys() {
         let v = serde_json::json!({"b": [1, {"z": 1, "a": 2}], "a": "x"});
         assert_eq!(canonical_json(&v), r#"{"a":"x","b":[1,{"a":2,"z":1}]}"#);
+    }
+    #[test]
+    fn partition_routes_validate_and_preserve_old_hash_when_empty() {
+        let mut schema = sample();
+        let original = schema.compute_hash();
+        assert!(
+            serde_json::to_value(&schema).unwrap()["tables"][1]
+                .get("partition_routes")
+                .is_none()
+        );
+        let relation = schema.tables[1].relations[0].name.clone();
+        schema.tables[1].partition_routes = vec![vec![relation.clone()]];
+        schema.schema_hash = schema.compute_hash();
+        schema.validate().unwrap();
+        assert_ne!(schema.schema_hash, original);
+        for path in [vec![], vec!["missing".into()], vec![relation; 9]] {
+            schema.tables[1].partition_routes = vec![path];
+            schema.schema_hash = schema.compute_hash();
+            assert!(
+                schema
+                    .validate()
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| matches!(e, SchemaValidationError::InvalidPartitionRoute { .. }))
+            );
+        }
     }
 }

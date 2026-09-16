@@ -137,3 +137,34 @@ Query planning is not routing. By the time a query reaches a Durable Object, the
 - [placement.md](placement.md): which Durable Object hosts a partition.
 - [checkpoints.md](checkpoints.md): how sequence numbers survive a restart.
 - [consistency-invariants.md](consistency-invariants.md): the per-partition order guarantee.
+
+## Additional recipients through relations
+
+A table can declare `partitionRoutes: [["permissions"]]` in the TypeScript
+schema. Each path follows one to eight declared relations and ends at a table
+with a direct partition column. The compiled field is `partition_routes`.
+The row keeps its owning partition column; each distinct foreign endpoint
+partition receives an additional copy. For metadata, a path can traverse its
+`document` relation and then the document's `permissions` relation.
+
+The Rust engine maintains a separate SQLite projection containing only shared
+rows and the relationship rows needed to route them. Bootstrap SQL requires a
+non-null recipient different from the owner. A relationship insertion hydrates
+only paths touched by that changed key. Ordinary private rows do not accumulate
+in this projection. Removing the last foreign membership removes the row and
+unreferenced dependencies from the projection. The existing parent index used
+for ordinary ownership routing is unchanged.
+
+The recipient Durable Object fills its own rows plus the foreign rows that
+reach its partition through a declared path. This does not make every source
+row part of every cache. Browser query windows still govern which rows the
+client receives. Relation routing is organization-level replication, not
+user-level authorization: named queries and mutators must still constrain
+permissions to the authenticated partition and subject.
+
+Routing decisions are journaled in the same SQLite transaction as projection
+changes. A replay uses the saved decision, even if a later revoke changed the
+projection. Checkpoint advancement collects covered journal entries. Bootstrap
+and hydration use source reads followed by CDC replay; they do not provide a
+cross-table serializable snapshot. Deployment acceptance must include grants,
+revokes, concurrent writes, and restart/replay behavior against the source.
