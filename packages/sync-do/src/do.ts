@@ -597,15 +597,30 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
           : (sessions
               .clientSubsOf(session)
               .find((s) => s.clientSubId === sub.basedOn && s.status === "live") ?? null)
+      const started = Date.now()
       const outcome = engine.subscribe(
         query.success,
         base === null ? {} : { basedOn: base.subscription },
       )
+      const engineMs = Date.now() - started
       if (Result.isFailure(outcome)) {
         this.send(ws, { type: "subscription_error", id: sub.id, error: outcome.failure })
         return
       }
       sessions.setClientSub(session, sub.id, outcome.success.subscription, outcome.success.status)
+      const snapshot = outcome.success.events.find(
+        (e) => e.type === "snapshot" && e.subscription === outcome.success.subscription,
+      )
+      // One line per subscribe, no row contents: how long the engine took and what it sends.
+      log({
+        event: "orbit.subscription.subscribed",
+        partition,
+        status: outcome.success.status,
+        engine_ms: engineMs,
+        rows: snapshot?.type === "snapshot" ? snapshot.rows.length : 0,
+        members: snapshot?.type === "snapshot" ? snapshot.members.length : 0,
+        based_on: base !== null,
+      })
       this.send(ws, {
         type: "subscribed",
         id: sub.id,
