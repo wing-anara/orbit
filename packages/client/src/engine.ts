@@ -87,6 +87,8 @@ interface Subscription {
   pendingChunks: { rows: Array<RowUpdate>; members: Array<MemberRef> } | null
   /** Set while the subscription has no references and waits out `queryTtlMs`. */
   retention: ReturnType<typeof setTimeout> | null
+  /** The cache changed under an unreferenced subscription; it reads again when referenced. */
+  dirty: boolean
   /** The query as planned locally at registration; identifies a grown window of it. */
   readonly localQuery: Query
   /**
@@ -114,6 +116,11 @@ export interface EngineConfig {
   readonly pushUrl?: string
   readonly fetch?: typeof fetch
   readonly storageMode?: "opfs" | "memory"
+  /**
+   * Push the pending mutations of a database another tab left behind and nothing else: no
+   * persisted subscription is restored (see `createOrbitClient`).
+   */
+  readonly drainOnly?: boolean
   readonly makeWebSocket?: (url: string, protocols: ReadonlyArray<string>) => WebSocket
   readonly backoffMinMs?: number
   readonly backoffMaxMs?: number
@@ -252,7 +259,9 @@ export class ClientEngine {
             }),
         })
       }
-      for (const persisted of yield* this.store.subscriptions()) {
+      for (const persisted of this.config.drainOnly === true
+        ? []
+        : yield* this.store.subscriptions()) {
         const planned = this.store.plan(persisted.query)
         if (Result.isFailure(planned)) continue
         const sub = this.register(persisted.id, persisted.ref, planned.success, 0)
@@ -431,6 +440,7 @@ export class ClientEngine {
       snapshot: { status: "pending", rows: [], error: null, cursor: null },
       pendingChunks: null,
       retention: null,
+      dirty: false,
       localQuery: planned.query,
       basedOn: null,
     }
@@ -492,6 +502,7 @@ export class ClientEngine {
       const id = subscriptionIdOf(wire, planned.success)
       const fresh = !this.subscriptions.has(id)
       const sub = this.register(id, wire, planned.success, 1)
+      if (!fresh && sub.dirty) yield* this.refresh(sub)
       if (fresh) {
         yield* this.store.registerSubscription(id, wire, planned.success.query)
         yield* this.refresh(sub)
@@ -578,6 +589,14 @@ export class ClientEngine {
 
   private refresh(sub: Subscription): Effect.Effect<void, StoreError> {
     return Effect.gen({ self: this }, function* () {
+      // A retained query nobody references (a window the user scrolled past, a query the
+      // application left) is not re-read on every change: it reads once when referenced again.
+      // Otherwise every growth of a window re-reads every smaller window it grew from.
+      if (sub.refs === 0) {
+        sub.dirty = true
+        return
+      }
+      sub.dirty = false
       // A subscription that has no snapshot yet has no membership to read through. Answer it
       // from the local cache at once (rows other subscriptions and pending mutations already
       // hold); the server's snapshot replaces the set when it arrives and the status turns live.

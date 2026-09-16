@@ -1062,6 +1062,82 @@ describe("client-side mutations", () => {
     await again.close()
   })
 
+  it(
+    "the first tab pushes the mutations a closed tab queued offline in its own slot",
+    { timeout: 15_000 },
+    async () => {
+      const { server, push, open } = await setup({ pushReachable: false })
+      // A second tab: its own slot, one mutation queued while the push endpoint was unreachable,
+      // then closed. The log stays in its database.
+      const orphan = reloadable(nodeAsyncDriver())
+      const closedTab = await createOrbitClient({
+        definition: sync,
+        schema,
+        url: "http://fake",
+        partition: "org_1",
+        getToken: async () => "t",
+        driver: orphan,
+        clientId: "c-tab2",
+        mutators,
+        pushUrl: "http://fake/push",
+        fetch: push.fetch,
+        makeWebSocket: server.connect,
+        backoffMinMs: 5,
+        backoffMaxMs: 20,
+      })
+      const queued = closedTab.mutate.createDocument({ id: "n2", groupId: null })
+      await queued.local
+      await closedTab.close()
+      expect(await orphan.query(`SELECT count(*) AS n FROM pending_mutations`)).toEqual([{ n: 1 }])
+
+      // The server's `orbit_clients` scope is live before the drain pushes, as in production,
+      // where a fill reflects the rows committed meanwhile.
+      const warm = await open()
+      await waitFor(() => server.pendingFills.length >= 1, 2000, "client row fill")
+      for (const fill of [...server.pendingFills]) server.completeFill(fill.table, [])
+      await warm.close()
+
+      // The first tab opens with the endpoint reachable: it drains the slot as the closed tab.
+      push.reachable = true
+      const logs: Array<{ event: string; data: Record<string, unknown> }> = []
+      const first = await createOrbitClient({
+        definition: sync,
+        schema,
+        url: "http://fake",
+        partition: "org_1",
+        getToken: async () => "t",
+        driver: reloadable(nodeAsyncDriver()),
+        clientId: "c1",
+        mutators,
+        pushUrl: "http://fake/push",
+        fetch: push.fetch,
+        makeWebSocket: server.connect,
+        backoffMinMs: 5,
+        backoffMaxMs: 20,
+        openSlot: async (slot) => (slot === 1 ? orphan : null),
+        onLog: (event, data) => logs.push({ event, data }),
+      })
+      const deadline = Date.now() + 5000
+      while (Date.now() < deadline && !logs.some((l) => l.event === "store.drained")) {
+        for (const fill of [...server.pendingFills]) server.completeFill(fill.table, [])
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      const drained = logs.find((l) => l.event === "store.drained")
+      if (drained === undefined)
+        console.log(
+          JSON.stringify({
+            pushes: push.requests.map((r) => r.clientId),
+            orphanLog: await orphan.query(`SELECT id, pushed FROM pending_mutations`),
+            events: logs.map((l) => l.event),
+          }),
+        )
+      expect(drained?.data).toEqual({ slot: 1, pending: 1, remaining: 0 })
+      expect(await orphan.query(`SELECT count(*) AS n FROM pending_mutations`)).toEqual([{ n: 0 }])
+      expect(push.requests.map((r) => r.clientId)).toContain("c-tab2")
+      await first.close()
+    },
+  )
+
   it("pushes contiguous ids and confirms through sync without an empty state", async () => {
     const { server, push, driver, events, open } = await setup({ deferCommit: true })
     const client = await open()

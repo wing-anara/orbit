@@ -63,13 +63,17 @@ const classify = (
   return { code: "sql", message }
 }
 
-const open = async (name: string, mode: "opfs" | "memory"): Promise<void> => {
+const open = async (
+  name: string,
+  mode: "opfs" | "memory",
+  poolName = "orbit-sahpool",
+): Promise<void> => {
   if (sqlite3 === null) sqlite3 = await sqlite3InitModule()
   if (db !== null) return
   if (mode === "memory") {
     db = new sqlite3.oo1.DB(":memory:", "c")
   } else {
-    pool = await sqlite3.installOpfsSAHPoolVfs({ name: "orbit-sahpool", initialCapacity: 6 })
+    pool = await sqlite3.installOpfsSAHPoolVfs({ name: poolName, initialCapacity: 6 })
     db = new pool.OpfsSAHPoolDb(`/${name}.sqlite3`)
   }
   db.exec("PRAGMA foreign_keys = OFF; PRAGMA synchronous = NORMAL;")
@@ -125,7 +129,7 @@ const handleRequest = async (event: MessageEvent<unknown>): Promise<void> => {
   try {
     switch (request.type) {
       case "open":
-        await open(request.name, request.mode)
+        await open(request.name, request.mode, request.pool)
         post({ type: "ok", id: request.id })
         return
       case "query":

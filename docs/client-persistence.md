@@ -15,7 +15,9 @@ Two storage modes exist:
 
 The default database name is `orbit-<app>-<partition>`. Pass `databaseName` to override it. The worker sets `PRAGMA synchronous = NORMAL` and `PRAGMA foreign_keys = OFF`.
 
-The pool is exclusive. Only one browsing context per origin can hold it. `createOrbitClient` in `packages/client/src/client.ts` handles the failure: when the open fails with code `locked` (a second tab holds the pool) or `unsupported` (private mode, an old browser), it logs `store.fallback` and opens a `memory` database with a fresh worker. Any other error is thrown as `OrbitClientError`. If the caller asked for `memory`, no fallback happens.
+A pool is exclusive. Only one browsing context per origin can hold it. `createOrbitClient` in `packages/client/src/client.ts` gives each tab its own pool (a slot): the first tab holds `orbit-sahpool`, the next tab `orbit-sahpool-1`, and so on up to `tabs` slots (default 4). Each slot is a full database with its own client id, cursor and pending log, so a mutation queued offline outlives the tab that queued it. The first tab drains the other slots at startup: it opens each slot nobody holds, and when its pending log is not empty it runs a drain engine as that client (`drainOnly`, no subscriptions restored) until the log is confirmed or 60 seconds pass. The log events are `store.slot`, `store.drain`, `store.drained` and `store.drain_failed`.
+
+When every slot is held, or the open fails with `unsupported` (private mode, an old browser), the client logs `store.fallback` and opens a `memory` database with a fresh worker. Any other error is thrown as `OrbitClientError`. If the caller asked for `memory`, no fallback happens.
 
 The chosen mode is visible as `storageMode` in the status object. An application can show it in its user interface. A tab in `memory` mode works, but it starts empty and loses everything on reload.
 
@@ -106,6 +108,8 @@ The store resets itself in two cases: `planMigration` returns `reset` (see [sche
 A live query renders before the server answers. While a subscription has no snapshot yet, the engine evaluates it over the local cache, so a query whose rows other subscriptions already hold (a narrower filter, a folder that was preloaded) shows its rows at once with status `pending`. The server's snapshot then replaces the set and the status turns `live`. Rows the cache does not hold appear when the snapshot lands.
 
 A window that grows on scroll extends its previous subscription (`subscribe.basedOn`). The store records the link in `subscriptions.based_on` and keeps the base's rows under the base: a read follows the chain, a membership removal reaches every window in the chain (they are subsets of each other), and when a base retires or gets a complete snapshot its rows move to the windows that extend it. A grown window therefore writes only its new members.
+
+A retained query that nobody references is not re-read on every change. It is marked dirty and reads once when it is referenced again. Without this, every growth of a window re-reads every smaller window it grew from.
 
 A released query is not dropped at once. It stays subscribed for `queryTtlMs` (default five minutes), so its rows stay cached and current through deltas, and a component that subscribes again within that time is `live` immediately, online or offline. When the TTL passes with no reference, the engine unsubscribes and garbage-collects the rows only that query referenced. Set `queryTtlMs: 0` to retire queries at once. Zero calls the same idea the query TTL.
 

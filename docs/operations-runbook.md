@@ -102,7 +102,7 @@ The Durable Object writes one JSON line per event to `console.log` (`packages/sy
 
 - `orbit.cdc.batch`: `partition`, `status`, `applied_seq`, `duplicates`, `apply_ms`, `transactions`, `first_gtid`, `sessions`, `total_ms`. A rejected batch carries `reason`.
 - `orbit.fill.completed`: `partition`, `fill_id`, `status`, `rows`, `position`, `duration_ms`, or `error`.
-- `orbit.subscription.subscribed`: `partition`, `status`, `engine_ms`, `rows`, `members`, `based_on`. One line per subscribe: how long the engine took to register and materialize the query, and what the first snapshot carries (`based_on` when the client extended a window in place).
+- `orbit.subscription.subscribed`: `partition`, `status`, `rows`, `members`, `based_on`. One line per subscribe: what the first snapshot carries (`based_on` when the client extended a window in place). No duration: the Workers clock does not advance during synchronous work.
 - `orbit.subscriptions.swept`: `partition`, `count`. The alarm dropped subscriptions that no session held for longer than `subscriptionGraceMs` (default one hour, `makeSyncDurableObject` config). Until then an orphaned subscription stays materialized so a reload or a redeploy does not rewrite its membership.
 
 Row contents never appear in logs.

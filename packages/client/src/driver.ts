@@ -56,6 +56,8 @@ export const WorkerRequest = Schema.Union([
     id: Schema.Finite,
     name: Schema.String,
     mode: Schema.Literals(["opfs", "memory"]),
+    /** The OPFS pool (directory) to hold; each tab holds its own (see `createOrbitClient`). */
+    pool: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     type: Schema.Literal("query"),

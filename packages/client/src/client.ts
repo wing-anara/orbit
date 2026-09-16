@@ -64,6 +64,15 @@ export interface OrbitClientConfig<D, M extends MutatorDefinitions<D> = Record<n
   /** A ready driver (tests and non-browser hosts). */
   readonly driver?: AsyncSqlDriver
   readonly databaseName?: string
+  /**
+   * How many tabs per origin keep a persistent database. Each tab holds its own OPFS pool
+   * (slot), so an edit queued offline survives the tab that made it; the first tab pushes the
+   * pending mutations that closed tabs left behind. Beyond this many tabs, a tab falls back to
+   * memory. Default 4.
+   */
+  readonly tabs?: number
+  /** Test seam: opens the database of a slot, or null when a tab holds it. */
+  readonly openSlot?: (slot: number) => Promise<AsyncSqlDriver | null>
   /** Overrides the client id persisted in the local database. */
   readonly clientId?: string
   readonly onLog?: (event: string, data: Record<string, unknown>) => void
@@ -140,6 +149,41 @@ export class OrbitClientError extends Error {
   }
 }
 
+/** The OPFS pool a tab slot holds; slot 0 is the pool name of single-tab databases. */
+export const slotPool = (slot: number): string =>
+  slot === 0 ? "orbit-sahpool" : `orbit-sahpool-${slot}`
+
+const DEFAULT_TABS = 4
+const DRAIN_TIMEOUT_MS = 60_000
+
+const isLocked = (e: unknown): boolean => e instanceof SqlDriverError && e.code === "locked"
+
+const pendingCount = async (driver: AsyncSqlDriver): Promise<number> => {
+  try {
+    const rows = await driver.query(`SELECT count(*) AS n FROM pending_mutations`)
+    const n = rows[0]?.["n"]
+    return typeof n === "number" ? n : 0
+  } catch {
+    return 0
+  }
+}
+
+/** Resolves when the drain engine's pending log is confirmed, or after the drain timeout. */
+const drained = (drain: ClientEngine): Promise<void> =>
+  new Promise<void>((resolve) => {
+    let off: (() => void) | null = null
+    const done = (): void => {
+      clearTimeout(timer)
+      off?.()
+      resolve()
+    }
+    const timer = setTimeout(done, DRAIN_TIMEOUT_MS)
+    off = drain.onStatus(() => {
+      if (drain.getStatus().pendingMutations === 0) done()
+    })
+    if (drain.getStatus().pendingMutations === 0) done()
+  })
+
 export const createOrbitClient = async <
   D extends SyncSchemaDefinition<never, unknown> | { readonly _tag: "SyncSchemaDefinition" },
   M extends MutatorDefinitions<D> = Record<never, never>,
@@ -147,18 +191,48 @@ export const createOrbitClient = async <
   config: OrbitClientConfig<D, M>,
 ): Promise<OrbitClient<D, M>> => {
   const requested = config.storage ?? "opfs"
+  const tabs = Math.max(1, config.tabs ?? DEFAULT_TABS)
+  const databaseName = config.databaseName ?? `orbit-${config.schema.app}-${config.partition}`
   let mode: StorageMode = requested
   let driver = config.driver
+  // The slot this tab holds; the first slot also pushes what closed tabs left behind.
+  let slot = 0
+  /** The database of another slot, or null while a tab holds it. */
+  const openSlot =
+    config.openSlot ??
+    (async (s: number): Promise<AsyncSqlDriver | null> => {
+      if (config.worker === undefined) return null
+      try {
+        return await openWorkerDriver(config.worker(), databaseName, "opfs", slotPool(s))
+      } catch (e) {
+        if (isLocked(e)) return null
+        throw e
+      }
+    })
   if (driver === undefined) {
     if (config.worker === undefined)
       throw new OrbitClientError("createOrbitClient needs either `driver` or `worker`")
-    const name = config.databaseName ?? `orbit-${config.schema.app}-${config.partition}`
     try {
-      driver = await openWorkerDriver(config.worker(), name, requested)
+      if (requested === "memory")
+        driver = await openWorkerDriver(config.worker(), databaseName, "memory")
+      else {
+        // An OPFS pool is exclusive to one context per origin. Each tab holds its own slot, so
+        // its database (and the mutations it queued offline) outlives the tab.
+        for (; slot < tabs && driver === undefined; slot++) {
+          const opened = await openSlot(slot)
+          if (opened !== null) {
+            driver = opened
+            break
+          }
+        }
+        if (driver === undefined)
+          throw new SqlDriverError({ code: "locked", message: `${tabs} tabs hold every slot` })
+        if (slot > 0) config.onLog?.("store.slot", { slot, pool: slotPool(slot) })
+      }
     } catch (e) {
-      // OPFS is exclusive to one context per origin (another tab holds the pool) or unavailable
-      // (private mode, unsupported browser). Fall back to an in-memory database so the tab still
-      // works; persistence resumes once it can hold the pool. Any other error is reported.
+      // Every slot is held by another tab, or OPFS is unavailable (private mode, unsupported
+      // browser). Fall back to an in-memory database so the tab still works. Any other error is
+      // reported.
       const recoverable =
         e instanceof SqlDriverError && (e.code === "locked" || e.code === "unsupported")
       if (!recoverable || requested === "memory")
@@ -168,14 +242,15 @@ export const createOrbitClient = async <
         )
       config.onLog?.("store.fallback", { from: requested, to: "memory", reason: e.message })
       mode = "memory"
-      driver = await openWorkerDriver(config.worker(), name, "memory")
+      driver = await openWorkerDriver(config.worker(), databaseName, "memory")
     }
   }
-  const engine = new ClientEngine({
+  const engineConfig = (d: AsyncSqlDriver, drainOnly: boolean) => ({
     schema: config.schema,
     partition: config.partition,
-    driver,
+    driver: d,
     storageMode: mode,
+    ...(drainOnly ? { drainOnly } : {}),
     target: async () => {
       const token = await config.getToken()
       const base = config.url.replace(/^http/, "ws").replace(/\/$/, "")
@@ -185,7 +260,8 @@ export const createOrbitClient = async <
         protocols: [WS_SUBPROTOCOL, `${WS_TOKEN_PREFIX}${encodeURIComponent(token)}`],
       }
     },
-    ...(config.clientId === undefined ? {} : { clientId: config.clientId }),
+    // A drained database keeps the client id of the tab that wrote it.
+    ...(config.clientId === undefined || drainOnly ? {} : { clientId: config.clientId }),
     ...(config.subject === undefined ? {} : { subject: config.subject }),
     ...(config.mutators === undefined ? {} : { mutators: config.mutators }),
     ...(config.pushUrl === undefined ? {} : { pushUrl: config.pushUrl }),
@@ -198,6 +274,7 @@ export const createOrbitClient = async <
     ...(config.pingIntervalMs === undefined ? {} : { pingIntervalMs: config.pingIntervalMs }),
     ...(config.pongTimeoutMs === undefined ? {} : { pongTimeoutMs: config.pongTimeoutMs }),
   })
+  const engine = new ClientEngine(engineConfig(driver, false))
   try {
     await Effect.runPromise(engine.open())
   } catch (e) {
@@ -206,6 +283,40 @@ export const createOrbitClient = async <
       e,
     )
   }
+
+  /**
+   * Pushes the mutations that closed tabs queued offline in their own slots. Each orphaned
+   * database is opened as the client that wrote it, connected until its pending log is
+   * confirmed (or a timeout passes), and closed again.
+   */
+  const drainOrphans = async (): Promise<void> => {
+    for (let s = 1; s < tabs; s++) {
+      let orphan: AsyncSqlDriver | null = null
+      try {
+        orphan = await openSlot(s)
+        if (orphan === null) continue
+        const pending = await pendingCount(orphan)
+        if (pending === 0) {
+          await orphan.close()
+          continue
+        }
+        config.onLog?.("store.drain", { slot: s, pending })
+        const drain = new ClientEngine(engineConfig(orphan, true))
+        await Effect.runPromise(drain.open())
+        await drained(drain)
+        const remaining = await pendingCount(orphan)
+        await Effect.runPromise(drain.close())
+        config.onLog?.("store.drained", { slot: s, pending, remaining })
+      } catch (e) {
+        config.onLog?.("store.drain_failed", {
+          slot: s,
+          error: e instanceof Error ? e.message : String(e),
+        })
+        await orphan?.close().catch(() => undefined)
+      }
+    }
+  }
+  if (mode === "opfs" && slot === 0 && config.mutators !== undefined) void drainOrphans()
 
   const subscribe = <N extends string, I extends IncludeShape>(
     query: TypedQuery<D, N, I> | NamedQueryCall<D, N, I>,

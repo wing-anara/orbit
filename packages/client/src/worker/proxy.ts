@@ -36,6 +36,7 @@ export const openWorkerDriver = async (
   worker: Worker,
   name: string,
   mode: "opfs" | "memory",
+  pool?: string,
 ): Promise<WorkerDriver> => {
   let nextId = 1
   const pending = new Map<number, Pending>()
@@ -72,7 +73,13 @@ export const openWorkerDriver = async (
     })
   }
 
-  await call({ type: "open", name, mode })
+  try {
+    await call({ type: "open", name, mode, ...(pool === undefined ? {} : { pool }) })
+  } catch (e) {
+    // A worker whose open failed (the pool is held by another tab) has nothing to keep.
+    worker.terminate()
+    throw e
+  }
 
   return {
     query: async (sql, params = []) => {
