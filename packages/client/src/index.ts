@@ -37,3 +37,12 @@ export {
 export { SqlDriverError, type AsyncSqlDriver, type Statement, type StorageMode } from "./driver.ts"
 export { openWorkerDriver, type WorkerDriver } from "./worker/proxy.ts"
 export { type ConnectionState } from "./connection.ts"
+
+export {
+  createSharedOrbitClient,
+  SharedOwnerChangedError,
+  type SharedOrbitClient,
+  type SharedOrbitClientConfig,
+  type SharedMutate,
+  type SharedMutationHandle,
+} from "./shared/client.ts"

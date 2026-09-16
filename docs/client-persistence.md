@@ -158,3 +158,60 @@ Browser events shorten the wait. An `offline` event closes the socket with code 
 Resume is snapshot-based. The server answers every reconnect with a fresh snapshot per subscription, taken at one cursor. The store applies each snapshot as a diff against what it has, so unchanged rows are rewritten but not duplicated. The test `reconnects after a drop` confirms that changes made while offline appear after the reconnect.
 
 A malformed server message is not dropped. The connection turns it into a fatal `invalid_message` error that the engine exposes as `fatalError`.
+
+## Sharing a browser cache across tabs
+
+Use `createSharedOrbitClient` when tabs for the same signed-in identity should share a
+cache. It accepts the ordinary client configuration plus a required stable `subject`.
+The scope includes the normalized sync server URL, schema app, partition, subject, and
+optional database name. Different identities never share an OPFS pool or channel.
+
+```ts
+const client = await createSharedOrbitClient({
+  definition: sync,
+  schema: artifact,
+  url: "https://app.example.com/orbit",
+  partition: organizationId,
+  subject: userId,
+  getToken,
+  worker: () => new SqliteWorker(),
+  mutators,
+  pushUrl: "https://app.example.com/orbit/push",
+})
+const mutation = client.mutate.renameDocument({ id, name })
+await mutation.local
+const idInDurableQueue = await mutation.id
+const outcome = await mutation.server
+```
+
+Web Locks elect one owner. That tab runs the existing dedicated SQLite worker, engine,
+WebSocket, and mutation queue. Other tabs use BroadcastChannel RPC and keep only their
+query results. Identical queries share an engine subscription and each changed result
+is broadcast once. Peer Web Locks release query references when tabs disappear.
+There is no timer-based lease, competing writer, or silent in-memory fallback.
+
+Closing or crashing the owner releases its locks. A waiting tab opens the same OPFS
+pool, resumes the same client id and pending log, and restores active queries. The
+`freeze`/`pagehide` hooks terminate the worker and socket before releasing ownership;
+`resume`/`pageshow` rejoin. Browsers must support Web Locks, BroadcastChannel, and the
+configured SQLite storage. An incompatible schema in another tab fails explicitly;
+reload or close old tabs before using the new schema.
+
+Mutation ids are allocated by the owner, so **shared mutation handles expose
+`id: Promise<number>`**, while `local` and `server` retain their usual meaning. The
+ordinary `createOrbitClient` API still exposes a synchronous id. A locally acknowledged
+mutation survives owner handoff and its `server` promise reconnects to the durable
+outcome. The last 1,024 outcomes are retained. Requests whose local commit was not
+acknowledged reject with `SharedOwnerChangedError`; inspect current state before retrying
+because the write may have committed immediately before the owner disappeared.
+`awaitMutation(id)` recovers a known outcome or waits on a still-pending mutation; it
+rejects for unknown/pruned ids. These receipts are local recovery metadata, not an audit log.
+
+For an upgrade from the original per-tab storage, opt into `legacySlots: 4` (or the old
+configured slot count). On owner startup, available old slots with the same partition
+and schema are drained with their original client ids and current authenticated push
+transport. Their cached views are never imported into the new identity-scoped database.
+Recovery does not clear old databases. Slots held by old tabs are skipped; reload the
+remaining old tabs, then reopen a shared owner to recover their queues. Incompatible
+legacy schemas are left intact and logged as `store.recovery_skipped` rather than reset.
+Temporary recovery workers/connections may exist until those old queues drain.

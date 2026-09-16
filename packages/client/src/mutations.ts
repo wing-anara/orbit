@@ -25,7 +25,7 @@ import {
   JsonValue,
   MUTATION_PROTOCOL_VERSION,
   ORBIT_CLIENTS_TABLE,
-  type MutationOutcome,
+  MutationOutcome,
   type PushRequest,
   type PushResponse,
 } from "@orbit/protocol"
@@ -255,6 +255,10 @@ export class MutationManager {
   private readonly serverRejecters = new Map<number, (error: unknown) => void>()
   /** Mutation ids whose local replay failed, so the failure is reported once. */
   private readonly replayFailed = new Set<number>()
+  private readonly observers = new Map<
+    number,
+    Set<{ resolve: (outcome: MutationOutcome) => void; reject: (error: Error) => void }>
+  >()
   private pushing = false
   private pushAgain = false
   private wake: (() => void) | null = null
@@ -290,7 +294,8 @@ export class MutationManager {
       const last = await Effect.runPromise(
         this.config.store.lastMutationIdOf(ORBIT_CLIENTS_TABLE, this.config.clientId),
       )
-      this.lastId = Math.max(pending.at(-1)?.id ?? 0, last ?? 0)
+      const receipts = await this.driver.query(`SELECT MAX(id) AS id FROM mutation_outcomes`)
+      this.lastId = Math.max(pending.at(-1)?.id ?? 0, last ?? 0, Number(receipts[0]?.["id"] ?? 0))
       await this.rebase([])
     })
   }
@@ -317,6 +322,60 @@ export class MutationManager {
       () => this.kick(),
     )
     return { id, local, server }
+  }
+
+  observe(id: number): Promise<MutationOutcome> {
+    if (!Number.isSafeInteger(id) || id < 1 || id > this.lastId || this.closed)
+      return Promise.reject(new Error("Mutation is not available in this client"))
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject }
+      const waiting = this.observers.get(id) ?? new Set()
+      waiting.add(waiter)
+      this.observers.set(id, waiting)
+      void this.config.lock
+        .run(async () => {
+          const rows = await this.driver.query(
+            `SELECT outcome FROM mutation_outcomes WHERE id = ?`,
+            [id],
+          )
+          const value = rows[0]?.["outcome"]
+          if (typeof value === "string") {
+            this.settle(id, Schema.decodeUnknownSync(MutationOutcome)(JSON.parse(value)))
+          } else {
+            const pending = await this.driver.query(
+              `SELECT id FROM pending_mutations WHERE id = ?`,
+              [id],
+            )
+            if (pending.length === 0) {
+              waiting.delete(waiter)
+              if (waiting.size === 0) this.observers.delete(id)
+              reject(new Error("Mutation outcome is no longer retained"))
+            }
+          }
+        })
+        .catch((error: unknown) => {
+          waiting.delete(waiter)
+          if (waiting.size === 0) this.observers.delete(id)
+          reject(error instanceof Error ? error : new Error(String(error)))
+        })
+    })
+  }
+
+  private async remember(
+    outcomes: ReadonlyArray<MutationOutcome>,
+    overwrite = true,
+  ): Promise<void> {
+    if (outcomes.length === 0) return
+    await this.driver.batch([
+      ...outcomes.map((outcome) => ({
+        sql: `INSERT OR ${overwrite ? "REPLACE" : "IGNORE"} INTO mutation_outcomes (id, outcome) VALUES (?, ?)`,
+        params: [outcome.id, JSON.stringify(outcome)],
+      })),
+      {
+        sql: `DELETE FROM mutation_outcomes WHERE id < (SELECT MAX(id) - 1023 FROM mutation_outcomes)`,
+        params: [],
+      },
+    ])
   }
 
   private context(id: number): MutationContext {
@@ -412,6 +471,10 @@ export class MutationManager {
     )
     if (last !== null && last > this.lastId) this.lastId = last
     const confirmed = last === null ? [] : pending.filter((m) => m.id <= last)
+    await this.remember(
+      confirmed.map((m) => ({ id: m.id, status: "applied" as const })),
+      false,
+    )
     await this.rebase(confirmed.map((m) => m.id))
     for (const m of confirmed) {
       this.settle(m.id, { id: m.id, status: "applied" })
@@ -427,6 +490,8 @@ export class MutationManager {
     this.serverWaiters.delete(id)
     this.serverRejecters.delete(id)
     resolve?.(outcome)
+    for (const waiter of this.observers.get(id) ?? []) waiter.resolve(outcome)
+    this.observers.delete(id)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -446,6 +511,13 @@ export class MutationManager {
 
   close(): void {
     this.closed = true
+    const error = new Error("Orbit mutation manager closed")
+    for (const reject of this.serverRejecters.values()) reject(error)
+    this.serverRejecters.clear()
+    this.serverWaiters.clear()
+    for (const waiting of this.observers.values())
+      for (const waiter of waiting) waiter.reject(error)
+    this.observers.clear()
     this.wake?.()
   }
 
@@ -532,6 +604,7 @@ export class MutationManager {
   ): Promise<boolean> {
     const names = new Map(batch.map((m) => [m.id, m.name] as const))
     if (response.type === "ok") {
+      await this.remember(response.outcomes)
       const pushed: Array<number> = []
       const failed: Array<MutationOutcome & { status: "failed" }> = []
       for (const outcome of response.outcomes) {
@@ -562,6 +635,7 @@ export class MutationManager {
       if (last > this.lastId) this.lastId = last
       const applied = batch.filter((m) => m.id <= last)
       if (applied.length > 0) {
+        await this.remember(applied.map((m) => ({ id: m.id, status: "duplicate" as const })))
         await this.rebase(applied.map((m) => m.id))
         await this.config.onChanged(null)
         for (const m of applied) {

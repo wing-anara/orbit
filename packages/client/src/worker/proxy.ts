@@ -37,6 +37,7 @@ export const openWorkerDriver = async (
   name: string,
   mode: "opfs" | "memory",
   pool?: string,
+  signal?: AbortSignal,
 ): Promise<WorkerDriver> => {
   let nextId = 1
   const pending = new Map<number, Pending>()
@@ -62,6 +63,17 @@ export const openWorkerDriver = async (
     pending.clear()
   })
 
+  const abort = (): void => {
+    if (closed) return
+    closed = true
+    worker.terminate()
+    const error = new SqlDriverError({ code: "closed", message: "SQLite worker aborted" })
+    for (const request of pending.values()) request.reject(error)
+    pending.clear()
+  }
+  signal?.addEventListener("abort", abort, { once: true })
+  if (signal?.aborted) abort()
+
   type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never
   const call = (request: DistributiveOmit<WorkerRequest, "id">): Promise<WorkerResponse> => {
     if (closed)
@@ -77,6 +89,7 @@ export const openWorkerDriver = async (
     await call({ type: "open", name, mode, ...(pool === undefined ? {} : { pool }) })
   } catch (e) {
     // A worker whose open failed (the pool is held by another tab) has nothing to keep.
+    signal?.removeEventListener("abort", abort)
     worker.terminate()
     throw e
   }
@@ -102,6 +115,7 @@ export const openWorkerDriver = async (
       if (closed) return
       await call({ type: "close" })
       closed = true
+      signal?.removeEventListener("abort", abort)
       worker.terminate()
     },
   }

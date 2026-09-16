@@ -75,6 +75,7 @@ const STORE_DDL: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS membership (subscription TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, tbl, key))`,
   `CREATE INDEX IF NOT EXISTS membership_row ON membership (tbl, key)`,
   `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, ref TEXT, cursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0, based_on TEXT)`,
+  `CREATE TABLE IF NOT EXISTS mutation_outcomes (id INTEGER PRIMARY KEY, outcome TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS pending_mutations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, args TEXT NOT NULL, created_at INTEGER NOT NULL, pushed INTEGER NOT NULL DEFAULT 0)`,
 ]
 
@@ -241,6 +242,7 @@ export class LocalStore {
           { sql: `DELETE FROM membership`, params: [] },
           { sql: `DELETE FROM subscriptions`, params: [] },
           { sql: `DELETE FROM pending_mutations`, params: [] },
+          { sql: `DELETE FROM mutation_outcomes`, params: [] },
           { sql: `DELETE FROM meta`, params: [] },
         )
       }

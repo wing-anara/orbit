@@ -1,3 +1,4 @@
+import type { MutationOutcome } from "@orbit/protocol"
 /**
  * The client engine: owns the local store, the connection, the live queries and the mutations.
  *
@@ -810,6 +811,11 @@ export class ClientEngine {
   // ---------------------------------------------------------------------------------------------
 
   /** Applies a mutator locally and queues it for the push loop. */
+  awaitMutation(id: number): Promise<MutationOutcome> {
+    if (this.mutations === null) return Promise.reject(new Error("Mutators are not configured"))
+    return this.mutations.observe(id)
+  }
+
   mutate(name: string, args: unknown): MutationHandle {
     const manager = this.mutations
     if (manager === null) throw new Error("createOrbitClient was called without `mutators`")

@@ -21,7 +21,7 @@
  */
 
 import { Effect } from "effect"
-import type { SyncSchema } from "@orbit/protocol"
+import type { MutationOutcome, SyncSchema } from "@orbit/protocol"
 import { WS_SUBPROTOCOL, WS_TOKEN_PREFIX } from "@orbit/protocol/client"
 import type { DefinedMutators, MutatorArgs, MutatorDefinitions } from "@orbit/mutators"
 import { NamedQueryCall, type IncludeShape, type ResultRow, type TypedQuery } from "@orbit/query"
@@ -64,6 +64,15 @@ export interface OrbitClientConfig<D, M extends MutatorDefinitions<D> = Record<n
   /** A ready driver (tests and non-browser hosts). */
   readonly driver?: AsyncSqlDriver
   readonly databaseName?: string
+  /** OPFS pool namespace; callers sharing a database must also coordinate its owner. */
+  readonly pool?: string
+  /** Disable the memory fallback when durable ownership is required. Default true. */
+  readonly storageFallback?: boolean
+  readonly signal?: AbortSignal
+  /** Recover pending writes from this many pre-shared OPFS slots, without importing their views. */
+  readonly legacySlots?: number
+  /** Test seam for legacy slot recovery. */
+  readonly openLegacySlot?: (slot: number) => Promise<AsyncSqlDriver | null>
   /**
    * How many tabs per origin keep a persistent database. Each tab holds its own OPFS pool
    * (slot), so an edit queued offline survives the tab that made it; the first tab pushes the
@@ -113,6 +122,7 @@ export interface OrbitClient<D, M extends MutatorDefinitions<D> = Record<never, 
   readonly read: <N extends string, I extends IncludeShape = {}>(
     query: TypedQuery<D, N, I> | NamedQueryCall<D, N, I>,
   ) => Promise<ReadonlyArray<ResultRow<D, N, I>>>
+  readonly awaitMutation: (id: number) => Promise<MutationOutcome>
   readonly mutate: Mutate<M>
   readonly onMutation: (listener: (event: MutationEvent) => void) => () => void
   readonly getStatus: () => SyncStatus
@@ -169,19 +179,22 @@ const pendingCount = async (driver: AsyncSqlDriver): Promise<number> => {
 }
 
 /** Resolves when the drain engine's pending log is confirmed, or after the drain timeout. */
-const drained = (drain: ClientEngine): Promise<void> =>
+const drained = (drain: ClientEngine, signal?: AbortSignal): Promise<void> =>
   new Promise<void>((resolve) => {
     let off: (() => void) | null = null
     const done = (): void => {
       clearTimeout(timer)
+      signal?.removeEventListener("abort", done)
       off?.()
       resolve()
     }
     const timer = setTimeout(done, DRAIN_TIMEOUT_MS)
     off = drain.onStatus(() => {
-      if (drain.getStatus().pendingMutations === 0) done()
+      signal?.addEventListener("abort", done, { once: true })
+      if (signal?.aborted || drain.getStatus().pendingMutations === 0) done()
     })
-    if (drain.getStatus().pendingMutations === 0) done()
+    signal?.addEventListener("abort", done, { once: true })
+    if (signal?.aborted || drain.getStatus().pendingMutations === 0) done()
   })
 
 export const createOrbitClient = async <
@@ -190,8 +203,13 @@ export const createOrbitClient = async <
 >(
   config: OrbitClientConfig<D, M>,
 ): Promise<OrbitClient<D, M>> => {
+  const recovery = new AbortController()
+  const stopRecovery = (): void => recovery.abort()
+  config.signal?.addEventListener("abort", stopRecovery, { once: true })
   const requested = config.storage ?? "opfs"
   const tabs = Math.max(1, config.tabs ?? DEFAULT_TABS)
+  const poolForSlot = (s: number): string =>
+    config.pool === undefined ? slotPool(s) : s === 0 ? config.pool : `${config.pool}-${s}`
   const databaseName = config.databaseName ?? `orbit-${config.schema.app}-${config.partition}`
   let mode: StorageMode = requested
   let driver = config.driver
@@ -203,7 +221,13 @@ export const createOrbitClient = async <
     (async (s: number): Promise<AsyncSqlDriver | null> => {
       if (config.worker === undefined) return null
       try {
-        return await openWorkerDriver(config.worker(), databaseName, "opfs", slotPool(s))
+        return await openWorkerDriver(
+          config.worker(),
+          databaseName,
+          "opfs",
+          poolForSlot(s),
+          config.signal,
+        )
       } catch (e) {
         if (isLocked(e)) return null
         throw e
@@ -214,7 +238,13 @@ export const createOrbitClient = async <
       throw new OrbitClientError("createOrbitClient needs either `driver` or `worker`")
     try {
       if (requested === "memory")
-        driver = await openWorkerDriver(config.worker(), databaseName, "memory")
+        driver = await openWorkerDriver(
+          config.worker(),
+          databaseName,
+          "memory",
+          undefined,
+          config.signal,
+        )
       else {
         // An OPFS pool is exclusive to one context per origin. Each tab holds its own slot, so
         // its database (and the mutations it queued offline) outlives the tab.
@@ -227,7 +257,7 @@ export const createOrbitClient = async <
         }
         if (driver === undefined)
           throw new SqlDriverError({ code: "locked", message: `${tabs} tabs hold every slot` })
-        if (slot > 0) config.onLog?.("store.slot", { slot, pool: slotPool(slot) })
+        if (slot > 0) config.onLog?.("store.slot", { slot, pool: poolForSlot(slot) })
       }
     } catch (e) {
       // Every slot is held by another tab, or OPFS is unavailable (private mode, unsupported
@@ -235,14 +265,20 @@ export const createOrbitClient = async <
       // reported.
       const recoverable =
         e instanceof SqlDriverError && (e.code === "locked" || e.code === "unsupported")
-      if (!recoverable || requested === "memory")
+      if (!recoverable || requested === "memory" || config.storageFallback === false)
         throw new OrbitClientError(
           `could not open the local database: ${e instanceof Error ? e.message : String(e)}`,
           e,
         )
       config.onLog?.("store.fallback", { from: requested, to: "memory", reason: e.message })
       mode = "memory"
-      driver = await openWorkerDriver(config.worker(), databaseName, "memory")
+      driver = await openWorkerDriver(
+        config.worker(),
+        databaseName,
+        "memory",
+        undefined,
+        config.signal,
+      )
     }
   }
   const engineConfig = (d: AsyncSqlDriver, drainOnly: boolean) => ({
@@ -284,35 +320,82 @@ export const createOrbitClient = async <
     )
   }
 
+  const abort = (): void => {
+    void Effect.runPromise(engine.close()).catch(() => undefined)
+  }
+  config.signal?.addEventListener("abort", abort, { once: true })
+  if (config.signal?.aborted) {
+    await Effect.runPromise(engine.close())
+    throw new OrbitClientError("Client creation aborted")
+  }
+
   /**
    * Pushes the mutations that closed tabs queued offline in their own slots. Each orphaned
    * database is opened as the client that wrote it, connected until its pending log is
    * confirmed (or a timeout passes), and closed again.
    */
   const drainOrphans = async (): Promise<void> => {
-    for (let s = 1; s < tabs; s++) {
+    const legacy = Math.max(0, config.legacySlots ?? 0)
+    const slots = [
+      ...Array.from({ length: tabs - 1 }, (_, i) => ({ slot: i + 1, legacy: false })),
+      ...Array.from({ length: legacy }, (_, i) => ({ slot: i, legacy: true })),
+    ]
+    for (const entry of slots) {
+      if (recovery.signal.aborted) return
+      const s = entry.slot
+      let drain: ClientEngine | null = null
       let orphan: AsyncSqlDriver | null = null
       try {
-        orphan = await openSlot(s)
+        orphan = entry.legacy
+          ? config.openLegacySlot !== undefined
+            ? await config.openLegacySlot(s)
+            : config.worker === undefined
+              ? null
+              : await openWorkerDriver(
+                  config.worker(),
+                  databaseName,
+                  "opfs",
+                  slotPool(s),
+                  recovery.signal,
+                )
+          : await openSlot(s)
         if (orphan === null) continue
         const pending = await pendingCount(orphan)
         if (pending === 0) {
           await orphan.close()
           continue
         }
-        config.onLog?.("store.drain", { slot: s, pending })
-        const drain = new ClientEngine(engineConfig(orphan, true))
+        if (entry.legacy) {
+          const meta = await orphan.query(
+            "SELECT key, value FROM meta WHERE key IN ('partition', 'schema_hash')",
+          )
+          const stored = new Map(meta.map((row) => [row["key"], row["value"]]))
+          if (
+            stored.get("partition") !== config.partition ||
+            stored.get("schema_hash") !== config.schema.schema_hash
+          ) {
+            config.onLog?.("store.recovery_skipped", {
+              slot: s,
+              reason: "legacy identity or schema differs",
+              pending,
+            })
+            continue
+          }
+        }
+        config.onLog?.("store.drain", { slot: s, legacy: entry.legacy, pending })
+        drain = new ClientEngine(engineConfig(orphan, true))
         await Effect.runPromise(drain.open())
-        await drained(drain)
+        await drained(drain, recovery.signal)
         const remaining = await pendingCount(orphan)
-        await Effect.runPromise(drain.close())
         config.onLog?.("store.drained", { slot: s, pending, remaining })
       } catch (e) {
         config.onLog?.("store.drain_failed", {
           slot: s,
           error: e instanceof Error ? e.message : String(e),
         })
-        await orphan?.close().catch(() => undefined)
+      } finally {
+        if (drain !== null) await Effect.runPromise(drain.close()).catch(() => undefined)
+        else await orphan?.close().catch(() => undefined)
       }
     }
   }
@@ -399,10 +482,16 @@ export const createOrbitClient = async <
     liveQuery,
     read,
     mutate,
+    awaitMutation: (id) => engine.awaitMutation(id),
     onMutation: (listener) => engine.onMutation(listener),
     getStatus: () => engine.getStatus(),
     onStatus: (listener) => engine.onStatus(listener),
-    close: () => Effect.runPromise(engine.close()),
+    close: () => {
+      recovery.abort()
+      config.signal?.removeEventListener("abort", stopRecovery)
+      config.signal?.removeEventListener("abort", abort)
+      return Effect.runPromise(engine.close())
+    },
     clientId: engine.clientId,
   }
 }

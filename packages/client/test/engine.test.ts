@@ -1138,6 +1138,87 @@ describe("client-side mutations", () => {
     },
   )
 
+  it(
+    "a shared cache recovers an old offline slot without importing its views",
+    { timeout: 15_000 },
+    async () => {
+      const { server, push, open } = await setup({ pushReachable: false })
+      // A second tab: its own slot, one mutation queued while the push endpoint was unreachable,
+      // then closed. The log stays in its database.
+      const orphan = reloadable(nodeAsyncDriver())
+      const closedTab = await createOrbitClient({
+        definition: sync,
+        schema,
+        url: "http://fake",
+        partition: "org_1",
+        getToken: async () => "t",
+        driver: orphan,
+        clientId: "c-tab2",
+        mutators,
+        pushUrl: "http://fake/push",
+        fetch: push.fetch,
+        makeWebSocket: server.connect,
+        backoffMinMs: 5,
+        backoffMaxMs: 20,
+      })
+      const queued = closedTab.mutate.createDocument({ id: "n2", groupId: null })
+      await queued.local
+      await closedTab.close()
+      expect(await orphan.query(`SELECT count(*) AS n FROM pending_mutations`)).toEqual([{ n: 1 }])
+
+      // The server's `orbit_clients` scope is live before the drain pushes, as in production,
+      // where a fill reflects the rows committed meanwhile.
+      const warm = await open()
+      await waitFor(() => server.pendingFills.length >= 1, 2000, "client row fill")
+      for (const fill of [...server.pendingFills]) server.completeFill(fill.table, [])
+      await warm.close()
+
+      // The first tab opens with the endpoint reachable: it drains the slot as the closed tab.
+      push.reachable = true
+      const logs: Array<{ event: string; data: Record<string, unknown> }> = []
+      const { createSharedOrbitClient } = await import("../src/shared/client.ts")
+      const { sharedPlatform } = await import("./support/shared-platform.ts")
+      const first = await createSharedOrbitClient({
+        subject: "user_1",
+        platform: sharedPlatform(),
+        legacySlots: 4,
+        definition: sync,
+        schema,
+        url: "http://fake",
+        partition: "org_1",
+        getToken: async () => "t",
+        driver: reloadable(nodeAsyncDriver()),
+        clientId: "c1",
+        mutators,
+        pushUrl: "http://fake/push",
+        fetch: push.fetch,
+        makeWebSocket: server.connect,
+        backoffMinMs: 5,
+        backoffMaxMs: 20,
+        openLegacySlot: async (slot) => (slot === 1 ? orphan : null),
+        onLog: (event, data) => logs.push({ event, data }),
+      })
+      const deadline = Date.now() + 5000
+      while (Date.now() < deadline && !logs.some((l) => l.event === "store.drained")) {
+        for (const fill of [...server.pendingFills]) server.completeFill(fill.table, [])
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      const drained = logs.find((l) => l.event === "store.drained")
+      if (drained === undefined)
+        console.log(
+          JSON.stringify({
+            pushes: push.requests.map((r) => r.clientId),
+            orphanLog: await orphan.query(`SELECT id, pushed FROM pending_mutations`),
+            events: logs.map((l) => l.event),
+          }),
+        )
+      expect(drained?.data).toEqual({ slot: 1, pending: 1, remaining: 0 })
+      expect(await orphan.query(`SELECT count(*) AS n FROM pending_mutations`)).toEqual([{ n: 0 }])
+      expect(push.requests.map((r) => r.clientId)).toContain("c-tab2")
+      await first.close()
+    },
+  )
+
   it("pushes contiguous ids and confirms through sync without an empty state", async () => {
     const { server, push, driver, events, open } = await setup({ deferCommit: true })
     const client = await open()
@@ -1306,5 +1387,161 @@ describe("client-side mutations", () => {
     await client.mutate.createDocument({ id: "n1", groupId: null }).local
     expect(ids(live.getSnapshot().rows)).toEqual(["n1"])
     await client.close()
+  })
+})
+
+// Shared-client tests exercise the real engine and SQLite through the tab transport.
+describe("shared browser clients", () => {
+  const setup = async (pushReachable = true) => {
+    const { createSharedOrbitClient } = await import("../src/shared/client.ts")
+    const { sharedPlatform } = await import("./support/shared-platform.ts")
+    const platform = sharedPlatform()
+    const server = new FakeSyncServer(schema, "org_1")
+    const push = new FakePushServer(server, serverApply, { reachable: pushReachable })
+    const driver = reloadable(nodeAsyncDriver())
+    let sockets = 0
+    const open = () =>
+      createSharedOrbitClient({
+        definition: sync,
+        schema,
+        url: "http://fake",
+        partition: "org_1",
+        subject: "user_1",
+        getToken: async () => "test",
+        driver,
+        mutators,
+        pushUrl: "http://fake/push",
+        fetch: push.fetch,
+        makeWebSocket: (url) => {
+          sockets++
+          return server.connect(url)
+        },
+        backoffMinMs: 5,
+        backoffMaxMs: 20,
+        platform,
+        queryTtlMs: 0,
+      })
+    return { open, server, push, driver, sockets: () => sockets }
+  }
+
+  it("three tabs share a client id, socket, optimistic writes and dense mutation ids", async () => {
+    const env = await setup()
+    const clients = await Promise.all([env.open(), env.open(), env.open()])
+    try {
+      const views = clients.map((c) => c.liveQuery(documents))
+      await waitFor(() => env.server.pendingFills.length === 2)
+      env.server.completeFill("Chatbot", [])
+      env.server.completeFill("orbit_clients", [])
+      await waitFor(() => views.every((v) => v.getSnapshot().status === "live"))
+      expect(new Set(clients.map((c) => c.clientId)).size).toBe(1)
+      expect(env.sockets()).toBe(1)
+      const writes = clients.map((c, i) =>
+        c.mutate.createDocument({ id: `shared-${i}`, groupId: null }),
+      )
+      await Promise.all(writes.map((w) => w.local))
+      expect((await Promise.all(writes.map((w) => w.id))).sort()).toEqual([1, 2, 3])
+      await waitFor(() => views.every((v) => v.getSnapshot().rows.length === 3))
+      expect((await Promise.all(writes.map((w) => w.server))).map((r) => r.status)).toEqual([
+        "applied",
+        "applied",
+        "applied",
+      ])
+      await views[0]!.release()
+      await clients[0]!.close()
+      await waitFor(() => env.sockets() === 2)
+      await waitFor(() => views.slice(1).every((v) => v.getSnapshot().status === "live"))
+      expect(env.sockets()).toBe(2)
+      const next = clients[2]!.mutate.createDocument({ id: "after-handoff", groupId: null })
+      await next.local
+      await next.server
+      expect(await next.id).toBe(4)
+      await waitFor(() => views[1]!.getSnapshot().rows.length === 4)
+    } finally {
+      await Promise.all(clients.map((c) => c.close()))
+    }
+  })
+
+  it("keeps offline mutations when the owner tab closes", async () => {
+    const env = await setup(false)
+    const first = await env.open(),
+      second = await env.open()
+    try {
+      const view = second.liveQuery(documents)
+      await waitFor(() => env.server.pendingFills.length === 2)
+      env.server.completeFill("Chatbot", [])
+      env.server.completeFill("orbit_clients", [])
+      await waitFor(() => view.getSnapshot().status === "live")
+      const write = second.mutate.createDocument({ id: "survives-owner", groupId: null })
+      await write.local
+      await waitFor(() => view.getSnapshot().rows.length === 1)
+      const originalId = first.clientId
+      await first.close()
+      await waitFor(() => view.getSnapshot().status === "live")
+      expect(second.clientId).toBe(originalId)
+      env.push.reachable = true
+      expect((await write.server).status).toBe("applied")
+      await waitFor(() => second.getStatus().pendingMutations === 0, 5000)
+      expect(view.getSnapshot().rows.map((r) => r.id)).toEqual(["survives-owner"])
+      expect(env.push.requests.flatMap((r) => r.mutations).every((m) => m.id === 1)).toBe(true)
+    } finally {
+      await first.close()
+      await second.close()
+    }
+  })
+
+  it("retains exact failed outcomes and consumed ids across owner handoff", async () => {
+    const env = await setup()
+    const first = await env.open(),
+      second = await env.open()
+    try {
+      env.push.deferCommit = true
+      const bad = second.mutate.createDocument({ id: "bad", groupId: null })
+      await bad.local
+      const expected = { id: 1, status: "failed", error: "refused by the server" }
+      expect(await bad.server).toEqual(expected)
+      await first.close()
+      await waitFor(() => env.sockets() === 2)
+      expect(await second.awaitMutation(1)).toEqual(expected)
+      const next = second.mutate.createDocument({ id: "good", groupId: null })
+      await next.local
+      expect(await next.id).toBe(2)
+    } finally {
+      await first.close()
+      await second.close()
+    }
+  })
+
+  it("restores the durable queue after every tab has closed", async () => {
+    const env = await setup(false)
+    const first = await env.open()
+    const id = first.clientId
+    await first.mutate.createDocument({ id: "last-tab", groupId: null }).local
+    await first.close()
+    const next = await env.open()
+    try {
+      expect(next.clientId).toBe(id)
+      expect(await next.read(documents)).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: "last-tab" })]),
+      )
+      env.push.reachable = true
+      expect((await next.awaitMutation(1)).status).toBe("applied")
+    } finally {
+      await next.close()
+    }
+  })
+
+  it("keeps invalid mutator arguments out of the shared queue", async () => {
+    const env = await setup()
+    const client = await env.open()
+    try {
+      expect(() =>
+        client.mutate.createDocument({ id: 4 as unknown as string, groupId: null }),
+      ).toThrow()
+      const next = client.mutate.createDocument({ id: "valid", groupId: null })
+      await next.local
+      expect(await next.id).toBe(1)
+    } finally {
+      await client.close()
+    }
   })
 })
