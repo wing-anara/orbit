@@ -356,6 +356,54 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it("a row that leaves a grown window leaves the base it inherited the row from, and survives a reload", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const driver = reloadable(nodeAsyncDriver())
+    const { engine } = makeClient(server, driver, 60_000)
+    await Effect.runPromise(engine.open())
+    const byId = (limit: number) => ({
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" as const }],
+      limit,
+    })
+    const small = await Effect.runPromise(engine.subscribe(byId(2)))
+    await waitFor(() => server.pendingFills.length === 1, 2000, "fill request")
+    server.completeFill("Chatbot", [chatbot("a"), chatbot("b"), chatbot("c"), chatbot("d")])
+    await Effect.runPromise(engine.awaitLive(small.id))
+    const grown = await Effect.runPromise(engine.subscribe(byId(3)))
+    await Effect.runPromise(engine.awaitLive(grown.id))
+    expect(server.receivedBases.at(-1)).toBe(small.id)
+    // The grown window holds only its extra member; "a" and "b" are read through the base.
+    const own = await driver.query(
+      `SELECT key FROM membership WHERE subscription = ? ORDER BY key`,
+      [grown.id],
+    )
+    expect(own.map((r) => r["key"])).toEqual([JSON.stringify(["c"])])
+    // Deleting "a" removes it from both windows; "d" enters the grown one.
+    server.commit([remove("Chatbot", chatbot("a"))])
+    await waitFor(
+      () =>
+        grown
+          .getSnapshot()
+          .rows.map((r) => r.row["id"])
+          .join() === "b,c,d",
+      3000,
+      "grown window after the delete",
+    )
+    expect(small.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["b", "c"])
+    await Effect.runPromise(engine.close())
+
+    // After a reload every window gets a complete snapshot and stands on its own.
+    const again = makeClient(server, driver, 60_000)
+    await Effect.runPromise(again.engine.open())
+    const back = await Effect.runPromise(again.engine.subscribe(byId(3)))
+    await Effect.runPromise(again.engine.awaitLive(back.id))
+    expect(back.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["b", "c", "d"])
+    const link = await driver.query(`SELECT based_on FROM subscriptions WHERE id = ?`, [back.id])
+    expect(link[0]?.["based_on"]).toBeNull()
+    await Effect.runPromise(again.engine.close())
+  })
+
   it("restored subscriptions retire after the query TTL unless the application references them", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const driver = reloadable(nodeAsyncDriver())

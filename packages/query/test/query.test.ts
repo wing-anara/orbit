@@ -214,12 +214,18 @@ describe("SQL compilation against SQLite", () => {
     expect(docRows.map((r) => r["id"]).sort()).toEqual(["d1", "d2"])
   })
 
-  it("restricts to a subscription's membership", () => {
+  it("restricts to a subscription's membership, following the based_on chain", () => {
     db.prepare(`INSERT INTO membership VALUES ('s1', 'Chatbot', '["d1"]')`).run()
-    const p = plan({ table: "Chatbot" })
-    const { sql, params } = compileSelect(p, { membershipOf: "s1" })
-    const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>
-    expect(rows.map((r) => r["id"])).toEqual(["d1"])
+    db.prepare(`INSERT INTO membership VALUES ('s2', 'Chatbot', '["d2"]')`).run()
+    db.prepare(`INSERT INTO subscriptions VALUES ('s1', NULL), ('s2', 's1'), ('s3', 's2')`).run()
+    const p = plan({ table: "Chatbot", orderBy: [{ column: "id", direction: "asc" }] })
+    const read = (subscription: string) => {
+      const { sql, params } = compileSelect(p, { membershipOf: subscription })
+      return (db.prepare(sql).all(...params) as Array<Record<string, unknown>>).map((r) => r["id"])
+    }
+    expect(read("s1")).toEqual(["d1"])
+    expect(read("s2")).toEqual(["d1", "d2"])
+    expect(read("s3")).toEqual(["d1", "d2"])
   })
 
   it("finds the rows an include level references for one parent row", () => {

@@ -105,6 +105,8 @@ The store resets itself in two cases: `planMigration` returns `reset` (see [sche
 
 A live query renders before the server answers. While a subscription has no snapshot yet, the engine evaluates it over the local cache, so a query whose rows other subscriptions already hold (a narrower filter, a folder that was preloaded) shows its rows at once with status `pending`. The server's snapshot then replaces the set and the status turns `live`. Rows the cache does not hold appear when the snapshot lands.
 
+A window that grows on scroll extends its previous subscription (`subscribe.basedOn`). The store records the link in `subscriptions.based_on` and keeps the base's rows under the base: a read follows the chain, a membership removal reaches every window in the chain (they are subsets of each other), and when a base retires or gets a complete snapshot its rows move to the windows that extend it. A grown window therefore writes only its new members.
+
 A released query is not dropped at once. It stays subscribed for `queryTtlMs` (default five minutes), so its rows stay cached and current through deltas, and a component that subscribes again within that time is `live` immediately, online or offline. When the TTL passes with no reference, the engine unsubscribes and garbage-collects the rows only that query referenced. Set `queryTtlMs: 0` to retire queries at once. Zero calls the same idea the query TTL.
 
 Applications keep frequent views instant by subscribing once to a broad "preload" query, for example an `allDocuments` query.

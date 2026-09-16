@@ -290,8 +290,9 @@ export const compileSelect = (planned: PlannedQuery, options: SelectOptions = {}
     )
   if (options.membershipOf !== undefined) {
     if (!dialect.hasKeyColumn) throw new Error("membership requires the local cache dialect")
-    ctx.params.push(options.membershipOf, planned.table.name)
-    const member = `${t}."__key" IN (SELECT m."key" FROM "membership" m WHERE m."subscription" = ? AND m."tbl" = ?)`
+    // A subscription that extends another (`subscriptions.based_on`) reads the base's rows too.
+    ctx.params.push(planned.table.name, options.membershipOf)
+    const member = `${t}."__key" IN (SELECT m."key" FROM "membership" m WHERE m."tbl" = ? AND m."subscription" IN (WITH RECURSIVE chain(id) AS (SELECT ? UNION SELECT s."based_on" FROM "subscriptions" s JOIN chain ON s."id" = chain.id WHERE s."based_on" IS NOT NULL) SELECT id FROM chain))`
     where.push(options.alsoAdmit === undefined ? member : `(${member} OR ${options.alsoAdmit})`)
   }
   let sql = `SELECT ${selectList(dialect, planned.table, t)} FROM ${dialect.table(planned.table.name)} ${t}`

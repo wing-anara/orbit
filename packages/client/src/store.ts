@@ -74,7 +74,7 @@ const STORE_DDL: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS membership (subscription TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, tbl, key))`,
   `CREATE INDEX IF NOT EXISTS membership_row ON membership (tbl, key)`,
-  `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, ref TEXT, cursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, ref TEXT, cursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0, based_on TEXT)`,
   `CREATE TABLE IF NOT EXISTS pending_mutations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, args TEXT NOT NULL, created_at INTEGER NOT NULL, pushed INTEGER NOT NULL DEFAULT 0)`,
 ]
 
@@ -189,6 +189,8 @@ export class LocalStore {
       ])
       if (!subscriptionColumns.some((c) => str(c["name"]) === "ref"))
         yield* this.run([{ sql: `ALTER TABLE subscriptions ADD COLUMN ref TEXT`, params: [] }])
+      if (!subscriptionColumns.some((c) => str(c["name"]) === "based_on"))
+        yield* this.run([{ sql: `ALTER TABLE subscriptions ADD COLUMN based_on TEXT`, params: [] }])
       const meta = yield* this.query(`SELECT key, value FROM meta`)
       const stored = new Map(meta.map((r) => [str(r["key"]), str(r["value"])] as const))
       const storedPartition = stored.get("partition")
@@ -308,10 +310,29 @@ export class LocalStore {
 
   removeSubscription(id: string): Effect.Effect<void, StoreError> {
     return this.run([
+      ...this.transferStatements(id),
       ...this.gcStatementsForSubscription(id),
       { sql: `DELETE FROM membership WHERE subscription = ?`, params: [id] },
       { sql: `DELETE FROM subscriptions WHERE id = ?`, params: [id] },
     ])
+  }
+
+  /**
+   * Hands the rows of a subscription to the subscriptions that extend it (`based_on`) before its
+   * membership goes away, and points them at its own base. The copy happens once, when a base
+   * retires or is replaced, not on every window growth.
+   */
+  private transferStatements(id: string): ReadonlyArray<Statement> {
+    return [
+      {
+        sql: `INSERT OR IGNORE INTO membership (subscription, tbl, key) SELECT d.id, m.tbl, m.key FROM membership m JOIN subscriptions d ON d.based_on = ? WHERE m.subscription = ?`,
+        params: [id, id],
+      },
+      {
+        sql: `UPDATE subscriptions SET based_on = (SELECT based_on FROM subscriptions WHERE id = ?) WHERE based_on = ?`,
+        params: [id, id],
+      },
+    ]
   }
 
   /** Deletes rows referenced only by `subscription`, per table. Run before removing its membership. */
@@ -362,21 +383,19 @@ export class LocalStore {
     cursor: number,
     rows: ReadonlyArray<RowUpdate>,
     members: ReadonlyArray<MemberRef>,
-    // A subscription whose membership the snapshot extends: copied in one statement, so a
-    // grown window costs the new members only (see `snapshot.basedOn` in the protocol).
+    // A subscription whose membership this snapshot extends: the rows stay under the base and
+    // reads follow the link, so a grown window writes only its new members (see
+    // `snapshot.basedOn` in the protocol).
     basedOn: string | null = null,
   ): Effect.Effect<void, StoreError> {
     const statements: Array<Statement> = [
+      ...this.transferStatements(subscription),
       ...this.gcStatementsForSubscription(subscription),
       { sql: `DELETE FROM membership WHERE subscription = ?`, params: [subscription] },
-      ...(basedOn === null
-        ? []
-        : [
-            {
-              sql: `INSERT OR IGNORE INTO membership (subscription, tbl, key) SELECT ?, tbl, key FROM membership WHERE subscription = ?`,
-              params: [subscription, basedOn],
-            },
-          ]),
+      {
+        sql: `UPDATE subscriptions SET based_on = ? WHERE id = ?`,
+        params: [basedOn, subscription],
+      },
       ...members.map((m) => ({
         sql: `INSERT OR IGNORE INTO membership (subscription, tbl, key) VALUES (?, ?, ?)`,
         params: [subscription, m.table, SchemaRuntime.keyString(m.key)],
@@ -401,9 +420,10 @@ export class LocalStore {
     const removed: Array<MemberRef> = []
     for (const m of memberships) {
       for (const ref of m.removed) {
+        // A row that left a window also left the windows it extends (they are subsets).
         statements.push({
-          sql: `DELETE FROM membership WHERE subscription = ? AND tbl = ? AND key = ?`,
-          params: [m.subscriptionId, ref.table, SchemaRuntime.keyString(ref.key)],
+          sql: `DELETE FROM membership WHERE tbl = ? AND key = ? AND subscription IN (WITH RECURSIVE chain(id) AS (SELECT ? UNION SELECT s.based_on FROM subscriptions s JOIN chain ON s.id = chain.id WHERE s.based_on IS NOT NULL) SELECT id FROM chain)`,
+          params: [ref.table, SchemaRuntime.keyString(ref.key), m.subscriptionId],
         })
         removed.push(ref)
       }
@@ -454,8 +474,9 @@ export class LocalStore {
         const CHUNK = 200
         for (let i = 0; i < refs.length; i += CHUNK) {
           const chunk = refs.slice(i, i + CHUNK)
+          // A subscription that extends a holder reads the row too.
           const rows = await this.driver.query(
-            `SELECT DISTINCT subscription FROM membership WHERE ${chunk.map(() => "(tbl = ? AND key = ?)").join(" OR ")}`,
+            `WITH RECURSIVE dep(subscription) AS (SELECT DISTINCT subscription FROM membership WHERE ${chunk.map(() => "(tbl = ? AND key = ?)").join(" OR ")} UNION SELECT s.id FROM subscriptions s JOIN dep ON s.based_on = dep.subscription) SELECT subscription FROM dep`,
             chunk.flatMap((r) => [r.table, SchemaRuntime.keyString(r.key)]),
           )
           for (const row of rows)

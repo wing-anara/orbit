@@ -26,7 +26,7 @@ export const openDb = (schema: SyncSchema): DatabaseSync => {
   const db = new DatabaseSync(":memory:")
   for (const stmt of allDdl(schema)) db.exec(stmt)
   db.exec(
-    `CREATE TABLE membership (subscription TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, tbl, key))`,
+    `CREATE TABLE membership (subscription TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, tbl, key)); CREATE TABLE subscriptions (id TEXT PRIMARY KEY, based_on TEXT)`,
   )
   return db
 }
