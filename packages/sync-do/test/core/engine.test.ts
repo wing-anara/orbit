@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest"
 
 import type { Query } from "@orbit/protocol"
 import type { RowUpdate } from "@orbit/protocol/client"
+import { canonicalJson } from "@orbit/schema"
 
-import type { EngineEvent } from "../../src/core/engine.ts"
+import { SyncEngine, type EngineEvent } from "../../src/core/engine.ts"
 import {
   batch,
   chatbot,
@@ -494,6 +495,50 @@ describe("SyncEngine: subscriptions and incremental maintenance", () => {
     expect(fullSnapshot.rows.map((r) => r.key)).toEqual([["a"]])
     expect(engine.membershipOf(full.success.subscription)).toEqual(
       engine.recompute(full.success.subscription),
+    )
+  })
+
+  it("extends and maintains persisted legacy subscription identities after an upgrade", () => {
+    const { engine, driver, deps } = makeEngine()
+    liveScope(engine, "Chatbot", [chatbot("a"), chatbot("b"), chatbot("c")])
+    const query: Query = {
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" }],
+      limit: 2,
+    }
+    const small = engine.subscribe(query)
+    if (!Result.isSuccess(small)) throw new Error("subscribe failed")
+    const stored = driver.query(`SELECT query FROM subscriptions WHERE id = ?`, [
+      small.success.subscription,
+    ])[0]!
+    const legacy = canonicalJson(JSON.parse(String(stored["query"])))
+    driver.run(`UPDATE subscriptions SET id = ? WHERE id = ?`, [legacy, small.success.subscription])
+    driver.run(`UPDATE membership SET subscription = ? WHERE subscription = ?`, [
+      legacy,
+      small.success.subscription,
+    ])
+
+    const reopened = new SyncEngine(deps)
+    reopened.init()
+    const grown = reopened.subscribe({ ...query, limit: 3 }, { basedOn: legacy })
+    if (!Result.isSuccess(grown)) throw new Error("subscribe failed")
+    const snapshot = grown.success.events.find((e) => e.type === "snapshot")
+    if (snapshot?.type !== "snapshot") throw new Error("no snapshot")
+    expect(snapshot.basedOn).toBe(legacy)
+    expect(snapshot.rows.map((r) => r.key)).toEqual([["c"]])
+    expect(grown.success.subscription).toMatch(/^[a-f0-9]{64}$/)
+
+    const changed = reopened.applyBatch(
+      batch(schema, "org_1", [txn(1, [remove("Chatbot", chatbot("a"))])]),
+    )
+    expect(
+      deltas(changed.events)
+        .flatMap((e) => e.memberships.map((m) => m.subscriptionId))
+        .sort(),
+    ).toEqual([legacy, grown.success.subscription].sort())
+    reopened.unsubscribe(legacy)
+    expect(reopened.membershipOf(grown.success.subscription)).toEqual(
+      reopened.recompute(grown.success.subscription),
     )
   })
 

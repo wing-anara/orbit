@@ -66,7 +66,9 @@ describe("planQuery", () => {
     ])
     expect(p.query.include).toEqual([{ relation: "folder" }, { relation: "organization" }])
     expect([...p.tables].sort()).toEqual(["Chatbot", "organization"])
-    expect(p.key).toContain('"table":"Chatbot"')
+    expect(p.key).toMatch(/^[a-f0-9]{64}$/)
+    expect(plan(p.query).key).toBe(p.key)
+    expect(plan({ ...p.query, limit: 2 }).key).not.toBe(p.key)
   })
 
   it("allows LIKE over a JSON column, which is stored as text", () => {

@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@noble/hashes": "2.4.0",
     "@orbit/protocol": "workspace:*",
     "@orbit/schema": "workspace:*",
     "effect": "catalog:"

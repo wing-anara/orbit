@@ -19,6 +19,8 @@ import type {
   ValueKind,
 } from "@orbit/protocol"
 import { canonicalJson, type SchemaRuntime } from "@orbit/schema"
+import { sha256 } from "@noble/hashes/sha2.js"
+import { bytesToHex } from "@noble/hashes/utils.js"
 
 export const MAX_LIMIT = 10_000
 export const MAX_IN_VALUES = 40
@@ -328,7 +330,10 @@ export const planQuery = (
     includes: includes.success,
     tables,
     predicateTables: walk.predicateTables,
-    key: canonicalJson(normalized),
+    // This identity is repeated in every membership row and index. Keeping the full AST here
+    // makes a thousand-row window store megabytes of identical query text. The query itself
+    // remains in subscriptions.query; the key is an opaque, stable identity.
+    key: bytesToHex(sha256(new TextEncoder().encode(canonicalJson(normalized)))),
     rt,
   })
 }
