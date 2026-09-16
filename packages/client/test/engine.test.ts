@@ -1446,6 +1446,34 @@ describe("shared browser clients", () => {
     }
   })
 
+  it("mounting many identical consumers does not rebroadcast the cached result", async () => {
+    const env = await setup()
+    const first = await env.open(),
+      second = await env.open()
+    const query = clientQueries.documents({ type: "DOCUMENT" })
+    const view = second.liveQuery(query)
+    try {
+      await waitFor(() => env.server.pendingFills.length === 2)
+      env.server.completeFill("Chatbot", [chatbot("a")])
+      env.server.completeFill("orbit_clients", [])
+      await waitFor(() => view.getSnapshot().status === "live")
+      const snapshot = view.getSnapshot()
+      let notifications = 0
+      view.subscribe(() => notifications++)
+      const others = Array.from({ length: 100 }, () => second.liveQuery(query))
+      await settle(100)
+      expect(notifications).toBe(0)
+      expect(others.every((other) => other.getSnapshot() === snapshot)).toBe(true)
+      await Promise.all(others.map((other) => other.release()))
+      await first.mutate.createDocument({ id: "0-new", groupId: null }).server
+      await waitFor(() => view.getSnapshot().rows[0]?.id === "0-new")
+      expect(notifications).toBeGreaterThan(0)
+    } finally {
+      await first.close()
+      await second.close()
+    }
+  })
+
   it("three tabs share a client id, socket, optimistic writes and dense mutation ids", async () => {
     const env = await setup()
     const clients = await Promise.all([env.open(), env.open(), env.open()])

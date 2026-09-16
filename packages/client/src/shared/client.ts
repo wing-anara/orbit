@@ -76,8 +76,16 @@ export const createSharedOrbitClient = async <
   const mutationListeners = new Set<(event: MutationEvent) => void>()
   const queries = new Map<
     string,
-    { wire: WireQuery; key: string; snapshot: Snapshot; listeners: Set<() => void> }
+    {
+      id: string
+      refs: number
+      wire: WireQuery
+      key: string
+      snapshot: Snapshot
+      listeners: Set<() => void>
+    }
   >()
+  const queryIds = new Map<string, string>()
   const requests = new Map<
     string,
     {
@@ -157,11 +165,11 @@ export const createSharedOrbitClient = async <
         for (const listener of mutationListeners) listener(event.event)
         break
       case "snapshot": {
-        for (const entry of queries.values()) {
-          if (entry.key !== event.id) continue
-          entry.snapshot = event.snapshot
-          for (const listener of entry.listeners) listener()
-        }
+        const id = queryIds.get(event.id)
+        const entry = id === undefined ? undefined : queries.get(id)
+        if (entry === undefined) return
+        entry.snapshot = event.snapshot
+        for (const listener of entry.listeners) listener()
         break
       }
       default: {
@@ -281,29 +289,51 @@ export const createSharedOrbitClient = async <
     query: TypedQuery<D, string, IncludeShape> | NamedQueryCall<D, string, IncludeShape>,
   ): LiveQuery<object> {
     checkOpen()
-    const id = String(++sequence)
     const resolved = wire(query)
-    const entry = {
+    const key = queryKey(resolved)
+    const existingId = queryIds.get(key)
+    const existing = existingId === undefined ? undefined : queries.get(existingId)
+    const entry = existing ?? {
+      id: String(++sequence),
+      refs: 0,
       wire: resolved,
-      key: queryKey(resolved),
-      snapshot: { status: "pending", rows: [], error: null, cursor: null } as Snapshot,
+      key,
+      snapshot: { status: "pending", rows: [], error: null, cursor: null },
       listeners: new Set<() => void>(),
     }
-    queries.set(id, entry)
-    if (ready) coordinator.command({ type: "subscribe", id, query: entry.wire })
+    entry.refs++
+    if (existing === undefined) {
+      queries.set(entry.id, entry)
+      queryIds.set(key, entry.id)
+      if (ready) coordinator.command({ type: "subscribe", id: entry.id, query: entry.wire })
+    }
+    const listeners = new Set<() => void>()
+    let released = false
     return {
       getSnapshot: () => entry.snapshot,
       subscribe: (listener: () => void) => {
-        entry.listeners.add(listener)
-        return () => entry.listeners.delete(listener)
+        if (released) return () => undefined
+        const wrapped = (): void => listener()
+        listeners.add(wrapped)
+        entry.listeners.add(wrapped)
+        return () => {
+          listeners.delete(wrapped)
+          entry.listeners.delete(wrapped)
+        }
       },
       release: async () => {
-        if (!queries.delete(id)) return
-        entry.listeners.clear()
-        if (ready) coordinator.command({ type: "release", id })
+        if (released) return
+        released = true
+        for (const listener of listeners) entry.listeners.delete(listener)
+        listeners.clear()
+        if (--entry.refs > 0) return
+        queries.delete(entry.id)
+        queryIds.delete(key)
+        if (ready) coordinator.command({ type: "release", id: entry.id })
       },
     }
   }
+
   function read<N extends string, I extends IncludeShape = {}>(
     query: TypedQuery<D, N, I> | NamedQueryCall<D, N, I>,
   ): Promise<ReadonlyArray<ResultRow<D, N, I>>>
@@ -433,6 +463,7 @@ export const createSharedOrbitClient = async <
       for (const request of requests.values()) request.reject(error)
       requests.clear()
       queries.clear()
+      queryIds.clear()
       await coordinator.close()
       statusListeners.clear()
       mutationListeners.clear()
