@@ -289,19 +289,19 @@ pub fn kind_from_vitess_type(ty: i32) -> ValueKind {
 /// `source_type`, so the projection decodes the cells exactly like a VStream row of the same
 /// table. A synced column that is missing or has another Vitess type is a `SchemaMismatch`.
 pub fn query_fields(schema: &TableSchema, fields: &[Field]) -> Result<TableFields, VStreamError> {
-    let mut out = Vec::with_capacity(schema.columns.len());
+    let mut out = fields.to_vec();
     for col in &schema.columns {
         let source = col.derived.as_ref().map_or(col.name.as_str(), |d| d.from.as_str());
-        let field = fields
+        let index = fields
             .iter()
-            .find(|f| f.name == source)
+            .position(|f| f.name == source)
             .ok_or_else(|| VStreamError::SchemaMismatch {
                 table: schema.name.clone(),
                 message: format!("synced column {source} is missing from the query result"),
             })?;
+        let field = &fields[index];
         if col.derived.is_some() {
-            // The rule reads the raw cell; its type does not matter.
-            out.push(field.clone());
+            // Keep the Execute field order, including deduplicated derived sources.
             continue;
         }
         let live = if field.column_type.is_empty() {
@@ -323,7 +323,7 @@ pub fn query_fields(schema: &TableSchema, fields: &[Field]) -> Result<TableField
         } else {
             field.clone()
         };
-        out.push(live);
+        out[index] = live;
     }
     Ok(TableFields {
         table: schema.name.clone(),
@@ -756,6 +756,28 @@ mod tests {
                 .map(|c| c.name.clone())
                 .collect::<Vec<_>>()
         );
+
+        // Execute may select columns in a different order from the schema.
+        let mut reversed = live.clone();
+        reversed.reverse();
+        let fields = query_fields(&table_schema(), &reversed).unwrap();
+        let projection = TableProjection::build(&table_schema(), &fields).unwrap();
+        let projected = projection
+            .project(&raw(&[
+                Some("-5"),
+                Some("18446744073709551615"),
+                Some("\u{0}"),
+                Some("1.5"),
+                Some("1234.5678"),
+                Some(r#"{"a": [1, 2]}"#),
+                Some("1"),
+                Some("x,z"),
+                Some("B"),
+                Some("org1"),
+                Some("r1"),
+            ]))
+            .unwrap();
+        assert_eq!(projected, row);
 
         // A missing column or another Vitess type is schema drift.
         let mut missing = live.clone();
