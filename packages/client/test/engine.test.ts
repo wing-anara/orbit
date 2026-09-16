@@ -1396,7 +1396,7 @@ describe("shared browser clients", () => {
     const { createSharedOrbitClient } = await import("../src/shared/client.ts")
     const { sharedPlatform } = await import("./support/shared-platform.ts")
     const platform = sharedPlatform()
-    const server = new FakeSyncServer(schema, "org_1")
+    const server = new FakeSyncServer(schema, "org_1", { queries: serverQueries })
     const push = new FakePushServer(server, serverApply, { reachable: pushReachable })
     const driver = reloadable(nodeAsyncDriver())
     let sockets = 0
@@ -1423,6 +1423,28 @@ describe("shared browser clients", () => {
       })
     return { open, server, push, driver, sockets: () => sockets }
   }
+
+  it("shares named query snapshots with a later joining follower", async () => {
+    const env = await setup()
+    const first = await env.open()
+    const view = first.liveQuery(clientQueries.documents({ type: "DOCUMENT" }))
+    await waitFor(() => env.server.pendingFills.length === 2)
+    env.server.completeFill("Chatbot", [chatbot("a"), chatbot("b")])
+    env.server.completeFill("orbit_clients", [])
+    await waitFor(() => view.getSnapshot().status === "live")
+    const second = await env.open()
+    try {
+      const peer = second.liveQuery(clientQueries.documents({ type: "DOCUMENT" }))
+      await waitFor(() => peer.getSnapshot().status === "live")
+      expect(peer.getSnapshot().rows.map((row) => row.id)).toEqual(["a"])
+      expect(
+        env.server.receivedRefs.filter((ref) => "name" in ref && ref.name === "documents"),
+      ).toHaveLength(1)
+    } finally {
+      await first.close()
+      await second.close()
+    }
+  })
 
   it("three tabs share a client id, socket, optimistic writes and dense mutation ids", async () => {
     const env = await setup()

@@ -3,7 +3,7 @@ import { decodeArgs, type MutatorDefinitions } from "@orbit/mutators"
 import { NamedQueryCall, TypedQuery, type IncludeShape } from "@orbit/query"
 import type { SyncSchemaDefinition } from "@orbit/schema"
 import { createOrbitClient, type LiveQuery, type OrbitClientConfig } from "../client.ts"
-import type { Command, Event, WireQuery } from "./protocol.ts"
+import { queryKey, type Command, type Event, type WireQuery } from "./protocol.ts"
 
 const callable = (value: unknown): value is (args: unknown) => MutationHandle =>
   typeof value === "function"
@@ -104,7 +104,7 @@ export const openSharedOwner = async <D extends Definition, M extends MutatorDef
           case "subscribe": {
             await release(peer, command.id)
             if (peers.get(peer) !== refs) return
-            const key = JSON.stringify(command.query)
+            const key = queryKey(command.query)
             let entry = queries.get(key)
             if (entry === undefined) {
               const query = client.liveQuery(queryOf(command.query))

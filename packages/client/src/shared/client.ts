@@ -12,7 +12,14 @@ import type { MutationEvent } from "../mutations.ts"
 import { SharedCoordinator } from "./coordinator.ts"
 import { openSharedOwner, type Definition } from "./owner.ts"
 import { browserPlatform, deferred, sharedScope, type SharedPlatform } from "./platform.ts"
-import type { Command, Event, Snapshot, WireQuery } from "./protocol.ts"
+import {
+  queryKey,
+  SHARED_PROTOCOL_VERSION,
+  type Command,
+  type Event,
+  type Snapshot,
+  type WireQuery,
+} from "./protocol.ts"
 
 export interface SharedMutationHandle {
   /** Assigned by the shared owner; dense across all tabs. */
@@ -69,7 +76,7 @@ export const createSharedOrbitClient = async <
   const mutationListeners = new Set<(event: MutationEvent) => void>()
   const queries = new Map<
     string,
-    { wire: WireQuery; snapshot: Snapshot; listeners: Set<() => void> }
+    { wire: WireQuery; key: string; snapshot: Snapshot; listeners: Set<() => void> }
   >()
   const requests = new Map<
     string,
@@ -151,7 +158,7 @@ export const createSharedOrbitClient = async <
         break
       case "snapshot": {
         for (const entry of queries.values()) {
-          if (JSON.stringify(entry.wire) !== event.id) continue
+          if (entry.key !== event.id) continue
           entry.snapshot = event.snapshot
           for (const listener of entry.listeners) listener()
         }
@@ -210,7 +217,7 @@ export const createSharedOrbitClient = async <
   const makeCoordinator = (): SharedCoordinator =>
     new SharedCoordinator({
       scope,
-      schema: config.schema.schema_hash,
+      schema: JSON.stringify([config.schema.schema_hash, SHARED_PROTOCOL_VERSION]),
       platform,
       event: receive,
       failure: fail,
@@ -275,8 +282,10 @@ export const createSharedOrbitClient = async <
   ): LiveQuery<object> {
     checkOpen()
     const id = String(++sequence)
+    const resolved = wire(query)
     const entry = {
-      wire: wire(query),
+      wire: resolved,
+      key: queryKey(resolved),
       snapshot: { status: "pending", rows: [], error: null, cursor: null } as Snapshot,
       listeners: new Set<() => void>(),
     }

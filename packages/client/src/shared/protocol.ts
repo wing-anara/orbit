@@ -1,9 +1,14 @@
 import { Schema } from "effect"
+import { canonicalJson } from "@orbit/schema"
 import { JsonValue, MutationOutcome, NamedQueryRef, Query } from "@orbit/protocol"
 import { SyncError } from "@orbit/protocol/client"
 
+export const SHARED_PROTOCOL_VERSION = 1
+
 export const WireQuery = Schema.Struct({ ast: Query, ref: Schema.optionalKey(NamedQueryRef) })
 export type WireQuery = typeof WireQuery.Type
+const decodeWireQuery = Schema.decodeUnknownSync(WireQuery)
+export const queryKey = (query: WireQuery): string => canonicalJson(decodeWireQuery(query))
 const number = Schema.Finite
 const nullableNumber = Schema.NullOr(number)
 const rows = Schema.Array(Schema.Record(Schema.String, Schema.Unknown))
