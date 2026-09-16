@@ -22,6 +22,29 @@ import { WorkerRequest, type WorkerResponse } from "../driver.ts"
 let sqlite3: Sqlite3Static | null = null
 let db: Database | null = null
 let pool: SAHPoolUtil | null = null
+/** Releases the Web Lock that marks this context's slot (see `holdSlot`). */
+let releaseSlot: (() => void) | null = null
+
+/**
+ * Marks the pool as held by this context with a Web Lock, released when the context ends. A
+ * pool another tab holds is refused here, before OPFS reports the conflict handle by handle.
+ * Without the Web Locks API the OPFS access handles alone decide.
+ */
+const holdSlot = async (poolName: string): Promise<boolean> => {
+  if (typeof navigator === "undefined" || navigator.locks === undefined) return true
+  return new Promise<boolean>((resolve) => {
+    void navigator.locks.request(`orbit-slot:${poolName}`, { ifAvailable: true }, (lock) => {
+      if (lock === null) {
+        resolve(false)
+        return
+      }
+      resolve(true)
+      return new Promise<void>((release) => {
+        releaseSlot = release
+      })
+    })
+  })
+}
 
 const decodeRequest = Schema.decodeUnknownSync(WorkerRequest)
 
@@ -73,6 +96,7 @@ const open = async (
   if (mode === "memory") {
     db = new sqlite3.oo1.DB(":memory:", "c")
   } else {
+    if (!(await holdSlot(poolName))) throw new Error(`pool ${poolName} is locked by another tab`)
     pool = await sqlite3.installOpfsSAHPoolVfs({ name: poolName, initialCapacity: 6 })
     db = new pool.OpfsSAHPoolDb(`/${name}.sqlite3`)
   }
@@ -174,6 +198,8 @@ const handleRequest = async (event: MessageEvent<unknown>): Promise<void> => {
           pool.pauseVfs()
           pool = null
         }
+        releaseSlot?.()
+        releaseSlot = null
         post({ type: "ok", id: request.id })
         return
     }
