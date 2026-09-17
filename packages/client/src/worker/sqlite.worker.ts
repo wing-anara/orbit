@@ -18,6 +18,7 @@ import sqlite3InitModule, {
 import { Schema } from "effect"
 
 import { WorkerRequest, type WorkerResponse } from "../driver.ts"
+import { runBatch } from "./batch.ts"
 
 let sqlite3: Sqlite3Static | null = null
 let db: Database | null = null
@@ -161,10 +162,7 @@ const handleRequest = async (event: MessageEvent<unknown>): Promise<void> => {
         return
       case "batch": {
         if (db === null) throw new Error("database is not open")
-        const database = db
-        database.transaction(() => {
-          for (const s of request.statements) database.exec({ sql: s.sql, bind: s.params })
-        })
+        runBatch(db, request.statements)
         post({ type: "ok", id: request.id })
         return
       }
