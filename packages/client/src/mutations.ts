@@ -461,7 +461,8 @@ export class MutationManager {
 
   /**
    * Called under the lock after every applied delta or snapshot. Confirms every pending mutation
-   * the synced `orbit_clients` row covers and rebases the rest. Returns whether anything changed.
+   * the synced `orbit_clients` row covers after HTTP establishes success, and rebases the rest.
+   * A consumed id alone cannot distinguish an applied mutation from a refusal.
    */
   async confirm(): Promise<boolean> {
     const pending = await readPendingMutations(this.driver)
@@ -470,7 +471,7 @@ export class MutationManager {
       this.config.store.lastMutationIdOf(ORBIT_CLIENTS_TABLE, this.config.clientId),
     )
     if (last !== null && last > this.lastId) this.lastId = last
-    const confirmed = last === null ? [] : pending.filter((m) => m.id <= last)
+    const confirmed = last === null ? [] : pending.filter((m) => m.pushed && m.id <= last)
     await this.remember(
       confirmed.map((m) => ({ id: m.id, status: "applied" as const })),
       false,
@@ -625,6 +626,10 @@ export class MutationManager {
           this.emit({ id: outcome.id, name, status: "failed", error: outcome.error })
         } else this.emit({ id: outcome.id, name, status: "pushed" })
       }
+      // CDC may beat the HTTP response. Its consumed id does not distinguish
+      // success from refusal. Only retire successful mutations after recording
+      // their actual outcome, and confirm here if CDC has already arrived.
+      if (pushed.length > 0 && (await this.confirm())) await this.config.onChanged(null)
       if (response.lastMutationId > this.lastId) this.lastId = response.lastMutationId
       return false
     }

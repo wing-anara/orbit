@@ -1301,6 +1301,41 @@ describe("client-side mutations", () => {
     await client.close()
   })
 
+  it("does not turn an HTTP refusal into success when CDC arrives first", async () => {
+    const { server, push, driver, open } = await setup()
+    const originalFetch = push.fetch
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    push.fetch = async (input, init) => {
+      const response = await originalFetch(input, init)
+      await gate
+      return response
+    }
+    const client = await open()
+    const live = client.liveQuery(documents)
+    await waitFor(() => server.pendingFills.length === 2, 2000, "fills")
+    server.completeFill("Chatbot", [])
+    server.completeFill("orbit_clients", [])
+    await waitFor(() => live.getSnapshot().status === "live", 3000, "live")
+    const bad = client.mutate.createDocument({ id: "bad", groupId: null })
+    await bad.local
+    let settled = false
+    void bad.server.then(() => {
+      settled = true
+    })
+    await waitFor(() => (client.getStatus().cursor ?? 0) > 0, 3000, "CDC before HTTP")
+    await settle()
+    const settledBeforeHttp = settled
+    release()
+    expect(await bad.server).toEqual({ id: 1, status: "failed", error: "refused by the server" })
+    expect(settledBeforeHttp).toBe(false)
+    expect(ids(live.getSnapshot().rows)).toEqual([])
+    expect(await driver.query(`SELECT COUNT(*) AS n FROM pending_mutations`)).toEqual([{ n: 0 }])
+    await client.close()
+  })
+
   it("rolls the overlay back when the server reports a failed outcome", async () => {
     const { server, push, events, open } = await setup({ deferCommit: true })
     const client = await open()
