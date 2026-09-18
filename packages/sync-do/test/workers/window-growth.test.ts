@@ -82,7 +82,19 @@ it("bounds growing-window reads in workerd, including the candidate membership p
         basedOn: extension?.type === "snapshot" && extension.basedOn === base.success.subscription,
       })
     }
+    engine.markOrphaned(grown.success.subscription, Date.now())
+    engine.sweepOrphans(Date.now())
+    const afterSweep = engine.membershipOf(grown.success.subscription).length
+    const baseAfterSweep = engine.membershipOf(base.success.subscription).length
+    const restored = engine.subscribe(
+      { ...query, limit: 1100 },
+      { basedOn: base.success.subscription },
+    )
+    if (Result.isFailure(restored)) throw restored.failure
     return {
+      afterSweep,
+      baseAfterSweep,
+      restoredMembers: engine.membershipOf(restored.success.subscription).length,
       reused,
       growthReads,
       bigints: snapshot?.type === "snapshot" ? snapshot.rows.map((r) => r.row?.["big"]) : [],
@@ -91,7 +103,14 @@ it("bounds growing-window reads in workerd, including the candidate membership p
       members: engine.membershipOf(grown.success.subscription).length,
     }
   })
-  expect(result).toMatchObject({ added: 100, basedOn: true, members: 1100 })
+  expect(result).toMatchObject({
+    added: 100,
+    basedOn: true,
+    members: 1100,
+    afterSweep: 100,
+    baseAfterSweep: 1000,
+    restoredMembers: 1100,
+  })
   // A subscription-first JSON join reads >100,000 rows for this workload in
   // workerd, even though Node SQLite chooses a fast plan for the same query.
   expect(result.growthReads).toBeLessThan(20_000)

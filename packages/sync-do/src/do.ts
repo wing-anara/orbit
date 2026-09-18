@@ -76,8 +76,8 @@ export interface SyncDurableObjectConfig {
   /**
    * How long a subscription stays materialized after its last session left, milliseconds.
    * A reload, a redeploy or a client's query TTL within this period reuses the membership
-   * instead of rewriting it. Maintenance of an orphaned subscription costs a few indexed
-   * operations per change that touches its tables. Default: one hour.
+   * instead of rewriting it. Orphan maintenance stops immediately; expired
+   * memberships are reclaimed in bounded alarm passes. Default: one hour.
    */
   readonly subscriptionGraceMs?: number
 }
@@ -875,13 +875,15 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       const engine = this.engine
       if (engine === null) return
       const dropped = engine.sweepOrphans(now - subscriptionGraceMs)
-      if (dropped.length > 0)
+      const nextOrphan = engine.nextOrphanDue(subscriptionGraceMs)
+      const pendingCleanup = nextOrphan !== null && nextOrphan <= now
+      if (dropped.length > 0 || pendingCleanup)
         log({
           event: "orbit.subscriptions.swept",
           partition: this.partition,
           count: dropped.length,
+          pending_cleanup: pendingCleanup,
         })
-      const nextOrphan = engine.nextOrphanDue(subscriptionGraceMs)
       if (nextOrphan !== null) await this.scheduleAlarm(Math.max(nextOrphan, now + 1000))
       let pending = 0
       for (const fill of engine.outstandingFills()) {

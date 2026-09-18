@@ -43,6 +43,55 @@ const seed = (engine: SyncEngine, count: number) => {
 }
 
 describe("orphan subscription maintenance", () => {
+  it("bounds expired membership deletion and safely revives a partially swept view", () => {
+    const { engine, driver, deps } = makeEngine()
+    seed(engine, 3000)()
+    const active = subscribe(engine, window(100)).subscription
+    const first = subscribe(engine, window(2500)).subscription
+    const second = subscribe(engine, window(2600)).subscription
+    engine.markOrphaned(first, 10)
+    engine.markOrphaned(second, 11)
+    const count = () => Number(driver.query("SELECT COUNT(*) AS n FROM membership")[0]?.["n"])
+    const before = count()
+    expect(engine.sweepOrphans(20)).toEqual([])
+    expect(before - count()).toBe(1000)
+    expect(engine.membershipOf(active)).toHaveLength(100)
+    expect(
+      driver.query("SELECT value FROM meta WHERE key = ?", [`orphan_version:${first}`]),
+    ).toEqual([])
+
+    // An eviction or a returning client between cleanup passes must not trust
+    // the former current-version proof for the now incomplete membership.
+    const reopened = new SyncEngine(deps)
+    reopened.init()
+    const restored = reopened.subscribe(window(2500), { basedOn: active })
+    if (Result.isFailure(restored)) throw restored.failure
+    expect(reopened.membershipOf(first)).toEqual(reopened.recompute(first))
+    expect(reopened.membershipOf(first)).toHaveLength(2500)
+    const dropped: string[] = []
+    for (let i = 0; i < 3; i++) {
+      const previous = count()
+      dropped.push(...reopened.sweepOrphans(20))
+      expect(previous - count()).toBeLessThanOrEqual(1000)
+    }
+    expect(dropped).toEqual([second])
+    expect(reopened.membershipOf(active)).toHaveLength(100)
+    expect(reopened.membershipOf(first)).toHaveLength(2500)
+    expect(reopened.nextOrphanDue(1000)).toBeNull()
+    driver.db.close()
+  })
+
+  it("also bounds cleanup when abandoned queries have no membership", () => {
+    const { engine, driver } = makeEngine()
+    seed(engine, 0)()
+    for (let i = 1; i <= 40; i++) engine.markOrphaned(subscribe(engine, window(i)).subscription, i)
+    expect(engine.sweepOrphans(100)).toHaveLength(16)
+    expect(engine.sweepOrphans(100)).toHaveLength(16)
+    expect(engine.sweepOrphans(100)).toHaveLength(8)
+    expect(engine.nextOrphanDue(1000)).toBeNull()
+    driver.db.close()
+  })
+
   it("bounds mutation work by active views after window/filter churn", () => {
     const measure = (orphans: number) => {
       const { engine, driver } = makeEngine()

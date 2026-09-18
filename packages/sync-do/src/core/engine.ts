@@ -951,16 +951,40 @@ export class SyncEngine {
     })
   }
 
-  /** Drops subscriptions orphaned at or before `before`. Returns the dropped ids. */
+  /**
+   * Reclaims expired memberships in bounded passes so a large historical window
+   * cannot monopolize the DO alarm. Returns only subscriptions fully removed.
+   */
   sweepOrphans(before: number): ReadonlyArray<string> {
     return this.db.transaction(() => {
       const ids = this.db
-        .query(`SELECT id FROM subscriptions WHERE orphaned_at IS NOT NULL AND orphaned_at <= ?`, [
-          before,
-        ])
+        .query(
+          `SELECT id FROM subscriptions WHERE orphaned_at IS NOT NULL AND orphaned_at <= ? ORDER BY orphaned_at LIMIT 16`,
+          [before],
+        )
         .map((r) => asString(r["id"]))
-      for (const id of ids) this.unsubscribe(id)
-      return ids
+      const dropped: Array<string> = []
+      let remaining = 1000
+      for (const id of ids) {
+        if (remaining === 0) break
+        // Reopening between passes must rebuild this incomplete membership,
+        // even when no source row changed since it was originally orphaned.
+        this.db.run(`DELETE FROM meta WHERE key = ?`, [`orphan_version:${id}`])
+        this.db.run(
+          `DELETE FROM membership WHERE rowid IN (SELECT rowid FROM membership WHERE subscription = ? LIMIT ?)`,
+          [id, remaining],
+        )
+        const deleted = asNumber(this.db.query(`SELECT changes() AS n`)[0]?.["n"])
+        remaining -= deleted
+        if (
+          this.db.query(`SELECT 1 AS present FROM membership WHERE subscription = ? LIMIT 1`, [id])
+            .length > 0
+        )
+          continue
+        this.unsubscribe(id)
+        dropped.push(id)
+      }
+      return dropped
     })
   }
 
