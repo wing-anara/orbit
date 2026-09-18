@@ -73,3 +73,45 @@ describe("subscription garbage collection", () => {
     }
   })
 })
+
+it("replays unchanged snapshots without deleting or rewriting cached row images", async () => {
+  const driver = nodeAsyncDriver()
+  const store = new LocalStore(driver, schema, "org_1")
+  try {
+    await Effect.runPromise(store.open({ clientId: "replay-test" }))
+    await Effect.runPromise(
+      store.registerSubscription("view", { table: "organization" }, { table: "organization" }),
+    )
+    const row = {
+      table: "organization",
+      key: ["org_1"],
+      row: {
+        id: "org_1",
+        name: "original",
+        created_at: "2026-01-01 00:00:00",
+        hipaa_enabled: false,
+      },
+    }
+    const members = [{ table: "organization", key: ["org_1"] }]
+    await Effect.runPromise(store.applySnapshot("view", 1, [row], members))
+    driver.db.exec(
+      `CREATE TEMP TABLE writes (op TEXT); CREATE TEMP TRIGGER track_insert AFTER INSERT ON t_organization BEGIN INSERT INTO writes VALUES ('insert'); END; CREATE TEMP TRIGGER track_update AFTER UPDATE ON t_organization BEGIN INSERT INTO writes VALUES ('update'); END; CREATE TEMP TRIGGER track_delete AFTER DELETE ON t_organization BEGIN INSERT INTO writes VALUES ('delete'); END;`,
+    )
+    await Effect.runPromise(store.applySnapshot("view", 2, [row], members))
+    expect(driver.db.prepare("SELECT * FROM writes").all()).toEqual([])
+    const changed = { ...row, row: { ...row.row, name: "changed", hipaa_enabled: true } }
+    await Effect.runPromise(store.applySnapshot("view", 3, [changed], members))
+    expect(driver.db.prepare("SELECT op FROM writes").all()).toEqual([{ op: "update" }])
+    expect(driver.db.prepare("SELECT name, hipaa_enabled FROM t_organization").get()).toEqual({
+      name: "changed",
+      hipaa_enabled: 1,
+    })
+    driver.db.exec("DELETE FROM writes")
+    await Effect.runPromise(store.applyDelta(4, [changed], []))
+    expect(driver.db.prepare("SELECT * FROM writes").all()).toEqual([])
+    await Effect.runPromise(store.applySnapshot("view", 5, [], []))
+    expect(driver.db.prepare("SELECT op FROM writes").all()).toEqual([{ op: "delete" }])
+  } finally {
+    driver.db.close()
+  }
+})

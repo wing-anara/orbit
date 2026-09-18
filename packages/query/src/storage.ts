@@ -30,8 +30,17 @@ export const rowToParams = (table: TableSchema, row: RowImage): ReadonlyArray<Sq
 export const upsertSql = (table: TableSchema): string => {
   const cols = [KEY_COLUMN, ...table.columns.map((c) => c.name)]
   const updates = table.columns.map((c) => `${quoteIdent(c.name)} = excluded.${quoteIdent(c.name)}`)
-  return `INSERT INTO ${quoteIdent(localTableName(table.name))} (${cols.map(quoteIdent).join(", ")}) VALUES (${cols.map(() => "?").join(", ")}) ON CONFLICT(${quoteIdent(KEY_COLUMN)}) DO UPDATE SET ${updates.join(", ")}`
+  return `INSERT INTO ${quoteIdent(localTableName(table.name))} (${cols.map(quoteIdent).join(", ")}) VALUES (${cols.map(() => "?").join(", ")}) ON CONFLICT(${quoteIdent(KEY_COLUMN)}) DO UPDATE SET ${updates.join(", ")} WHERE ${upsertChangedWhere(table)}`
 }
+
+/** Avoid rewriting unchanged row images when snapshots overlap or are replayed. */
+export const upsertChangedWhere = (table: TableSchema): string =>
+  table.columns
+    .map(
+      (c) =>
+        `${quoteIdent(localTableName(table.name))}.${quoteIdent(c.name)} IS NOT excluded.${quoteIdent(c.name)}`,
+    )
+    .join(" OR ")
 
 export const deleteByKeySql = (table: TableSchema): string =>
   `DELETE FROM ${quoteIdent(localTableName(table.name))} WHERE ${quoteIdent(KEY_COLUMN)} = ?`

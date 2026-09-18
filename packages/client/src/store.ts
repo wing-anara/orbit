@@ -34,6 +34,7 @@ import {
   rowToParams,
   sqliteDialect,
   upsertSql,
+  upsertChangedWhere,
   type Dialect,
   type PlannedQuery,
   type ResultNode,
@@ -338,11 +339,29 @@ export class LocalStore {
   }
 
   /** Deletes rows referenced only by `subscription`, per table. Run before removing its membership. */
-  private gcStatementsForSubscription(subscription: string): ReadonlyArray<Statement> {
-    return this.schema.tables.map((t) => ({
-      sql: `DELETE FROM ${quoteIdent(localTableName(t.name))} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT key FROM membership WHERE subscription = ? AND tbl = ?) AND NOT EXISTS (SELECT 1 FROM membership WHERE tbl = ? AND key = ${quoteIdent(localTableName(t.name))}.${quoteIdent(KEY_COLUMN)} AND subscription <> ?)`,
-      params: [subscription, t.name, t.name, subscription],
-    }))
+  private gcStatementsForSubscription(
+    subscription: string,
+    retained: ReadonlyArray<MemberRef> = [],
+  ): ReadonlyArray<Statement> {
+    const keys = new Map<string, Array<string>>()
+    for (const ref of retained) {
+      const list = keys.get(ref.table) ?? []
+      list.push(SchemaRuntime.keyString(ref.key))
+      keys.set(ref.table, list)
+    }
+    return this.schema.tables.map((t) => {
+      const keep = keys.get(t.name)
+      return {
+        sql: `DELETE FROM ${quoteIdent(localTableName(t.name))} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT key FROM membership WHERE subscription = ? AND tbl = ?) AND NOT EXISTS (SELECT 1 FROM membership WHERE tbl = ? AND key = ${quoteIdent(localTableName(t.name))}.${quoteIdent(KEY_COLUMN)} AND subscription <> ?)${keep === undefined ? "" : ` AND ${quoteIdent(KEY_COLUMN)} NOT IN (SELECT value FROM json_each(?))`}`,
+        params: [
+          subscription,
+          t.name,
+          t.name,
+          subscription,
+          ...(keep === undefined ? [] : [JSON.stringify(keep)]),
+        ],
+      }
+    })
   }
 
   private upsertStatements(
@@ -369,7 +388,7 @@ export class LocalStore {
         (c) => `${quoteIdent(c.name)} = excluded.${quoteIdent(c.name)}`,
       )
       out.push({
-        sql: `INSERT INTO ${quoteIdent(localTableName(table.name))} (${cols.map(quoteIdent).join(", ")}) SELECT ${cols.map(() => "?").join(", ")} WHERE EXISTS (SELECT 1 FROM membership WHERE tbl = ? AND key = ?) ON CONFLICT(${quoteIdent(KEY_COLUMN)}) DO UPDATE SET ${updates.join(", ")}`,
+        sql: `INSERT INTO ${quoteIdent(localTableName(table.name))} (${cols.map(quoteIdent).join(", ")}) SELECT ${cols.map(() => "?").join(", ")} WHERE EXISTS (SELECT 1 FROM membership WHERE tbl = ? AND key = ?) ON CONFLICT(${quoteIdent(KEY_COLUMN)}) DO UPDATE SET ${updates.join(", ")} WHERE ${upsertChangedWhere(table)}`,
         params: [...params, table.name, key],
       })
     }
@@ -392,7 +411,7 @@ export class LocalStore {
   ): Effect.Effect<void, StoreError> {
     const statements: Array<Statement> = [
       ...this.transferStatements(subscription),
-      ...this.gcStatementsForSubscription(subscription),
+      ...this.gcStatementsForSubscription(subscription, members),
       { sql: `DELETE FROM membership WHERE subscription = ?`, params: [subscription] },
       {
         sql: `UPDATE subscriptions SET based_on = ? WHERE id = ?`,
