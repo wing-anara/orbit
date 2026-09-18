@@ -16,7 +16,7 @@
  *    transaction, the bookkeeping row is upserted, and the transaction commits: `applied`.
  * 5. When the arguments are invalid or the mutator throws, the transaction rolls back, a second
  *    transaction records `last_mutation_id = id` so the client drops the mutation, and the outcome
- *    is `failed` with the error message.
+ *    is `failed` with the error message. RetryableMutationError instead leaves the id unconsumed.
  *
  * Runs on the Web standard `Request`/`Response`, so it fits Cloudflare Workers and Node alike.
  */
@@ -96,6 +96,9 @@ const readLast = async (tx: SqlTx, clientId: string): Promise<number> => {
 const recordLast = (tx: SqlTx, body: PushRequest, id: number): Promise<void> =>
   tx.execute(UPSERT_CLIENT_SQL, [body.clientId, body.partition, id, nowWire()])
 
+/** Transient application failures leave the durable mutation queued for another push. */
+export class RetryableMutationError extends Error {}
+
 /** Marks an error raised by the mutator (or argument decoding), as opposed to the database. */
 class ApplyFailure {
   constructor(readonly cause: unknown) {}
@@ -134,6 +137,7 @@ export const createPushHandler = <D, M extends MutatorDefinitions<D>>(
         const { definition, args } = decodeArgs(mutators, mutation.name, mutation.args)
         await definition.apply(createMysqlTx<D>(rt, tx, mutation.name), args, ctx)
       } catch (e) {
+        if (e instanceof RetryableMutationError) throw e
         throw new ApplyFailure(e)
       }
       await recordLast(tx, body, mutation.id)

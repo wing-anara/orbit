@@ -4,6 +4,7 @@ import { decodePushResponse, MUTATION_PROTOCOL_VERSION, type PushRequest } from 
 
 import {
   createPushHandler,
+  RetryableMutationError,
   SELECT_LAST_MUTATION_SQL,
   UPSERT_CLIENT_SQL,
 } from "../src/server/index.ts"
@@ -247,6 +248,48 @@ describe("createPushHandler mutation flow", () => {
       [upsert(1)],
       [selectLast(), insertItem("i1", "after", 1), upsert(2)],
     ])
+  })
+
+  it("retries transient application failures without consuming the mutation or later writes", async () => {
+    const db = new FakeDb()
+    let attempts = 0
+    const handler = createPushHandler({
+      schema,
+      db,
+      mutators: {
+        ...mutators,
+        definitions: {
+          ...mutators.definitions,
+          createItem: {
+            ...mutators.definitions.createItem,
+            apply: async (
+              tx,
+              args: Parameters<typeof mutators.definitions.createItem.apply>[1],
+              ctx,
+            ) => {
+              attempts++
+              if (attempts === 1) throw new RetryableMutationError("temporarily unavailable")
+              await mutators.definitions.createItem.apply(tx, args, ctx)
+            },
+          },
+        },
+      },
+      authorize: async () => ({ subject: "alice" }),
+    })
+    const body = push([{ id: 1, name: "createItem", args: { id: "retry", name: "retry" } }])
+    expect((await handler(request(body))).status).toBe(500)
+    expect(db.last.get("c1")).toBeUndefined()
+    expect(db.committed).toEqual([])
+    expect(decodePushResponse(await (await handler(request(body))).json())).toMatchObject({
+      type: "ok",
+      outcomes: [{ id: 1, status: "applied" }],
+      lastMutationId: 1,
+    })
+    expect(decodePushResponse(await (await handler(request(body))).json())).toMatchObject({
+      type: "ok",
+      outcomes: [{ id: 1, status: "duplicate" }],
+    })
+    expect(attempts).toBe(2)
   })
 
   it("treats invalid arguments and unknown mutators as failed and consumes the ids", async () => {

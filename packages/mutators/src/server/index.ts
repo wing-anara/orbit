@@ -13,6 +13,7 @@ export type { PushDb, SqlParam, SqlTx } from "./db.ts"
 export { createMysqlTx } from "./mysql-tx.ts"
 export {
   createPushHandler,
+  RetryableMutationError,
   MAX_ERROR_LENGTH,
   SELECT_LAST_MUTATION_SQL,
   UPSERT_CLIENT_SQL,
