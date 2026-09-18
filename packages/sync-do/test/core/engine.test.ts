@@ -92,6 +92,46 @@ describe("SyncEngine: cursor and deduplication", () => {
     expect(changedSnapshot?.type === "snapshot" && changedSnapshot.rows.length).toBe(2)
   })
 
+  it("resumes a retained orphan without scanning rows only with a server-owned current proof", () => {
+    const { engine, driver, deps } = makeEngine()
+    liveScope(engine, "Chatbot", [chatbot("a", { contents: "large image" })])
+    const first = engine.subscribe({ table: "Chatbot" })
+    if (Result.isFailure(first)) throw first.failure
+    const resume = { version: engine.resumeVersion(), query: first.success.query }
+    engine.markOrphaned(first.success.subscription, 10)
+    const reopened = new SyncEngine(deps)
+    reopened.init()
+    const spy = vi.spyOn(driver, "query")
+    const same = reopened.subscribe({ table: "Chatbot" }, { resume })
+    expect(
+      spy.mock.calls.some(
+        ([sql]) => sql.includes('FROM "t_Chatbot"') || sql.includes("FROM membership"),
+      ),
+    ).toBe(false)
+    spy.mockRestore()
+    if (Result.isFailure(same)) throw same.failure
+    expect(same.success.resumed).toEqual({ version: resume.version, cursor: 0 })
+    expect(same.success.events).toEqual([])
+    // A client can claim the new cache version, but must not make stale server
+    // membership current after it missed changes during the orphan interval.
+    reopened.markOrphaned(first.success.subscription, 20)
+    reopened.applyBatch(batch(schema, "org_1", [txn(1, [insert("Chatbot", chatbot("b"))])]))
+    const changed = reopened.subscribe(
+      { table: "Chatbot" },
+      {
+        resume: { version: reopened.resumeVersion(), query: first.success.query },
+      },
+    )
+    if (Result.isFailure(changed)) throw changed.failure
+    expect(reopened.membershipOf(first.success.subscription).map((m) => m.key)).toEqual([
+      ["a"],
+      ["b"],
+    ])
+    reopened.markOrphaned(first.success.subscription, 30)
+    reopened.unsubscribe(first.success.subscription)
+    expect(driver.query("SELECT key FROM meta WHERE key LIKE 'orphan_version:%'")).toEqual([])
+  })
+
   it("applies in order, skips duplicates, rejects gaps and conflicting duplicates", () => {
     const { engine } = makeEngine()
     liveScope(engine, "Chatbot", [])
@@ -590,6 +630,88 @@ describe("SyncEngine: subscriptions and incremental maintenance", () => {
     expect(engine.membershipOf(full.success.subscription)).toEqual(
       engine.recompute(full.success.subscription),
     )
+  })
+
+  it("grows the current prefix after inserts, deletes and reordered rows, with shared includes", () => {
+    const { engine } = makeEngine()
+    liveScope(engine, "Chatbot", [
+      chatbot("f", { type: "GROUP" }),
+      ...["a", "b", "c", "d"].map((id, i) => chatbot(id, { groupId: "f", displayOrder: i })),
+    ])
+    const query = (limit: number): Query => ({
+      table: "Chatbot",
+      where: { op: "eq", column: "type", value: "DOCUMENT" },
+      orderBy: [{ column: "displayOrder", direction: "asc" }],
+      limit,
+      include: ["folder"],
+    })
+    const first = engine.subscribe(query(2))
+    if (Result.isFailure(first)) throw first.failure
+    engine.applyBatch(
+      batch(schema, "org_1", [
+        txn(1, [
+          remove("Chatbot", chatbot("a", { groupId: "f", displayOrder: 0 })),
+          update(
+            "Chatbot",
+            chatbot("d", { groupId: "f", displayOrder: 3 }),
+            chatbot("d", { groupId: "f", displayOrder: -1 }),
+          ),
+          insert("Chatbot", chatbot("e", { groupId: "f", displayOrder: 4 })),
+        ]),
+      ]),
+    )
+    const before = engine.membershipOf(first.success.subscription)
+    const grown = engine.subscribe(query(4), { basedOn: first.success.subscription })
+    if (Result.isFailure(grown)) throw grown.failure
+    const snap = grown.success.events.find((e) => e.type === "snapshot")
+    if (snap?.type !== "snapshot") throw Error("missing snapshot")
+    expect(snap.basedOn).toBe(first.success.subscription)
+    expect(snap.rows.map((r) => r.key)).toEqual([["c"], ["e"]])
+    expect(
+      [...before, ...snap.members].sort((a, b) =>
+        JSON.stringify(a).localeCompare(JSON.stringify(b)),
+      ),
+    ).toEqual(
+      [...engine.recompute(grown.success.subscription)].sort((a, b) =>
+        JSON.stringify(a).localeCompare(JSON.stringify(b)),
+      ),
+    )
+    const keys = (refs: ReadonlyArray<{ table: string; key: ReadonlyArray<unknown> }>) =>
+      refs.map((ref) => JSON.stringify(ref)).sort()
+    expect(keys(engine.membershipOf(grown.success.subscription))).toEqual(
+      keys(engine.recompute(grown.success.subscription)),
+    )
+  })
+
+  it("grows exhausted and empty prefixes and does not reuse a differently filtered prefix", () => {
+    const { engine } = makeEngine()
+    liveScope(engine, "Chatbot", [chatbot("a"), chatbot("f", { type: "GROUP" })])
+    const query = (limit: number, type = "DOCUMENT"): Query => ({
+      table: "Chatbot",
+      where: { op: "eq", column: "type", value: type },
+      limit,
+      orderBy: [{ column: "id", direction: "asc" }],
+      include: ["folder"],
+    })
+    for (const type of ["DOCUMENT", "NOTE"]) {
+      const base = engine.subscribe(query(2, type))
+      if (Result.isFailure(base)) throw base.failure
+      const grown = engine.subscribe(query(4, type), { basedOn: base.success.subscription })
+      if (Result.isFailure(grown)) throw grown.failure
+      const snap = grown.success.events.find((e) => e.type === "snapshot")
+      expect(snap?.type === "snapshot" && snap.basedOn).toBe(base.success.subscription)
+      expect(snap?.type === "snapshot" && snap.rows).toEqual([])
+      expect(engine.membershipOf(grown.success.subscription)).toEqual(
+        engine.recompute(grown.success.subscription),
+      )
+    }
+    const base = engine.subscribe(query(2))
+    if (Result.isFailure(base)) throw base.failure
+    const changed = engine.subscribe(query(4, "GROUP"), { basedOn: base.success.subscription })
+    if (Result.isFailure(changed)) throw changed.failure
+    const snap = changed.success.events.find((e) => e.type === "snapshot")
+    expect(snap?.type === "snapshot" && snap.basedOn).toBeUndefined()
+    expect(snap?.type === "snapshot" && snap.rows.map((r) => r.key)).toEqual([["f"]])
   })
 
   it("extends and maintains persisted legacy subscription identities after an upgrade", () => {

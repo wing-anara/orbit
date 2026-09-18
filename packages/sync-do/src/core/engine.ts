@@ -809,6 +809,7 @@ export class SyncEngine {
         const events: Array<EngineEvent> = []
         this.plans.set(p.key, p)
         const existing = this.subscription(p.key)
+        const retainedVersion = existing === null ? null : this.meta(`orphan_version:${p.key}`)
         const base =
           options.basedOn === undefined || options.basedOn === p.key
             ? null
@@ -828,6 +829,7 @@ export class SyncEngine {
             )
         } else {
           this.db.run(`UPDATE subscriptions SET orphaned_at = NULL WHERE id = ?`, [p.key])
+          this.db.run(`DELETE FROM meta WHERE key = ?`, [`orphan_version:${p.key}`])
         }
         const { pending, requests } = this.ensureScopes(p.tables)
         for (const request of requests) events.push({ type: "fill_needed", request })
@@ -839,7 +841,8 @@ export class SyncEngine {
           resume.version === this.resumeVersion() &&
           canonicalJson(resume.query) === canonicalJson(p.query)
         // A held, live materialization needs neither row reads nor membership serialization.
-        if (unchanged && existing?.live === true)
+        if (unchanged && (existing?.live === true || retainedVersion === resume.version)) {
+          this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [p.key])
           return {
             subscription: p.key,
             status: "live",
@@ -847,10 +850,21 @@ export class SyncEngine {
             events,
             resumed: { version: resume.version, cursor: this.appliedSeq },
           }
+        }
         // The base's members need no row images: the client has them.
-        const held = seed && base !== null ? this.heldBy(base.id) : undefined
-        const snapshot =
-          existing?.live !== true
+        const grows =
+          existing === null &&
+          base !== null &&
+          base.live &&
+          base.planned.limit !== undefined &&
+          p.limit !== undefined &&
+          p.limit > base.planned.limit &&
+          JSON.stringify({ ...base.planned.query, limit: undefined }) ===
+            JSON.stringify({ ...p.query, limit: undefined })
+        const held = !grows && seed && base !== null ? this.heldBy(base.id) : undefined
+        const snapshot = grows
+          ? this.materializeGrowth({ id: p.key, planned: p, live: false }, base)
+          : existing?.live !== true
             ? this.materialize({ id: p.key, planned: p, live: false }, held)
             : this.snapshot(p.key, held)
         // An orphan may need its server membership rebuilt, but a validated client already has
@@ -908,6 +922,7 @@ export class SyncEngine {
     this.db.transaction(() => {
       this.db.run(`DELETE FROM membership WHERE subscription = ?`, [id])
       this.db.run(`DELETE FROM subscriptions WHERE id = ?`, [id])
+      this.db.run(`DELETE FROM meta WHERE key = ?`, [`orphan_version:${id}`])
       this.plans.delete(id)
     })
   }
@@ -919,10 +934,16 @@ export class SyncEngine {
    * `sweepOrphans` drops it once the grace period has passed.
    */
   markOrphaned(id: string, now: number): void {
-    this.db.run(
-      `UPDATE subscriptions SET orphaned_at = ?, live = 0 WHERE id = ? AND orphaned_at IS NULL`,
-      [now, id],
-    )
+    this.db.transaction(() => {
+      // A server-owned proof, not just the client's claim: this membership was
+      // complete at exactly this cache version before maintenance was suspended.
+      if (this.subscription(id)?.live === true)
+        this.setMeta(`orphan_version:${id}`, this.resumeVersion())
+      this.db.run(
+        `UPDATE subscriptions SET orphaned_at = ?, live = 0 WHERE id = ? AND orphaned_at IS NULL`,
+        [now, id],
+      )
+    })
   }
 
   /** Drops subscriptions orphaned at or before `before`. Returns the dropped ids. */
@@ -948,6 +969,7 @@ export class SyncEngine {
   private evaluate(
     planned: PlannedQuery,
     skip?: ReadonlySet<string>,
+    offset = 0,
   ): {
     readonly members: Array<{
       readonly path: string
@@ -958,8 +980,19 @@ export class SyncEngine {
   } {
     const members: Array<{ path: string; table: string; key: string; record: SqlRecord }> = []
     const options = { keysOnly: skip !== undefined }
-    const primary = compileSelect(planned, options)
-    for (const record of this.db.query(primary.sql, primary.params))
+    const primary = compileSelect(
+      offset === 0
+        ? planned
+        : {
+            ...planned,
+            limit: Math.max(0, (planned.limit ?? 0) - offset),
+          },
+      options,
+    )
+    for (const record of this.db.query(
+      primary.sql + (offset > 0 ? ` OFFSET ${offset}` : ""),
+      primary.params,
+    ))
       members.push({ path: "", table: planned.table.name, key: keyOfRecord(record), record })
     const keysByPath = new Map<string, Array<string>>([["", members.map((m) => m.key)]])
     for (const include of flattenIncludes(planned)) {
@@ -999,6 +1032,45 @@ export class SyncEngine {
       }
     }
     return { members }
+  }
+
+  /** A live identical smaller limit is a current prefix, including its complete include tree. */
+  private materializeGrowth(sub: SubscriptionRow, base: SubscriptionRow): EngineEvent {
+    const offset = Number(
+      this.db.query(`SELECT COUNT(*) AS n FROM membership WHERE subscription = ? AND path = ''`, [
+        base.id,
+      ])[0]?.["n"] ?? 0,
+    )
+    // Membership was seeded in SQL. Only evaluate roots beyond that prefix and their
+    // includes; walking the entire old include graph on each page is quadratic work.
+    // Sort and discard the prefix as keys, so SQLite does not copy large row
+    // images into its ordering buffer before applying OFFSET.
+    const { members } = this.evaluate(sub.planned, new Set(), offset)
+    const candidates = [
+      ...new Map(members.map((m) => [memberRef(m.table, m.key), [m.table, m.key]])).values(),
+    ]
+    const held = new Set<string>()
+    if (candidates.length > 0) {
+      for (const row of this.db.query(
+        `SELECT DISTINCT m.tbl, m.key FROM json_each(?) r JOIN membership m ON m.tbl = json_extract(r.value, '$[0]') AND m.key = json_extract(r.value, '$[1]') WHERE m.subscription = ?`,
+        [JSON.stringify(candidates), base.id],
+      ))
+        held.add(memberRef(asString(row["tbl"]), asString(row["key"])))
+    }
+    for (const m of members)
+      this.db.run(
+        `INSERT OR IGNORE INTO membership (subscription, path, tbl, key) VALUES (?, ?, ?, ?)`,
+        [sub.id, m.path, m.table, m.key],
+      )
+    this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [sub.id])
+    const snapshot = this.snapshotFrom(sub.id, members, held)
+    return {
+      ...snapshot,
+      basedOn: base.id,
+      members: snapshot.members.filter(
+        (m) => !held.has(memberRef(m.table, SchemaRuntime.keyString(m.key))),
+      ),
+    }
   }
 
   /**
@@ -1068,7 +1140,7 @@ export class SyncEngine {
       readonly record: SqlRecord
     }>,
     skip?: ReadonlySet<string>,
-  ): EngineEvent {
+  ): Extract<EngineEvent, { readonly type: "snapshot" }> {
     // A row can be reached as a primary row and through an include (self relations); membership
     // is a set, so it is listed once.
     const rows: Array<RowUpdate> = []
