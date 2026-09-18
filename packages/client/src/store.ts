@@ -340,8 +340,8 @@ export class LocalStore {
   /** Deletes rows referenced only by `subscription`, per table. Run before removing its membership. */
   private gcStatementsForSubscription(subscription: string): ReadonlyArray<Statement> {
     return this.schema.tables.map((t) => ({
-      sql: `DELETE FROM ${quoteIdent(localTableName(t.name))} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT key FROM membership WHERE subscription = ? AND tbl = ?) AND ${quoteIdent(KEY_COLUMN)} NOT IN (SELECT key FROM membership WHERE subscription <> ? AND tbl = ?)`,
-      params: [subscription, t.name, subscription, t.name],
+      sql: `DELETE FROM ${quoteIdent(localTableName(t.name))} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT key FROM membership WHERE subscription = ? AND tbl = ?) AND NOT EXISTS (SELECT 1 FROM membership WHERE tbl = ? AND key = ${quoteIdent(localTableName(t.name))}.${quoteIdent(KEY_COLUMN)} AND subscription <> ?)`,
+      params: [subscription, t.name, t.name, subscription],
     }))
   }
 
