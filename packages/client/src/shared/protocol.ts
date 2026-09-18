@@ -73,7 +73,11 @@ export const Event = Schema.Union([
   Schema.Struct({ type: Schema.Literal("snapshot"), id: Schema.String, snapshot: Snapshot }),
   Schema.Struct({ type: Schema.Literal("read"), id: Schema.String, rows }),
   Schema.Struct({ type: Schema.Literal("allocated"), id: Schema.String, mutationId: number }),
-  Schema.Struct({ type: Schema.Literal("local"), id: Schema.String }),
+  Schema.Struct({
+    type: Schema.Literal("local"),
+    id: Schema.String,
+    error: Schema.optionalKey(Schema.String),
+  }),
   Schema.Struct({ type: Schema.Literal("outcome"), id: Schema.String, outcome: MutationOutcome }),
   Schema.Struct({ type: Schema.Literal("error"), id: Schema.String, message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("mutation"), event: MutationEvent }),

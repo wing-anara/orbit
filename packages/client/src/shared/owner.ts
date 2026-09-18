@@ -1,4 +1,4 @@
-import type { MutationHandle } from "../mutations.ts"
+import { PersistedMutationError, type MutationHandle } from "../mutations.ts"
 import { decodeArgs, type MutatorDefinitions } from "@orbit/mutators"
 import { NamedQueryCall, TypedQuery, type IncludeShape } from "@orbit/query"
 import type { SyncSchemaDefinition } from "@orbit/schema"
@@ -158,7 +158,14 @@ export const openSharedOwner = async <D extends Definition, M extends MutatorDef
             void handle.local.then(
               () => send(peer, { type: "local", id: command.id }),
               (error: unknown) =>
-                send(peer, { type: "error", id: command.id, message: String(error) }),
+                // The durable mutation still goes to the server after a local
+                // refusal (e.g. an uncached row). Do not discard its outcome.
+                send(
+                  peer,
+                  error instanceof PersistedMutationError
+                    ? { type: "local", id: command.id, error: String(error) }
+                    : { type: "error", id: command.id, message: String(error) },
+                ),
             )
             void handle.server.then(
               (outcome) => send(peer, { type: "outcome", id: command.id, outcome }),

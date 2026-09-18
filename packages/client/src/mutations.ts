@@ -71,6 +71,9 @@ export interface MutationHandle {
   readonly server: Promise<MutationOutcome>
 }
 
+/** A local refusal after the mutation was durably queued; the server still decides. */
+export class PersistedMutationError extends Error {}
+
 /** A FIFO mutual exclusion lock usable from Promise and Effect code alike. */
 export class AsyncLock {
   private tail: Promise<void> = Promise.resolve()
@@ -423,7 +426,7 @@ export class MutationManager {
       this.replayFailed.add(id)
       this.emit({ id, name, status: "failed", error })
       this.config.onLog("mutation.failed_locally", { id, name, error })
-      throw new Error(`mutator ${name} failed: ${error}`)
+      throw new PersistedMutationError(`mutator ${name} failed: ${error}`)
     }
     this.emit({ id, name, status: "applied_locally" })
     await this.config.onChanged(tx.touched)

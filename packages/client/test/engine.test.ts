@@ -1786,14 +1786,17 @@ describe("client-side mutations", () => {
 
 // Shared-client tests exercise the real engine and SQLite through the tab transport.
 describe("shared browser clients", () => {
-  const setup = async (pushReachable = true) => {
+  const setup = async (
+    pushReachable = true,
+    wrapDriver: (driver: AsyncSqlDriver) => AsyncSqlDriver = (driver) => driver,
+  ) => {
     const { createSharedOrbitClient } = await import("../src/shared/client.ts")
     const { sharedPlatform } = await import("./support/shared-platform.ts")
     const messages: Array<unknown> = []
     const platform = sharedPlatform((message) => messages.push(message))
     const server = new FakeSyncServer(schema, "org_1", { queries: serverQueries })
     const push = new FakePushServer(server, serverApply, { reachable: pushReachable })
-    const driver = reloadable(nodeAsyncDriver())
+    const driver = reloadable(wrapDriver(nodeAsyncDriver()))
     let sockets = 0
     const open = () =>
       createSharedOrbitClient({
@@ -1940,6 +1943,55 @@ describe("shared browser clients", () => {
       }
     },
   )
+
+  it.each(["owner", "follower"] as const)(
+    "keeps the server outcome observable after a %s mutation fails locally",
+    async (role) => {
+      const env = await setup()
+      const owner = await env.open()
+      const client = role === "owner" ? owner : await env.open()
+      try {
+        const view = client.liveQuery(documents)
+        await waitFor(() => env.server.pendingFills.length === 2)
+        env.server.completeFill("Chatbot", [])
+        env.server.completeFill("orbit_clients", [])
+        await waitFor(() => view.getSnapshot().status === "live")
+        // The server may hold a row outside the client's current query window.
+        const write = client.mutate.setOrder({ id: "uncached", displayOrder: 42 })
+        await expect(write.local).rejects.toThrow("not found")
+        await expect(write.server).resolves.toMatchObject({ status: "applied" })
+        await waitFor(() => view.getSnapshot().rows.some((r) => r.id === "uncached"))
+      } finally {
+        await client.close()
+        if (client !== owner) await owner.close()
+      }
+    },
+  )
+
+  it("rejects an unpersisted mutation instead of waiting for a nonexistent server outcome", async () => {
+    const env = await setup(true, (driver) => ({
+      ...driver,
+      batch: async (statements) => {
+        if (statements.some((s) => s.sql.startsWith("INSERT INTO pending_mutations")))
+          throw new Error("disk full")
+        return driver.batch(statements)
+      },
+    }))
+    const client = await env.open()
+    try {
+      const view = client.liveQuery(documents)
+      await waitFor(() => env.server.pendingFills.length === 2)
+      env.server.completeFill("Chatbot", [])
+      env.server.completeFill("orbit_clients", [])
+      await waitFor(() => view.getSnapshot().status === "live")
+      const write = client.mutate.createDocument({ id: "not-persisted", groupId: null })
+      await expect(write.local).rejects.toThrow("disk full")
+      await expect(write.server).rejects.toThrow("disk full")
+      expect(await env.driver.query("SELECT id FROM pending_mutations")).toEqual([])
+    } finally {
+      await client.close()
+    }
+  })
 
   it("three tabs share a client id, socket, optimistic writes and dense mutation ids", async () => {
     const env = await setup()

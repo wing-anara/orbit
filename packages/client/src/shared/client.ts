@@ -419,7 +419,8 @@ export const createSharedOrbitClient = async <
               break
             case "local":
               request.committed = true
-              local.resolve()
+              if (event.error === undefined) local.resolve()
+              else local.reject(new Error(event.error))
               break
             case "outcome":
               server.resolve(event.outcome)
