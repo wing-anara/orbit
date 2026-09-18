@@ -1219,6 +1219,55 @@ const serverQueries = defineQueries(sync, {
 })
 
 describe("named queries", () => {
+  it("preserves public row identities across window growth and status changes without hiding relation updates", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const client = await createOrbitClient({
+      definition: sync,
+      schema,
+      url: "http://fake",
+      partition: "org_1",
+      getToken: async () => "t",
+      driver: nodeAsyncDriver(),
+      makeWebSocket: server.connect,
+      backoffMinMs: 5,
+      backoffMaxMs: 20,
+    })
+    const query = (limit: number) =>
+      q(sync)
+        .from("Chatbot")
+        .where((c) => c.eq("type", "DOCUMENT"))
+        .include("folder")
+        .orderBy("id")
+        .limit(limit)
+    try {
+      const first = client.liveQuery(query(1))
+      await waitFor(() => server.pendingFills.length === 1)
+      const folder = chatbot("g", { type: "GROUP" })
+      server.completeFill("Chatbot", [chatbot("a", { groupId: "g" }), chatbot("b"), folder])
+      await waitFor(() => first.getSnapshot().status === "live")
+      const original = first.getSnapshot().rows[0]
+      const grown = client.liveQuery(query(2))
+      await waitFor(() => grown.getSnapshot().status === "live")
+      expect(grown.getSnapshot().rows.map((r) => r.id)).toEqual(["a", "b"])
+      expect(grown.getSnapshot().rows[0]).toBe(original)
+      const rows = grown.getSnapshot().rows
+      const reconnect: Array<{ status: string; rows: typeof rows }> = []
+      const off = grown.subscribe(() => reconnect.push(grown.getSnapshot()))
+      server.dropAll()
+      await waitFor(
+        () => reconnect.some((s) => s.status === "stale") && reconnect.at(-1)?.status === "live",
+      )
+      expect(reconnect.every((s) => s.rows === rows)).toBe(true)
+      off()
+      server.commit([update("Chatbot", folder, chatbot("g", { type: "GROUP", displayOrder: 9 }))])
+      await waitFor(() => grown.getSnapshot().rows[0]?.folder?.displayOrder === 9)
+      expect(grown.getSnapshot().rows[0]).not.toBe(original)
+      expect(original?.folder?.displayOrder).toBeNull()
+    } finally {
+      await client.close()
+    }
+  })
+
   it("renders the local resolution first, then adopts the server's resolved query", async () => {
     const server = new FakeSyncServer(schema, "org_1", { queries: serverQueries })
     const driver = reloadable(nodeAsyncDriver())

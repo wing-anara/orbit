@@ -132,6 +132,11 @@ export interface OrbitClient<D, M extends MutatorDefinitions<D> = Record<never, 
   readonly clientId: string
 }
 
+type ResultCache = {
+  readonly nodes: WeakMap<ResultNode, object>
+  readonly arrays: WeakMap<ReadonlyArray<ResultNode>, ReadonlyArray<object>>
+}
+
 /**
  * Flattens locally served rows (primary row plus included relations) into the result shape the
  * query promises. The row type comes from the query's phantom `_Row`; the store only holds the
@@ -140,9 +145,24 @@ export interface OrbitClient<D, M extends MutatorDefinitions<D> = Record<never, 
 function toRows<D, N extends string, I extends IncludeShape>(
   query: TypedQuery<D, N, I> | NamedQueryCall<D, N, I>,
   rows: ReadonlyArray<ResultNode>,
+  cache: ResultCache,
 ): ReadonlyArray<ResultRow<D, N, I>>
-function toRows(_query: unknown, rows: ReadonlyArray<ResultNode>): ReadonlyArray<object> {
-  return rows.map(flattenNode)
+function toRows(
+  _query: unknown,
+  rows: ReadonlyArray<ResultNode>,
+  cache: ResultCache,
+): ReadonlyArray<object> {
+  const previous = cache.arrays.get(rows)
+  if (previous !== undefined) return previous
+  const result = rows.map((node) => {
+    const existing = cache.nodes.get(node)
+    if (existing !== undefined) return existing
+    const row = flattenNode(node)
+    cache.nodes.set(node, row)
+    return row
+  })
+  cache.arrays.set(rows, result)
+  return result
 }
 
 export const isNamedQueryCall = <D, N extends string, I extends IncludeShape>(
@@ -410,6 +430,8 @@ export const createOrbitClient = async <
         )
       : engine.subscribe(query.ast)
 
+  // Published engine nodes are immutable; growing windows share their unchanged prefix.
+  const resultCache: ResultCache = { nodes: new WeakMap(), arrays: new WeakMap() }
   const liveQuery = <N extends string, I extends IncludeShape = {}>(
     query: TypedQuery<D, N, I> | NamedQueryCall<D, N, I>,
   ): LiveQuery<ResultRow<D, N, I>> => {
@@ -450,7 +472,7 @@ export const createOrbitClient = async <
           lastSnapshot = snap
           cached = {
             status: snap.status,
-            rows: toRows(query, snap.rows),
+            rows: toRows(query, snap.rows, resultCache),
             error: snap.error,
             cursor: snap.cursor,
           }
@@ -473,7 +495,7 @@ export const createOrbitClient = async <
     query: TypedQuery<D, N, I> | NamedQueryCall<D, N, I>,
   ): Promise<ReadonlyArray<ResultRow<D, N, I>>> => {
     const ast = isNamedQueryCall(query) ? query.resolve(engine.queryContext).ast : query.ast
-    return toRows(query, await Effect.runPromise(engine.readLocal(ast)))
+    return toRows(query, await Effect.runPromise(engine.readLocal(ast)), resultCache)
   }
 
   const mutate = mutateMap<M>(config.mutators, (name, args) => engine.mutate(name, args))
