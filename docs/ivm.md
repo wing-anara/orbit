@@ -79,7 +79,13 @@ Durable Object SQLite binds at most 100 parameters per statement. The engine lim
 
 ## Grace period
 
-When the last session of a subscription leaves (an unsubscribe, a closed socket, a pruned session), the Durable Object does not drop the subscription. It records `orphaned_at` and keeps maintaining the membership; an alarm drops the subscription after `subscriptionGraceMs` (default one hour). A reload, a redeploy, or a client's query TTL within that period finds the subscription live and receives a snapshot without a single membership write. Without the grace period every reload rewrote the whole membership: 2,000 rows deleted and 2,000 inserted for a preload query over 2,000 documents.
+When the last session leaves, the subscription becomes orphaned and stops incremental maintenance immediately. Its membership stays for `subscriptionGraceMs` (default one hour). A server-owned version proof permits reuse only while the underlying cache is unchanged; otherwise a returning subscriber reconciles the view. An alarm reclaims at most 1,000 physical membership rows or shared chunk references per pass, examining at most 16 due subscriptions. A partial sweep invalidates the proof before deleting anything, so reopening between passes rebuilds a complete view.
+
+## Shared window membership
+
+Growing windows share the membership of their smaller live prefix. `membership_chunks` maps subscriptions to immutable shared chunks, and `membership_rows` stores each chunk's `(path, table, key)` entries. The read-only `membership` view presents the same logical set to incremental maintenance. New chunks contain at most 512 entries. Appending a window writes its new entries plus chunk references instead of copying the whole prefix. A removal clones only the affected chunk when another subscription owns it; unrelated windows keep their original membership. Sharing invalidates the writable tail, preventing later inserts from leaking into another view. Allocation, writers, ownership and cleanup are transactional SQLite state and survive rollback or object eviction.
+
+Old per-subscription membership tables are renamed and adopted as legacy chunks without rewriting their rows. The first edit of a shared legacy chunk may copy that larger chunk; subsequent newly allocated chunks use the 512-entry bound. Cache-format migration is forward-only: rolling back to a Worker predating chunk membership requires rebuilding its disposable DO cache. No source database or client protocol changes are involved.
 
 ## Delta contents
 

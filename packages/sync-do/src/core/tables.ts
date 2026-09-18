@@ -29,7 +29,6 @@ export const ENGINE_DDL: ReadonlyArray<string> = [
   // Covering index for "which subscriptions hold this row": the delta fan-out and the
   // any-path check. The old two-column index made the planner scan a whole subscription.
   `DROP INDEX IF EXISTS membership_row`,
-  `CREATE INDEX IF NOT EXISTS membership_by_row ON membership (tbl, key, subscription)`,
   `CREATE TABLE IF NOT EXISTS fills (fill_id TEXT PRIMARY KEY, tbl TEXT NOT NULL, requested_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 1)`,
 ]
 
@@ -54,7 +53,6 @@ export const ENGINE_UPGRADES: ReadonlyArray<{
     statements: [
       `DROP TABLE membership`,
       `CREATE TABLE membership (subscription TEXT NOT NULL, path TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, path, tbl, key))`,
-      `CREATE INDEX IF NOT EXISTS membership_by_row ON membership (tbl, key, subscription)`,
     ],
   },
 ]

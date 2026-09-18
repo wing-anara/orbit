@@ -117,6 +117,8 @@ export type EngineEvent =
   | { readonly type: "scopes_reset"; readonly reason: string }
 
 export interface SubscribeOutcome {
+  /** Internal work classification for bounded Worker telemetry, never sent to clients. */
+  readonly strategy: "pending" | "resume" | "growth" | "materialize" | "snapshot"
   readonly resumed?: { readonly version: string; readonly cursor: number }
   readonly subscription: string
   readonly status: "pending" | "live"
@@ -193,12 +195,16 @@ const reject = (reason: RejectReason): ApplyOutcome => ({
   events: [],
 })
 
+import { MembershipStore } from "./membership.ts"
+
 export class SyncEngine {
+  private readonly membership: MembershipStore
   readonly rt: SchemaRuntime
   private readonly plans = new Map<string, PlannedQuery>()
   private readonly codecs: ReadonlyMap<string, (input: unknown) => RowImage>
 
   constructor(private readonly deps: EngineDeps) {
+    this.membership = new MembershipStore(deps.driver, deps.newId)
     this.rt = new SchemaRuntime(deps.schema)
     const codecs = new Map<string, (input: unknown) => RowImage>()
     for (const [name, codec] of this.rt.codecs) codecs.set(name, decodeRowSync(codec))
@@ -226,6 +232,7 @@ export class SyncEngine {
         for (const stmt of upgrade.statements) this.db.run(stmt)
         if (upgrade.table === "membership") membershipRebuilt = true
       }
+      this.membership.init()
       // After upgrades: older caches did not have orphaned_at. Active-view scans must not
       // visit the retained history of abandoned windows.
       this.db.run(
@@ -351,7 +358,7 @@ export class SyncEngine {
     for (const t of this.deps.schema.tables) this.db.run(deleteAllSql(t))
     this.db.run(`DELETE FROM scopes`)
     this.db.run(`DELETE FROM held`)
-    this.db.run(`DELETE FROM membership`)
+    this.membership.clear()
     this.db.run(`DELETE FROM fills`)
     this.db.run(`UPDATE subscriptions SET live = 0`)
     this.setMeta("last_reset_reason", reason)
@@ -820,11 +827,7 @@ export class SyncEngine {
           )
           // The base's members are the new subscription's first guess: materialization then
           // writes only the members that differ instead of the whole window again.
-          if (seed)
-            this.db.run(
-              `INSERT OR IGNORE INTO membership (subscription, path, tbl, key) SELECT ?, path, tbl, key FROM membership WHERE subscription = ?`,
-              [p.key, base.id],
-            )
+          if (seed) this.membership.share(p.key, base.id)
         } else {
           this.db.run(`UPDATE subscriptions SET orphaned_at = NULL WHERE id = ?`, [p.key])
           this.db.run(`DELETE FROM meta WHERE key = ?`, [`orphan_version:${p.key}`])
@@ -832,7 +835,13 @@ export class SyncEngine {
         const { pending, requests } = this.ensureScopes(p.tables)
         for (const request of requests) events.push({ type: "fill_needed", request })
         if (pending.length > 0)
-          return { subscription: p.key, status: "pending", query: p.query, events }
+          return {
+            subscription: p.key,
+            status: "pending",
+            query: p.query,
+            events,
+            strategy: "pending",
+          }
         const resume = options.resume
         const unchanged =
           resume !== undefined &&
@@ -847,6 +856,7 @@ export class SyncEngine {
             query: p.query,
             events,
             resumed: { version: resume.version, cursor: this.appliedSeq },
+            strategy: "resume",
           }
         }
         // The base's members need no row images: the client has them.
@@ -867,6 +877,7 @@ export class SyncEngine {
           JSON.stringify({ ...base.planned.query, limit: undefined }) ===
             JSON.stringify({ ...p.query, limit: undefined })
         const held = !grows && seed && base !== null ? this.heldBy(base.id) : undefined
+        const strategy = grows ? "growth" : existing?.live !== true ? "materialize" : "snapshot"
         const snapshot = grows
           ? this.materializeGrowth({ id: p.key, planned: p, live: false }, base)
           : existing?.live !== true
@@ -881,11 +892,12 @@ export class SyncEngine {
             query: p.query,
             events,
             resumed: { version: resume.version, cursor: this.appliedSeq },
+            strategy,
           }
         events.push(
           held === undefined || base === null ? snapshot : this.extend(snapshot, base.id, held),
         )
-        return { subscription: p.key, status: "live", query: p.query, events }
+        return { subscription: p.key, status: "live", query: p.query, events, strategy }
       }),
     )
   }
@@ -925,7 +937,7 @@ export class SyncEngine {
 
   unsubscribe(id: string): void {
     this.db.transaction(() => {
-      this.db.run(`DELETE FROM membership WHERE subscription = ?`, [id])
+      this.membership.drop(id)
       this.db.run(`DELETE FROM subscriptions WHERE id = ?`, [id])
       this.db.run(`DELETE FROM meta WHERE key = ?`, [`orphan_version:${id}`])
       this.plans.delete(id)
@@ -970,17 +982,9 @@ export class SyncEngine {
         // Reopening between passes must rebuild this incomplete membership,
         // even when no source row changed since it was originally orphaned.
         this.db.run(`DELETE FROM meta WHERE key = ?`, [`orphan_version:${id}`])
-        this.db.run(
-          `DELETE FROM membership WHERE rowid IN (SELECT rowid FROM membership WHERE subscription = ? LIMIT ?)`,
-          [id, remaining],
-        )
-        const deleted = asNumber(this.db.query(`SELECT changes() AS n`)[0]?.["n"])
-        remaining -= deleted
-        if (
-          this.db.query(`SELECT 1 AS present FROM membership WHERE subscription = ? LIMIT 1`, [id])
-            .length > 0
-        )
-          continue
+        const collected = this.membership.collect(id, remaining)
+        remaining -= collected.spent
+        if (!collected.complete) continue
         this.unsubscribe(id)
         dropped.push(id)
       }
@@ -1082,16 +1086,12 @@ export class SyncEngine {
       for (const row of this.db.query(
         // Workerd otherwise chooses subscription-first and scans the candidate
         // JSON once per held member. Keep the bounded candidate list outermost.
-        `SELECT DISTINCT m.tbl, m.key FROM json_each(?) r CROSS JOIN membership m INDEXED BY membership_by_row ON m.tbl = json_extract(r.value, '$[0]') AND m.key = json_extract(r.value, '$[1]') WHERE m.subscription = ?`,
+        `SELECT DISTINCT m.tbl, m.key FROM json_each(?) r CROSS JOIN membership_rows m INDEXED BY membership_by_row ON m.tbl = json_extract(r.value, '$[0]') AND m.key = json_extract(r.value, '$[1]') JOIN membership_chunks c ON c.chunk = m.subscription WHERE c.subscription = ?`,
         [JSON.stringify(candidates), base.id],
       ))
         held.add(memberRef(asString(row["tbl"]), asString(row["key"])))
     }
-    for (const m of members)
-      this.db.run(
-        `INSERT OR IGNORE INTO membership (subscription, path, tbl, key) VALUES (?, ?, ?, ?)`,
-        [sub.id, m.path, m.table, m.key],
-      )
+    this.membership.add(sub.id, members)
     this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [sub.id])
     const snapshot = this.snapshotFrom(sub.id, members, held)
     return {
@@ -1124,18 +1124,12 @@ export class SyncEngine {
         present.add(id)
         continue
       }
-      this.db.run(
-        `DELETE FROM membership WHERE subscription = ? AND path = ? AND tbl = ? AND key = ?`,
-        [sub.id, path, tbl, key],
-      )
+      this.membership.remove(sub.id, { path, table: tbl, key })
     }
-    for (const m of members) {
-      if (present.has([m.path, m.table, m.key].join(" "))) continue
-      this.db.run(
-        `INSERT OR IGNORE INTO membership (subscription, path, tbl, key) VALUES (?, ?, ?, ?)`,
-        [sub.id, m.path, m.table, m.key],
-      )
-    }
+    this.membership.add(
+      sub.id,
+      members.filter((m) => !present.has([m.path, m.table, m.key].join(" "))),
+    )
     this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [sub.id])
     return this.snapshotFrom(sub.id, members, skip)
   }
@@ -1216,9 +1210,13 @@ export class SyncEngine {
       const sub = this.loadSubscription(row)
       if (sub === null) continue
       if (![...touched.keys()].some((table) => sub.planned.tables.has(table))) continue
-      const outcome = new SubscriptionMaintainer(this.db, this.rt, sub.id, sub.planned).apply(
-        touched,
-      )
+      const outcome = new SubscriptionMaintainer(
+        this.db,
+        this.rt,
+        sub.id,
+        sub.planned,
+        this.membership,
+      ).apply(touched)
       for (const m of outcome.added) {
         const table = this.rt.table(m.table)
         if (table === undefined) continue

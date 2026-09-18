@@ -786,7 +786,7 @@ describe("SyncEngine: subscriptions and incremental maintenance", () => {
     ])[0]!
     const legacy = canonicalJson(JSON.parse(String(stored["query"])))
     driver.run(`UPDATE subscriptions SET id = ? WHERE id = ?`, [legacy, small.success.subscription])
-    driver.run(`UPDATE membership SET subscription = ? WHERE subscription = ?`, [
+    driver.run(`UPDATE membership_chunks SET subscription = ? WHERE subscription = ?`, [
       legacy,
       small.success.subscription,
     ])

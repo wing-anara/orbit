@@ -613,6 +613,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       // the Workers clock does not advance during synchronous work.)
       log({
         event: "orbit.subscription.subscribed",
+        strategy: outcome.success.strategy,
         partition,
         status: outcome.success.status,
         rows: snapshot?.type === "snapshot" ? snapshot.rows.length : 0,

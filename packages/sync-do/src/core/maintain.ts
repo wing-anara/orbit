@@ -42,6 +42,7 @@ import {
 import { KEY_COLUMN, localTableName, quoteIdent, SchemaRuntime } from "@orbit/schema"
 
 import type { SqlDriver, SqlRecord } from "./driver.ts"
+import type { MembershipStore } from "./membership.ts"
 
 /** Bound parameters per statement the engine allows itself (Durable Objects permit 100). */
 export const MAX_BOUND_PARAMS = 90
@@ -129,6 +130,7 @@ export class SubscriptionMaintainer {
     private readonly rt: SchemaRuntime,
     private readonly id: string,
     private readonly planned: PlannedQuery,
+    private readonly membership: MembershipStore,
   ) {
     const levels = levelsOf(planned)
     this.root = levels.root
@@ -444,22 +446,14 @@ export class SubscriptionMaintainer {
   /** Adds the row to the level; callers check `hasPath` first so every insert is a real write. */
   private insert(level: Level, key: string): void {
     this.noteBefore(level.table.name, key)
-    this.db.run(`INSERT INTO membership (subscription, path, tbl, key) VALUES (?, ?, ?, ?)`, [
-      this.id,
-      level.path,
-      level.table.name,
-      key,
-    ])
+    this.membership.add(this.id, [{ path: level.path, table: level.table.name, key }])
     if (level === this.root && this.rootCount !== null) this.rootCount += 1
   }
 
   /** Removes the row from the level; callers check `hasPath` first so every delete is real. */
   private delete(level: Level, key: string): void {
     this.noteBefore(level.table.name, key)
-    this.db.run(
-      `DELETE FROM membership WHERE subscription = ? AND path = ? AND tbl = ? AND key = ?`,
-      [this.id, level.path, level.table.name, key],
-    )
+    this.membership.remove(this.id, { path: level.path, table: level.table.name, key })
     if (level === this.root && this.rootCount !== null) this.rootCount -= 1
   }
 

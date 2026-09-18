@@ -43,6 +43,40 @@ const seed = (engine: SyncEngine, count: number) => {
 }
 
 describe("orphan subscription maintenance", () => {
+  it("isolates a retained prefix from active descendants through CDC and reactivation", () => {
+    const { engine, deps } = makeEngine()
+    seed(engine, 200)()
+    const small = subscribe(engine, window(50)).subscription
+    const middleResult = engine.subscribe(window(100), { basedOn: small })
+    if (Result.isFailure(middleResult)) throw middleResult.failure
+    const middle = middleResult.success.subscription
+    const largeResult = engine.subscribe(window(150), { basedOn: middle })
+    if (Result.isFailure(largeResult)) throw largeResult.failure
+    const large = largeResult.success.subscription
+    const held = engine.membershipOf(small)
+    engine.markOrphaned(small, 10)
+    engine.applyBatch(
+      batch(schema, "org_1", [
+        txn(1, [
+          remove("Chatbot", chatbot("00000")),
+          remove("Chatbot", chatbot("00070")),
+          insert("Chatbot", chatbot("00000-new")),
+        ]),
+      ]),
+    )
+    expect(engine.membershipOf(small)).toEqual(held)
+    for (const id of [middle, large]) expect(engine.membershipOf(id)).toEqual(engine.recompute(id))
+    const reopened = new SyncEngine(deps)
+    reopened.init()
+    subscribe(reopened, window(50))
+    for (const id of [small, middle, large])
+      expect(reopened.membershipOf(id)).toEqual(reopened.recompute(id))
+    reopened.markOrphaned(middle, 20)
+    reopened.sweepOrphans(30)
+    for (const id of [small, large])
+      expect(reopened.membershipOf(id)).toEqual(reopened.recompute(id))
+  })
+
   it("bounds expired membership deletion and safely revives a partially swept view", () => {
     const { engine, driver, deps } = makeEngine()
     seed(engine, 3000)()
