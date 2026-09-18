@@ -52,7 +52,13 @@ import type { TableSchema } from "@orbit/protocol"
 import { KEY_COLUMN, quoteIdent, SchemaRuntime } from "@orbit/schema"
 
 import type { AsyncSqlDriver, Statement } from "./driver.ts"
-import { readNodes, readPendingMutations, overlayViewName, type LocalStore } from "./store.ts"
+import {
+  pruneUndoStatement,
+  readNodes,
+  readPendingMutations,
+  overlayViewName,
+  type LocalStore,
+} from "./store.ts"
 
 export type MutationEventStatus = "applied_locally" | "pushed" | "confirmed" | "failed"
 
@@ -188,6 +194,38 @@ export class LocalMutationTx {
     const record = rows[0]
     if (record === undefined) return null
     return rowFromRecord(table, record)
+  }
+
+  readonly localUndo = {
+    capture: async (name: string, group: string, rows: ReadonlyArray<unknown>): Promise<void> => {
+      const table = this.table(name)
+      const images = rows.map((row) => {
+        if (!isRecord(row)) throw new Error(`row of ${name} must be an object`)
+        return this.image(table, row)
+      })
+      // INSERT OR IGNORE is essential: replay after CDC removes the base rows must
+      // not replace the original before-images with an empty/incomplete selection.
+      this.statements.push({
+        sql: `INSERT OR IGNORE INTO local_undo (tbl, undo_group, mutation_id, images) VALUES (?, ?, ?, ?)`,
+        params: [name, group, this.mutationId, JSON.stringify(images)],
+      })
+    },
+    restore: async (name: string, group: string): Promise<void> => {
+      const table = this.table(name)
+      const records = await this.driver.query(
+        `SELECT images FROM local_undo WHERE tbl = ? AND undo_group = ? AND mutation_id < ? ORDER BY mutation_id DESC LIMIT 1`,
+        [name, group, this.mutationId],
+      )
+      const value = records[0]?.["images"]
+      if (typeof value !== "string") return
+      const images: unknown = JSON.parse(value)
+      if (!Array.isArray(images)) throw new Error("invalid local undo images")
+      for (const row of images) {
+        if (!isRecord(row)) throw new Error("invalid local undo row")
+        const image = this.image(table, row)
+        this.write(table, SchemaRuntime.keyString(this.store.rt.keyOf(table, image)), image)
+      }
+    },
   }
 
   async insert(name: string, row: unknown): Promise<void> {
@@ -477,6 +515,7 @@ export class MutationManager {
       this.emit({ id: m.id, name: m.name, status: "failed", error })
     }
     this.setPending(pending.length)
+    if (pending.length === 0) await this.driver.batch([pruneUndoStatement()])
   }
 
   /**

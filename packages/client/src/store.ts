@@ -72,11 +72,18 @@ export const MUTATION_COLUMN = "__mutation"
 /** Reads compile against the views, so pending mutations are visible. */
 export const VIEW_DIALECT: Dialect = sqliteDialect((table) => quoteIdent(overlayViewName(table)))
 
+/** Only evict completed undo history when no queued command could still need it. */
+export const pruneUndoStatement = (): Statement => ({
+  sql: `DELETE FROM local_undo WHERE NOT EXISTS (SELECT 1 FROM pending_mutations) AND mutation_id NOT IN (SELECT mutation_id FROM (SELECT mutation_id, SUM(bytes) OVER (ORDER BY mutation_id DESC) AS total FROM (SELECT mutation_id, SUM(length(images)) AS bytes FROM local_undo GROUP BY mutation_id)) WHERE total <= 33554432 ORDER BY mutation_id DESC LIMIT 100)`,
+  params: [],
+})
+
 const STORE_DDL: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS membership (subscription TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, tbl, key))`,
   `CREATE INDEX IF NOT EXISTS membership_row ON membership (tbl, key)`,
   `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, ref TEXT, cursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0, based_on TEXT, retired INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS local_undo (tbl TEXT NOT NULL, undo_group TEXT NOT NULL, mutation_id INTEGER NOT NULL, images TEXT NOT NULL, PRIMARY KEY (tbl, undo_group, mutation_id))`,
   `CREATE TABLE IF NOT EXISTS mutation_outcomes (id INTEGER PRIMARY KEY, outcome TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS pending_mutations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, args TEXT NOT NULL, created_at INTEGER NOT NULL, pushed INTEGER NOT NULL DEFAULT 0)`,
 ]
@@ -273,6 +280,7 @@ export class LocalStore {
           { sql: `DELETE FROM subscriptions`, params: [] },
           { sql: `DELETE FROM pending_mutations`, params: [] },
           { sql: `DELETE FROM mutation_outcomes`, params: [] },
+          { sql: `DELETE FROM local_undo`, params: [] },
           { sql: `DELETE FROM meta`, params: [] },
         )
       }

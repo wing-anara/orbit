@@ -168,3 +168,20 @@ Values are converted per column kind. On the way in: `bool` becomes 0 or 1, `jso
 ### Tests
 
 `pnpm --filter @orbit/mutators test` runs the unit tests against an in-memory fake `SqlTx` that records every statement. `ORBIT_TEST_VITESS=1 pnpm --filter @orbit/mutators test` also runs the handler end to end against the local docker Vitess with `mysql2`.
+
+### Optimistic Undo of authoritative deletes
+
+A client mutator can retain already-cached row images with
+`await tx.localUndo?.capture("Document", undoKey, rows)` before deleting them.
+The matching restore mutator calls `await tx.localUndo?.restore("Document", undoKey)`.
+The server must still implement and authorize the real restore; `localUndo` is absent
+on server transactions and captured images never enter the push payload.
+
+Captures commit atomically with the pending mutation and are immutable on replay.
+Restore uses the latest capture preceding its own mutation ID, so delete/restore
+cycles remain ordered across rebases and offline reloads. Missing history is a
+local no-op, allowing a cold restore to wait for authoritative sync. Failed restores
+roll back through the ordinary mutation overlay. Completed history is limited to
+100 mutation generations and 32 MiB; queued commands prevent history eviction.
+Cache resets clear the history. Applications should capture each independently
+restorable root, including its cached descendants, under a separate undo key.

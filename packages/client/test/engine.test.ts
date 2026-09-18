@@ -1511,7 +1511,15 @@ const mutators = defineMutators(sync, {
       await tx.update("Chatbot", { id }, { displayOrder })
     },
   ),
+  restoreDocument: define(
+    Schema.Struct({ id: Schema.String, refuse: Schema.optional(Schema.Boolean) }),
+    async (tx, { id }) => {
+      await tx.localUndo?.restore("Chatbot", id)
+    },
+  ),
   removeDocument: define(Schema.Struct({ id: Schema.String }), async (tx, { id }) => {
+    const row = await tx.get("Chatbot", { id })
+    await tx.localUndo?.capture("Chatbot", id, row ? [row] : [])
     await tx.delete("Chatbot", { id })
   }),
 })
@@ -1534,6 +1542,9 @@ const serverApply = (m: {
           }),
         ),
       ]
+    case "restoreDocument":
+      if (m.args["refuse"]) throw new Error("restore refused")
+      return [insert("Chatbot", chatbot(id))]
     case "setOrder":
       return [
         update(
@@ -1587,6 +1598,62 @@ describe("client-side mutations", () => {
   }
 
   const ids = (rows: ReadonlyArray<{ readonly id: string }>) => rows.map((r) => r.id)
+
+  it("restores confirmed deletes offline after CDC and reload; rolls back a refused restore", async () => {
+    const { server, push, driver, open } = await setup()
+    let client = await open()
+    let live = client.liveQuery(documents)
+    await waitFor(() => server.pendingFills.length === 2)
+    server.completeFill("Chatbot", [chatbot("a")])
+    server.completeFill("orbit_clients", [])
+    await waitFor(() => live.getSnapshot().status === "live")
+    await client.mutate.removeDocument({ id: "a" }).server
+    await waitFor(() => client.getStatus().pendingMutations === 0)
+    expect(ids(live.getSnapshot().rows)).toEqual([])
+    expect(await driver.query(`SELECT id FROM t_Chatbot`)).toEqual([])
+    push.reachable = false
+    server.reachable = false
+    await client.close()
+    client = await open()
+    live = client.liveQuery(documents)
+    await client.mutate.restoreDocument({ id: "a", refuse: true }).local
+    expect(ids(live.getSnapshot().rows)).toEqual(["a"])
+    await client.close()
+    client = await open()
+    live = client.liveQuery(documents)
+    await waitFor(() => live.getSnapshot().rows.length === 1)
+    expect(ids(live.getSnapshot().rows)).toEqual(["a"])
+    push.reachable = true
+    await waitFor(() => client.getStatus().pendingMutations === 0, 5000)
+    expect(ids(live.getSnapshot().rows)).toEqual([])
+    await client.close()
+  })
+
+  it("preserves before-images when a pending delete and Undo rebase after base removal", async () => {
+    const { server, driver, open } = await setup({ pushReachable: false })
+    const client = await open()
+    const live = client.liveQuery(documents)
+    await waitFor(() => server.pendingFills.length === 2)
+    server.completeFill("Chatbot", [chatbot("a", { displayOrder: 12 })])
+    server.completeFill("orbit_clients", [])
+    await waitFor(() => live.getSnapshot().status === "live")
+    await client.mutate.removeDocument({ id: "a" }).local
+    await client.mutate.restoreDocument({ id: "a" }).local
+    expect(live.getSnapshot().rows[0]?.displayOrder).toBe(12)
+    server.commit([remove("Chatbot", chatbot("a"))])
+    await waitFor(() => client.getStatus().cursor === 1)
+    expect(live.getSnapshot().rows[0]?.displayOrder).toBe(12)
+    expect(
+      JSON.parse(String((await driver.query(`SELECT images FROM local_undo`))[0]?.["images"]))[0]
+        .displayOrder,
+    ).toBe(12)
+    // A subsequent delete captures the latest optimistic image, not the first generation.
+    await client.mutate.setOrder({ id: "a", displayOrder: 21 }).local
+    await client.mutate.removeDocument({ id: "a" }).local
+    await client.mutate.restoreDocument({ id: "a" }).local
+    expect(live.getSnapshot().rows[0]?.displayOrder).toBe(21)
+    await client.close()
+  })
 
   it("applies an insert optimistically while offline and keeps it across a reload", async () => {
     const { driver, events, open } = await setup({ reachable: false, pushReachable: false })

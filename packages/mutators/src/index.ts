@@ -48,6 +48,18 @@ export interface MutationContext {
 
 /** Writes and reads a mutator may do. Every call is scoped to the mutation's partition. */
 export interface MutationTx<D> {
+  /** Client-only before-images for optimistic Undo. Never sent to or trusted by the server.
+   * Captures are durable with the mutation and immutable across replay. Missing captures
+   * restore nothing; the application's authoritative restore must still run on the server.
+   */
+  readonly localUndo?: {
+    readonly capture: <N extends SyncedTables<D>>(
+      table: N,
+      group: string,
+      rows: ReadonlyArray<RowOf<D, N>>,
+    ) => Promise<void>
+    readonly restore: <N extends SyncedTables<D>>(table: N, group: string) => Promise<void>
+  }
   /** Inserts a full row (every synced column; columns the server defaults may be omitted). */
   readonly insert: <N extends SyncedTables<D>>(
     table: N,
