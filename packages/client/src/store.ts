@@ -552,6 +552,41 @@ export class LocalStore {
     })
   }
 
+  /** Reuse a current base window's result nodes; read full rows/includes only for new roots. */
+  readGrowingSubscription(
+    planned: PlannedQuery,
+    subscription: string,
+    base: ReadonlyArray<ResultNode>,
+  ): Effect.Effect<ReadonlyArray<ResultNode>, StoreError> {
+    return Effect.tryPromise({
+      try: async () => {
+        const options: SelectOptions = {
+          membershipOf: subscription,
+          alsoAdmit: `t.${quoteIdent(KEY_COLUMN)} IN (SELECT ${quoteIdent(KEY_COLUMN)} FROM ${quoteIdent(overlayTableName(planned.table.name))})`,
+          dialect: VIEW_DIALECT,
+        }
+        const primary = compileSelect(planned, { ...options, keysOnly: true })
+        const keys = (await this.driver.query(primary.sql, primary.params)).map(keyOfRecord)
+        const nodes = new Map(base.map((node) => [node.key, node]))
+        const added = keys.filter((key) => !nodes.has(key))
+        if (added.length > 0) {
+          const records = await this.driver.query(
+            `SELECT * FROM ${quoteIdent(overlayViewName(planned.table.name))} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT value FROM json_each(?))`,
+            [JSON.stringify(added)],
+          )
+          for (const node of await readNodes(this.driver, planned, options, records))
+            nodes.set(node.key, node)
+        }
+        return keys.map((key) => {
+          const node = nodes.get(key)
+          if (node === undefined) throw new Error("growing window lost a selected row")
+          return node
+        })
+      },
+      catch: (e) => this.fail(e),
+    })
+  }
+
   /**
    * The subscriptions whose membership references any of `refs`: the ones a delta over those
    * rows can change. A subscription that references none of them keeps its result as it is.
@@ -674,10 +709,11 @@ export const readNodes = async (
   driver: AsyncSqlDriver,
   planned: PlannedQuery,
   options: SelectOptions,
+  selected?: ReadonlyArray<SqlRecord>,
 ): Promise<ReadonlyArray<ResultNode>> => {
   const opts: SelectOptions = { ...options, dialect: VIEW_DIALECT }
   const primary = compileSelect(planned, opts)
-  const records = await driver.query(primary.sql, primary.params)
+  const records = selected ?? (await driver.query(primary.sql, primary.params))
   const rows = records.map((r) => ({ key: keyOfRecord(r), row: rowFromRecord(planned.table, r) }))
   const byPath = new Map<
     string,

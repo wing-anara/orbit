@@ -553,19 +553,28 @@ export class ClientEngine {
       const id = subscriptionIdOf(wire, planned.success)
       const fresh = !this.subscriptions.has(id)
       const sub = this.register(id, wire, planned.success, 1)
+      const base = sub.onWire ? null : this.growthBase(sub)
+      if (base !== null) {
+        // Pin before the asynchronous local read so a released base cannot disappear meanwhile.
+        this.register(base.id, base.ref, base.planned, 1)
+        sub.basedOn = base.id
+      }
       if (!fresh && sub.dirty) yield* this.refresh(sub)
       if (fresh) {
         yield* this.store.registerSubscription(id, wire, planned.success.query)
-        yield* this.refresh(sub)
+        if (
+          base !== null &&
+          !base.dirty &&
+          JSON.stringify({ ...base.planned.query, limit: undefined }) ===
+            JSON.stringify({ ...sub.planned.query, limit: undefined })
+        ) {
+          // The old window is the initial pending result. Re-reading all of its includes would
+          // discard the benefit of receiving only the new rows in the extending snapshot.
+          sub.snapshot = { ...base.snapshot, status: sub.status }
+        } else yield* this.refresh(sub)
       }
       if (!sub.onWire) {
         sub.onWire = true
-        const base = this.growthBase(sub)
-        if (base !== null) {
-          // A reference of its own keeps the base (and its rows) until the snapshot arrives.
-          this.register(base.id, base.ref, base.planned, 1)
-          sub.basedOn = base.id
-        }
         if (this.send !== null)
           yield* this.send({
             type: "subscribe",
@@ -641,7 +650,7 @@ export class ClientEngine {
     return n
   }
 
-  private refresh(sub: Subscription): Effect.Effect<void, StoreError> {
+  private refresh(sub: Subscription, base?: Subscription): Effect.Effect<void, StoreError> {
     return Effect.gen({ self: this }, function* () {
       // A retained query nobody references (a window the user scrolled past, a query the
       // application left) is not re-read on every change: it reads once when referenced again.
@@ -654,10 +663,18 @@ export class ClientEngine {
       // A subscription that has no snapshot yet has no membership to read through. Answer it
       // from the local cache at once (rows other subscriptions and pending mutations already
       // hold); the server's snapshot replaces the set when it arrives and the status turns live.
+      const reusable =
+        base !== undefined &&
+        base.status === "live" &&
+        !base.dirty &&
+        JSON.stringify({ ...base.planned.query, limit: undefined }) ===
+          JSON.stringify({ ...sub.planned.query, limit: undefined })
       const rows =
         sub.status === "pending"
           ? yield* this.store.readLocal(sub.planned)
-          : yield* this.store.readSubscription(sub.planned, sub.id)
+          : reusable
+            ? yield* this.store.readGrowingSubscription(sub.planned, sub.id, base.snapshot.rows)
+            : yield* this.store.readSubscription(sub.planned, sub.id)
       sub.snapshot = { status: sub.status, rows, error: sub.error, cursor: this.cursor }
       for (const l of sub.listeners) l()
     })
@@ -759,7 +776,11 @@ export class ClientEngine {
               sub.error = null
               const rebased = yield* this.confirmMutations()
               if (rebased) yield* this.refreshTables(null, true)
-              else yield* this.refresh(sub)
+              else
+                yield* this.refresh(
+                  sub,
+                  basedOn === null ? undefined : this.subscriptions.get(basedOn),
+                )
             }),
           )
           yield* this.unpin(sub)

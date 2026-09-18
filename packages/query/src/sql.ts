@@ -261,6 +261,8 @@ const keyOrder = (dialect: Dialect, table: TableSchema, alias: string): string =
     : table.primary_key.map((c) => `${alias}.${dialect.ident(c)}`).join(", ")
 
 export interface SelectOptions {
+  /** Return only local primary keys, preserving the exact predicate, ordering and limit. */
+  readonly keysOnly?: boolean
   /** Restrict to rows that are members of the given subscription in the local `membership` table. */
   readonly membershipOf?: string
   /**
@@ -295,7 +297,12 @@ export const compileSelect = (planned: PlannedQuery, options: SelectOptions = {}
     const member = `${t}."__key" IN (SELECT m."key" FROM "membership" m WHERE m."tbl" = ? AND m."subscription" IN (WITH RECURSIVE chain(id) AS (SELECT ? UNION SELECT s."based_on" FROM "subscriptions" s JOIN chain ON s."id" = chain.id WHERE s."based_on" IS NOT NULL) SELECT id FROM chain))`
     where.push(options.alsoAdmit === undefined ? member : `(${member} OR ${options.alsoAdmit})`)
   }
-  let sql = `SELECT ${selectList(dialect, planned.table, t)} FROM ${dialect.table(planned.table.name)} ${t}`
+  if (options.keysOnly && !dialect.hasKeyColumn)
+    throw new Error("key projection requires the local cache dialect")
+  const projection = options.keysOnly
+    ? `${t}.${dialect.ident(KEY_COLUMN)}`
+    : selectList(dialect, planned.table, t)
+  let sql = `SELECT ${projection} FROM ${dialect.table(planned.table.name)} ${t}`
   if (where.length > 0) sql += ` WHERE ${where.join(" AND ")}`
   sql += ` ORDER BY ${orderClause(dialect, planned, t)}`
   if (planned.limit !== undefined) sql += ` LIMIT ${Math.trunc(planned.limit)}`

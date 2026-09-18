@@ -216,6 +216,92 @@ const reloadable = (driver: AsyncSqlDriver): AsyncSqlDriver => ({
 })
 
 describe("client engine end to end with the Durable Object core", () => {
+  it("does not reuse a retained window whose included rows changed while unobserved", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine } = makeClient(server, nodeAsyncDriver(), 30000)
+    await Effect.runPromise(engine.open())
+    const query = (limit: number) => ({
+      table: "Chatbot",
+      where: { op: "eq" as const, column: "type", value: "DOCUMENT" },
+      orderBy: [{ column: "id", direction: "asc" as const }],
+      include: ["folder"],
+      limit,
+    })
+    const small = await Effect.runPromise(engine.subscribe(query(1)))
+    await waitFor(() => server.pendingFills.length === 1)
+    const folder = chatbot("folder", { type: "GROUP", contents: "before" })
+    server.completeFill("Chatbot", [
+      folder,
+      chatbot("a", { groupId: "folder" }),
+      chatbot("b", { groupId: "folder" }),
+    ])
+    await Effect.runPromise(engine.awaitLive(small.id))
+    const old = small.getSnapshot().rows[0]
+    await Effect.runPromise(small.release())
+    server.commit([update("Chatbot", folder, { ...folder, contents: "after" })])
+    await waitFor(() => engine.getStatus().cursor === 1)
+    const grown = await Effect.runPromise(engine.subscribe(query(2)))
+    await Effect.runPromise(engine.awaitLive(grown.id))
+    expect(grown.getSnapshot().rows[0]).not.toBe(old)
+    expect(grown.getSnapshot().rows[0]?.related["folder"]).toMatchObject({
+      row: { contents: "after" },
+    })
+    await Effect.runPromise(engine.close())
+  })
+
+  it("grows a window by reading only new roots and their includes, preserving SQLite order", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const driver = nodeAsyncDriver()
+    const reads: Array<{ sql: string; rows: number }> = []
+    const { engine } = makeClient(server, {
+      ...driver,
+      query: async (sql, params) => {
+        const result = await driver.query(sql, params)
+        reads.push({ sql, rows: result.length })
+        return result
+      },
+    })
+    await Effect.runPromise(engine.open())
+    const query = (limit: number) => ({
+      table: "Chatbot",
+      where: { op: "eq" as const, column: "type", value: "DOCUMENT" },
+      orderBy: [{ column: "id", direction: "desc" as const }],
+      include: ["folder"],
+      limit,
+    })
+    const small = await Effect.runPromise(engine.subscribe(query(100)))
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill("Chatbot", [
+      chatbot("folder", { type: "GROUP", contents: "x".repeat(10000) }),
+      ...Array.from({ length: 125 }, (_, i) =>
+        chatbot(String(i).padStart(3, "0"), { groupId: "folder" }),
+      ),
+    ])
+    await Effect.runPromise(engine.awaitLive(small.id))
+    const original = small.getSnapshot().rows
+    reads.length = 0
+    const grown = await Effect.runPromise(engine.subscribe(query(125)))
+    await Effect.runPromise(engine.awaitLive(grown.id))
+    const rows = grown.getSnapshot().rows
+    expect(rows.map((row) => row.row["id"])).toEqual(
+      Array.from({ length: 125 }, (_, i) => String(124 - i).padStart(3, "0")),
+    )
+    for (let i = 0; i < 100; i++) expect(rows[i]).toBe(original[i])
+    expect(rows[124]?.related["folder"]).toMatchObject({
+      row: { id: "folder", contents: "x".repeat(10000) },
+    })
+    // Key projection may read the entire order; full row images must be limited to new roots.
+    expect(
+      reads
+        .filter(
+          (read) =>
+            read.sql.includes('"v_Chatbot"') && !read.sql.startsWith('SELECT t."__key" FROM'),
+        )
+        .every((read) => read.rows <= 25),
+    ).toBe(true)
+    await Effect.runPromise(engine.close())
+  })
+
   it("does not resume a named query when its authorized resolution changes", async () => {
     let allowed = "a"
     const server = new FakeSyncServer(schema, "org_1", {
