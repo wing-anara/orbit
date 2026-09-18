@@ -74,7 +74,7 @@ export const VIEW_DIALECT: Dialect = sqliteDialect((table) => quoteIdent(overlay
 
 /** Only evict completed undo history when no queued command could still need it. */
 export const pruneUndoStatement = (): Statement => ({
-  sql: `DELETE FROM local_undo WHERE NOT EXISTS (SELECT 1 FROM pending_mutations) AND mutation_id NOT IN (SELECT mutation_id FROM (SELECT mutation_id, SUM(bytes) OVER (ORDER BY mutation_id DESC) AS total FROM (SELECT mutation_id, SUM(length(images)) AS bytes FROM local_undo GROUP BY mutation_id)) WHERE total <= 33554432 ORDER BY mutation_id DESC LIMIT 100)`,
+  sql: `DELETE FROM local_undo WHERE NOT EXISTS (SELECT 1 FROM pending_mutations) AND mutation_id NOT IN (SELECT mutation_id FROM (SELECT mutation_id, SUM(bytes) OVER (ORDER BY mutation_id DESC) AS total FROM (SELECT mutation_id, SUM(length(CAST(images AS BLOB))) AS bytes FROM local_undo GROUP BY mutation_id)) WHERE total <= 33554432 ORDER BY mutation_id DESC LIMIT 100)`,
   params: [],
 })
 
