@@ -3,7 +3,7 @@ import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { Effect, Schema } from "effect"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import { SyncSchema, type RowChange, type TableSchema } from "@orbit/protocol"
 import type { RowImage } from "@orbit/protocol/client"
@@ -1153,6 +1153,35 @@ describe("local-first reads and query retention", () => {
     await Effect.runPromise(engine.awaitLive(narrow.id))
     expect(narrow.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["b"])
     await Effect.runPromise(engine.close())
+  })
+
+  it("keeps one cleanup pass queued while foreground work holds the store lock", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine } = makeClient(server)
+    let unblock!: () => void
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve
+    })
+    const collect = vi.spyOn(engine.store, "collectRetired").mockReturnValue(Effect.succeed(false))
+    try {
+      await Effect.runPromise(engine.open())
+      const foreground = engine.lock.run(() => gate)
+      // Snapshots can request collection while the first pass waits for this lock.
+      // A scheduled timer must remain outstanding until its queued work finishes.
+      for (let n = 0; n < 4; n++) {
+        await settle(125)
+        engine["scheduleCollection"]()
+      }
+      unblock()
+      await foreground
+      await settle(250)
+      // Requests during the queued pass coalesce into one follow-up, never get lost.
+      expect(collect).toHaveBeenCalledTimes(2)
+    } finally {
+      unblock()
+      collect.mockRestore()
+      await Effect.runPromise(engine.close())
+    }
   })
 
   it("continues bounded retirement after reopening and cancels cleanup on close", async () => {

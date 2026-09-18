@@ -173,6 +173,8 @@ export class ClientEngine {
   private mutations: MutationManager | null = null
   private onlineHandler: (() => void) | null = null
   private collectionTimer: ReturnType<typeof setTimeout> | null = null
+  private collectionRequested = false
+  private collectionRunning = false
   private closing = false
 
   constructor(private readonly config: EngineConfig) {
@@ -680,15 +682,28 @@ export class ClientEngine {
 
   /** Yield between bounded cache cleanup passes so sync and edits get the lock. */
   private scheduleCollection(delay = 100): void {
-    if (this.collectionTimer !== null || this.closing || !this.opened) return
+    if (this.closing || !this.opened) return
+    if (this.collectionRunning) {
+      this.collectionRequested = true
+      return
+    }
+    if (this.collectionTimer !== null) return
     this.collectionTimer = setTimeout(() => {
       this.collectionTimer = null
       if (this.closing) return
+      this.collectionRunning = true
       void Effect.runPromise(this.lock.runEffect(this.store.collectRetired())).then(
         (pending) => {
-          if (pending) this.scheduleCollection()
+          this.collectionRunning = false
+          const again = pending || this.collectionRequested
+          this.collectionRequested = false
+          if (again) this.scheduleCollection()
         },
-        () => this.scheduleCollection(1000),
+        () => {
+          this.collectionRunning = false
+          this.collectionRequested = false
+          this.scheduleCollection(1000)
+        },
       )
     }, delay)
     if (typeof this.collectionTimer === "object" && "unref" in this.collectionTimer)
