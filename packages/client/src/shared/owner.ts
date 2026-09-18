@@ -111,7 +111,11 @@ export const openSharedOwner = async <D extends Definition, M extends MutatorDef
               const members = new Map<string, Set<string>>()
               const publish = (): void => {
                 const snapshot = query.getSnapshot()
-                send(null, { type: "snapshot", id: key, snapshot })
+                // A view used by one tab is addressed to that tab. Multiple consumers
+                // still share one broadcast instead of cloning the same rows per peer.
+                if (members.size === 0) return
+                const recipient = members.size === 1 ? (members.keys().next().value ?? null) : null
+                send(recipient, { type: "snapshot", id: key, snapshot })
               }
               entry = { query, off: query.subscribe(publish), peers: members }
               queries.set(key, entry)

@@ -39,11 +39,25 @@ export class SharedCoordinator {
 
   private send(message: Message): void {
     if (this.closed) return
-    this.channel.postMessage(message)
+    // An owner-tab-only result never needs serialization or delivery to other tabs.
+    if (message.type !== "event" || message.to !== this.peer) this.channel.postMessage(message)
     queueMicrotask(() => this.receive(message))
   }
 
   private readonly onMessage = (event: MessageEvent<unknown>): void => {
+    // Routing is checked again after validation. Skip decoding a potentially large
+    // snapshot explicitly addressed to another tab; no unvalidated event is consumed.
+    const data = event.data
+    if (
+      typeof data === "object" &&
+      data !== null &&
+      "type" in data &&
+      data.type === "event" &&
+      "to" in data &&
+      typeof data.to === "string" &&
+      data.to !== this.peer
+    )
+      return
     let message: Message
     try {
       message = decodeMessage(event.data)

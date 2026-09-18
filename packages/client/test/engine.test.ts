@@ -1734,7 +1734,8 @@ describe("shared browser clients", () => {
   const setup = async (pushReachable = true) => {
     const { createSharedOrbitClient } = await import("../src/shared/client.ts")
     const { sharedPlatform } = await import("./support/shared-platform.ts")
-    const platform = sharedPlatform()
+    const messages: Array<unknown> = []
+    const platform = sharedPlatform((message) => messages.push(message))
     const server = new FakeSyncServer(schema, "org_1", { queries: serverQueries })
     const push = new FakePushServer(server, serverApply, { reachable: pushReachable })
     const driver = reloadable(nodeAsyncDriver())
@@ -1760,8 +1761,42 @@ describe("shared browser clients", () => {
         platform,
         queryTtlMs: 0,
       })
-    return { open, server, push, driver, sockets: () => sockets }
+    return { open, server, push, driver, messages, sockets: () => sockets }
   }
+
+  it("keeps an owner-only large view off the tab broadcast channel", async () => {
+    const env = await setup()
+    const owner = await env.open()
+    const other = await env.open()
+    try {
+      const view = owner.liveQuery(documents)
+      await waitFor(() => env.server.pendingFills.length === 2)
+      env.server.completeFill("Chatbot", [chatbot("a")])
+      env.server.completeFill("orbit_clients", [])
+      await waitFor(() => view.getSnapshot().status === "live")
+      const snapshots = () =>
+        env.messages.filter((message) => {
+          const m = message as { type: string; event?: { type: string } }
+          return m.type === "event" && m.event?.type === "snapshot"
+        })
+      expect(snapshots()).toHaveLength(0)
+      env.server.commit([insert("Chatbot", chatbot("b"))])
+      await waitFor(() => view.getSnapshot().rows.length === 2)
+      expect(snapshots()).toHaveLength(0)
+      // Joining consumers receive current data, then continue sharing live changes.
+      const peer = other.liveQuery(documents)
+      await waitFor(() => peer.getSnapshot().rows.length === 2)
+      expect(snapshots().length).toBeGreaterThan(0)
+      env.server.commit([remove("Chatbot", chatbot("a"))])
+      await waitFor(
+        () => view.getSnapshot().rows.length === 1 && peer.getSnapshot().rows.length === 1,
+      )
+      expect(peer.getSnapshot().rows[0]?.id).toBe("b")
+    } finally {
+      await other.close()
+      await owner.close()
+    }
+  })
 
   it("shares named query snapshots with a later joining follower", async () => {
     const env = await setup()

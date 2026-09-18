@@ -1,6 +1,6 @@
 import type { SharedChannel, SharedPlatform } from "../../src/shared/platform.ts"
 
-export const sharedPlatform = (): SharedPlatform => {
+export const sharedPlatform = (onPost?: (data: unknown) => void): SharedPlatform => {
   const channels = new Map<string, Set<SharedChannel & { deliver(data: unknown): void }>>()
   const tails = new Map<string, Promise<void>>()
   let id = 0
@@ -14,6 +14,7 @@ export const sharedPlatform = (): SharedPlatform => {
       const channel = {
         postMessage: (data: unknown) => {
           if (closed) throw new Error("Channel closed")
+          onPost?.(data)
           for (const other of group)
             if (other !== channel) {
               const clone = structuredClone(data)
