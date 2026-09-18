@@ -1052,7 +1052,9 @@ export class SyncEngine {
     const held = new Set<string>()
     if (candidates.length > 0) {
       for (const row of this.db.query(
-        `SELECT DISTINCT m.tbl, m.key FROM json_each(?) r JOIN membership m ON m.tbl = json_extract(r.value, '$[0]') AND m.key = json_extract(r.value, '$[1]') WHERE m.subscription = ?`,
+        // Workerd otherwise chooses subscription-first and scans the candidate
+        // JSON once per held member. Keep the bounded candidate list outermost.
+        `SELECT DISTINCT m.tbl, m.key FROM json_each(?) r CROSS JOIN membership m INDEXED BY membership_by_row ON m.tbl = json_extract(r.value, '$[0]') AND m.key = json_extract(r.value, '$[1]') WHERE m.subscription = ?`,
         [JSON.stringify(candidates), base.id],
       ))
         held.add(memberRef(asString(row["tbl"]), asString(row["key"])))
