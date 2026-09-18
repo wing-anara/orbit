@@ -387,6 +387,28 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it("bounds queued batches by membership work as well as row images", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine, log } = makeClient(server)
+    await Effect.runPromise(engine.open())
+    const docs = await Effect.runPromise(engine.subscribe({ table: "Chatbot" }))
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill("Chatbot", [])
+    await Effect.runPromise(engine.awaitLive(docs.id))
+    // Each transaction is 600 rows + 600 membership additions. Combining two
+    // would exceed the work bound even though their row count alone fits.
+    for (let batch = 0; batch < 3; batch++)
+      server.commit(
+        Array.from({ length: 600 }, (_, i) => insert("Chatbot", chatbot(`bounded-${batch}-${i}`))),
+      )
+    await waitFor(() => engine.getStatus().cursor === 3)
+    expect(docs.getSnapshot().rows).toHaveLength(1800)
+    expect(
+      log.filter(([event]) => event === "delta.applied").map(([, data]) => data["transactions"]),
+    ).toEqual([1, 1, 1])
+    await Effect.runPromise(engine.close())
+  }, 20_000)
+
   it("drains queued import deltas without refreshing a view for every transaction", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const { engine, driver, log } = makeClient(server)
@@ -399,10 +421,10 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.awaitLive(docs.id))
     let refreshes = 0
     docs.subscribe(() => refreshes++)
-    for (let i = 0; i < 32; i++) server.commit([insert("Chatbot", chatbot(`import-${i}`))])
-    for (let i = 0; i < 32; i++) server.commit([remove("Chatbot", chatbot(`import-${i}`))])
+    for (let i = 0; i < 256; i++) server.commit([insert("Chatbot", chatbot(`import-${i}`))])
+    for (let i = 0; i < 256; i++) server.commit([remove("Chatbot", chatbot(`import-${i}`))])
     server.commit([insert("Chatbot", chatbot("healthy"))])
-    await waitFor(() => engine.getStatus().cursor === 65)
+    await waitFor(() => engine.getStatus().cursor === 513)
     expect(docs.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["healthy"])
     expect((await driver.query("SELECT id FROM t_Chatbot")).map((r) => r["id"])).toEqual([
       "healthy",
@@ -411,8 +433,8 @@ describe("client engine end to end with the Durable Object core", () => {
     const applied = log
       .filter(([event]) => event === "delta.applied")
       .map(([, data]) => Number(data["transactions"]))
-    expect(applied.reduce((sum, n) => sum + n, 0)).toBe(65)
-    expect(Math.max(...applied)).toBeLessThanOrEqual(32)
+    expect(applied.reduce((sum, n) => sum + n, 0)).toBe(513)
+    expect(Math.max(...applied)).toBeLessThanOrEqual(256)
     await Effect.runPromise(engine.close())
   })
 

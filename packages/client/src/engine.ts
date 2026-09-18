@@ -357,8 +357,17 @@ export class ClientEngine {
               let work: Effect.Effect<void, StoreError>
               if (event.message.type === "delta") {
                 const deltas = [event.message]
-                let rows = event.message.rows.length
-                while (i < events.length && deltas.length < 32 && rows < 2000) {
+                // Ingestion emits hundreds of tiny status transactions. Bound accumulated
+                // work, not just their count, so draining them does not repeatedly read
+                // and render the same large query. One source transaction is indivisible.
+                const weight = (delta: typeof event.message) =>
+                  delta.rows.length +
+                  delta.memberships.reduce(
+                    (n, change) => n + change.added.length + change.removed.length,
+                    0,
+                  )
+                let changes = weight(event.message)
+                while (i < events.length && deltas.length < 256) {
                   const next = events[i]
                   if (next === undefined) break
                   if (
@@ -367,8 +376,10 @@ export class ClientEngine {
                     next.message.type !== "delta"
                   )
                     break
+                  const nextWeight = weight(next.message)
+                  if (changes + nextWeight > 2000) break
                   deltas.push(next.message)
-                  rows += next.message.rows.length
+                  changes += nextWeight
                   i++
                 }
                 work = this.onDeltas(deltas)
