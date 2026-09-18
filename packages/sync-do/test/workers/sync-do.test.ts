@@ -554,6 +554,38 @@ describe("client sessions", () => {
     b.ws.close(1000)
   })
 
+  it("reopens an orphaned view with current membership and resumes deltas", async () => {
+    const p = freshPartition()
+    const client = await connect(p, await token([p]))
+    const query = { table: "Chatbot" }
+    client.send(hello(p, [{ id: "old", query }]))
+    await client.next("welcome")
+    expect((await client.next("subscribed")).status).toBe("pending")
+    const req = (await pollFills()).requests.find((r) => r.partition === p)!
+    await uploadFill(req.fill_id, [chatbot("before")], 0)
+    expect((await client.next("subscribed")).status).toBe("live")
+    await client.next("snapshot")
+    client.send({ type: "unsubscribe", id: "old" })
+    await client.next("unsubscribed")
+    await deliver(p, [
+      txn(1, [
+        { table: "Chatbot", op: "delete", key: ["before"], before: chatbot("before") as never },
+        insert("Chatbot", chatbot("after")),
+      ]),
+    ])
+    client.send({ type: "subscribe", id: "new", query })
+    expect((await client.next("subscribed")).status).toBe("live")
+    const snapshot = await client.next("snapshot")
+    expect(snapshot.subscriptionId).toBe("new")
+    expect(snapshot.members.map((m) => m.key)).toEqual([["after"]])
+    await deliver(p, [txn(2, [insert("Chatbot", chatbot("later"))])])
+    const delta = await client.next("delta")
+    expect(delta.memberships).toEqual([
+      { subscriptionId: "new", added: [{ table: "Chatbot", key: ["later"] }], removed: [] },
+    ])
+    client.ws.close(1000)
+  })
+
   it("large snapshots are chunked and applied as one unit", async () => {
     const p = freshPartition()
     const client = await connect(p, await token([p]))

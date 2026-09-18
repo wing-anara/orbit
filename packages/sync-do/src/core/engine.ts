@@ -215,6 +215,11 @@ export class SyncEngine {
         for (const stmt of upgrade.statements) this.db.run(stmt)
         if (upgrade.table === "membership") membershipRebuilt = true
       }
+      // After upgrades: older caches did not have orphaned_at. Active-view scans must not
+      // visit the retained history of abandoned windows.
+      this.db.run(
+        `CREATE INDEX IF NOT EXISTS subscriptions_active ON subscriptions (orphaned_at, live)`,
+      )
       const storedHash = this.meta("schema_hash")
       const storedPartition = this.meta("partition")
       if (storedPartition !== null && storedPartition !== this.deps.partition) {
@@ -241,7 +246,7 @@ export class SyncEngine {
         // The membership table changed shape: live subscriptions are re-materialized from the
         // cache, which is still valid.
         for (const row of this.db.query(
-          `SELECT id, query, tables, live FROM subscriptions WHERE live = 1`,
+          `SELECT id, query, tables, live FROM subscriptions WHERE live = 1 AND orphaned_at IS NULL`,
         )) {
           const sub = this.loadSubscription(row)
           if (sub !== null) events.push(this.materialize(sub))
@@ -723,7 +728,9 @@ export class SyncEngine {
 
   private subscriptionsOn(table: string): ReadonlyArray<SubscriptionRow> {
     const out: Array<SubscriptionRow> = []
-    for (const row of this.db.query(`SELECT id, query, tables, live FROM subscriptions`)) {
+    for (const row of this.db.query(
+      `SELECT id, query, tables, live FROM subscriptions WHERE orphaned_at IS NULL`,
+    )) {
       const tables = decodeStoredTables(asString(row["tables"]))
       if (!tables.includes(table)) continue
       const sub = this.loadSubscription(row)
@@ -733,9 +740,10 @@ export class SyncEngine {
   }
 
   subscription(id: string): SubscriptionRow | null {
-    const row = this.db.query(`SELECT id, query, tables, live FROM subscriptions WHERE id = ?`, [
-      id,
-    ])[0]
+    const row = this.db.query(
+      `SELECT id, query, tables, CASE WHEN orphaned_at IS NULL THEN live ELSE 0 END AS live FROM subscriptions WHERE id = ?`,
+      [id],
+    )[0]
     return row === undefined ? null : this.loadSubscription(row)
   }
 
@@ -841,15 +849,16 @@ export class SyncEngine {
   }
 
   /**
-   * No session holds the subscription any more. It stays materialized and maintained, so a
-   * reload or a redeploy within the grace period reuses it instead of rewriting every
-   * membership row; `sweepOrphans` drops it once the grace period passed.
+   * No session holds the subscription any more. Keep its membership during the grace period,
+   * but stop maintaining it immediately: window/filter churn must not multiply CDC work.
+   * A returning subscriber reconciles the retained membership against the current cache.
+   * `sweepOrphans` drops it once the grace period has passed.
    */
   markOrphaned(id: string, now: number): void {
-    this.db.run(`UPDATE subscriptions SET orphaned_at = ? WHERE id = ? AND orphaned_at IS NULL`, [
-      now,
-      id,
-    ])
+    this.db.run(
+      `UPDATE subscriptions SET orphaned_at = ?, live = 0 WHERE id = ? AND orphaned_at IS NULL`,
+      [now, id],
+    )
   }
 
   /** Drops subscriptions orphaned at or before `before`. Returns the dropped ids. */
@@ -992,7 +1001,9 @@ export class SyncEngine {
     const memberships: Array<MembershipChange> = []
     const rowUpdates = new Map<string, RowUpdate>()
     if (touched.size === 0) return { rows: [], memberships }
-    const subs = this.db.query(`SELECT id, query, tables, live FROM subscriptions WHERE live = 1`)
+    const subs = this.db.query(
+      `SELECT id, query, tables, live FROM subscriptions WHERE live = 1 AND orphaned_at IS NULL`,
+    )
     for (const row of subs) {
       const sub = this.loadSubscription(row)
       if (sub === null) continue
@@ -1036,10 +1047,10 @@ export class SyncEngine {
         const existing = rowUpdates.get(ref)
         if (existing !== undefined && existing.row !== null) continue
         const isMember =
-          this.db.query(`SELECT 1 AS x FROM membership WHERE tbl = ? AND key = ? LIMIT 1`, [
-            tableName,
-            key,
-          ]).length > 0
+          this.db.query(
+            `SELECT 1 AS x FROM membership m JOIN subscriptions s ON s.id = m.subscription WHERE m.tbl = ? AND m.key = ? AND s.live = 1 AND s.orphaned_at IS NULL LIMIT 1`,
+            [tableName, key],
+          ).length > 0
         if (!isMember) continue
         const record = this.db.query(selectByKeySql(table), [key])[0]
         if (record !== undefined)
@@ -1068,7 +1079,7 @@ export class SyncEngine {
       const where = part.map(() => "(tbl = ? AND key = ?)").join(" OR ")
       const params = part.flatMap((r) => [r.table, SchemaRuntime.keyString(r.key)])
       for (const row of this.db.query(
-        `SELECT subscription, tbl, key FROM membership WHERE ${where}`,
+        `SELECT subscription, tbl, key FROM membership JOIN subscriptions ON subscriptions.id = membership.subscription WHERE (${where}) AND subscriptions.live = 1 AND subscriptions.orphaned_at IS NULL`,
         params,
       )) {
         const ref = memberRef(asString(row["tbl"]), asString(row["key"]))
