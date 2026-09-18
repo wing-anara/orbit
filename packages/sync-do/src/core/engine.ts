@@ -56,7 +56,13 @@ import {
   type PlannedQuery,
   type SqlValue,
 } from "@orbit/query"
-import { createIndexesSql, decodeRowSync, planMigration, SchemaRuntime } from "@orbit/schema"
+import {
+  canonicalJson,
+  createIndexesSql,
+  decodeRowSync,
+  planMigration,
+  SchemaRuntime,
+} from "@orbit/schema"
 
 import { listTables, type SqlDriver, type SqlRecord } from "./driver.ts"
 import { gtidSetContains, parseGtidSet } from "./gtid.ts"
@@ -83,6 +89,7 @@ export type EngineEvent =
   | {
       readonly type: "delta"
       readonly cursor: number
+      readonly version?: string
       readonly origin: DeltaOrigin
       readonly rows: ReadonlyArray<RowUpdate>
       readonly memberships: ReadonlyArray<MembershipChange>
@@ -91,6 +98,7 @@ export type EngineEvent =
       readonly type: "snapshot"
       readonly subscription: string
       readonly cursor: number
+      readonly version?: string
       readonly rows: ReadonlyArray<RowUpdate>
       readonly members: ReadonlyArray<MemberRef>
       /**
@@ -108,6 +116,7 @@ export type EngineEvent =
   | { readonly type: "scopes_reset"; readonly reason: string }
 
 export interface SubscribeOutcome {
+  readonly resumed?: { readonly version: string; readonly cursor: number }
   readonly subscription: string
   readonly status: "pending" | "live"
   /** The normalized query the subscription materializes. */
@@ -116,6 +125,7 @@ export interface SubscribeOutcome {
 }
 
 export interface SubscribeOptions {
+  readonly resume?: { readonly version: string; readonly query: Query }
   /**
    * A live subscription whose result the new one extends: the same query with a larger limit.
    * Its membership seeds the new subscription, so materialization writes only the extra
@@ -254,6 +264,7 @@ export class SyncEngine {
       }
       this.setMeta("schema_hash", this.deps.schema.schema_hash)
       this.setMeta("partition", this.deps.partition)
+      if (this.meta("cache_identity") === null) this.setMeta("cache_identity", this.deps.newId())
       if (this.meta("epoch") === null) this.setMeta("epoch", "0")
       if (this.meta("applied_seq") === null) this.setMeta("applied_seq", "0")
       return events
@@ -271,6 +282,21 @@ export class SyncEngine {
       `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       [key, value],
     )
+  }
+
+  /** Persisted cache incarnation plus source position. Fills invalidate even at the same cursor. */
+  resumeVersion(cursor = this.appliedSeq): string {
+    return JSON.stringify([
+      this.deps.schema.schema_hash,
+      this.deps.partition,
+      this.meta("cache_identity"),
+      this.epoch,
+      cursor,
+    ])
+  }
+
+  private invalidateResume(): void {
+    this.setMeta("cache_identity", this.deps.newId())
   }
 
   get appliedSeq(): number {
@@ -320,6 +346,7 @@ export class SyncEngine {
 
   /** Drops every cached scope, held change and membership. Subscriptions become pending. */
   private resetScopes(reason: string): void {
+    this.invalidateResume()
     for (const t of this.deps.schema.tables) this.db.run(deleteAllSql(t))
     this.db.run(`DELETE FROM scopes`)
     this.db.run(`DELETE FROM held`)
@@ -389,6 +416,7 @@ export class SyncEngine {
         now,
         asNumber(row["attempts"]) + 1,
       ])
+      this.invalidateResume()
       // Rows uploaded by the abandoned fill are discarded: the new fill is a fresh snapshot.
       const t = this.rt.table(table)
       if (t !== undefined) this.db.run(deleteAllSql(t))
@@ -425,6 +453,7 @@ export class SyncEngine {
       const decode = this.codecs.get(table.name)
       if (decode === undefined)
         return Result.fail<EngineError>({ code: "unknown_table", table: table.name })
+      this.invalidateResume()
       const sql = upsertSql(table)
       let n = 0
       for (const raw of rows) {
@@ -465,6 +494,7 @@ export class SyncEngine {
         [fillId],
       )[0]
       if (scope === undefined) return []
+      this.invalidateResume()
       const tableName = asString(scope["tbl"])
       const table = this.rt.table(tableName)
       if (table === undefined) return []
@@ -674,7 +704,14 @@ export class SyncEngine {
       trace: txn.trace,
       appliedAt: this.deps.now(),
     }
-    return Result.succeed({ type: "delta", cursor: txn.seq, origin, rows, memberships })
+    return Result.succeed({
+      type: "delta",
+      cursor: txn.seq,
+      version: this.resumeVersion(txn.seq),
+      origin,
+      rows,
+      memberships,
+    })
   }
 
   private applyChangeToCache(
@@ -793,12 +830,36 @@ export class SyncEngine {
         for (const request of requests) events.push({ type: "fill_needed", request })
         if (pending.length > 0)
           return { subscription: p.key, status: "pending", query: p.query, events }
+        const resume = options.resume
+        const unchanged =
+          resume !== undefined &&
+          resume.version === this.resumeVersion() &&
+          canonicalJson(resume.query) === canonicalJson(p.query)
+        // A held, live materialization needs neither row reads nor membership serialization.
+        if (unchanged && existing?.live === true)
+          return {
+            subscription: p.key,
+            status: "live",
+            query: p.query,
+            events,
+            resumed: { version: resume.version, cursor: this.appliedSeq },
+          }
         // The base's members need no row images: the client has them.
         const held = seed && base !== null ? this.heldBy(base.id) : undefined
         const snapshot =
           existing?.live !== true
             ? this.materialize({ id: p.key, planned: p, live: false }, held)
             : this.snapshot(p.key, held)
+        // An orphan may need its server membership rebuilt, but a validated client already has
+        // the identical rows. Keep future CDC delivery correct without retransmitting that view.
+        if (unchanged)
+          return {
+            subscription: p.key,
+            status: "live",
+            query: p.query,
+            events,
+            resumed: { version: resume.version, cursor: this.appliedSeq },
+          }
         events.push(
           held === undefined || base === null ? snapshot : this.extend(snapshot, base.id, held),
         )
@@ -991,7 +1052,14 @@ export class SyncEngine {
       if (skip?.has(ref)) continue
       rows.push({ table: m.table, key: parseKey(m.key), row: rowFromRecord(table, m.record) })
     }
-    return { type: "snapshot", subscription: id, cursor: this.appliedSeq, rows, members: refs }
+    return {
+      type: "snapshot",
+      subscription: id,
+      cursor: this.appliedSeq,
+      version: this.resumeVersion(),
+      rows,
+      members: refs,
+    }
   }
 
   /**

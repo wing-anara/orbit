@@ -35,6 +35,7 @@ import {
   type RowImage,
   type ServerMessage as ServerMessageType,
   type SyncError,
+  type SubscribeMessage,
 } from "@orbit/protocol/client"
 import { resolveNamedQuery, type AnyDefinedQueries, type QueryContext } from "@orbit/query"
 import { SyncEngine, type EngineEvent } from "@orbit/sync-do/core"
@@ -248,13 +249,14 @@ export class FakeSyncServer {
         cursor: this.engine.appliedSeq,
         serverTime: Date.now(),
       })
-      for (const sub of msg.subscriptions) this.subscribe(session, sub.id, sub.query)
+      for (const sub of msg.subscriptions)
+        this.subscribe(session, sub.id, sub.query, sub.basedOn, sub.resume)
       return
     }
     if (!session.helloDone) return
     switch (msg.type) {
       case "subscribe":
-        this.subscribe(session, msg.id, msg.query, msg.basedOn)
+        this.subscribe(session, msg.id, msg.query, msg.basedOn, msg.resume)
         return
       case "unsubscribe": {
         const cs = session.clientSubs.get(msg.id)
@@ -313,7 +315,13 @@ export class FakeSyncServer {
     })
   }
 
-  private subscribe(session: Session, clientSubId: string, ref: QueryRef, basedOn?: string): void {
+  private subscribe(
+    session: Session,
+    clientSubId: string,
+    ref: QueryRef,
+    basedOn?: string,
+    resume?: SubscribeMessage["resume"],
+  ): void {
     this.receivedRefs.push(ref)
     this.receivedBases.push(basedOn ?? null)
     const query = this.resolve(ref, session)
@@ -324,6 +332,7 @@ export class FakeSyncServer {
     const base = basedOn === undefined ? undefined : session.clientSubs.get(basedOn)
     const outcome = this.engine.subscribe(query.success, {
       ...(base === undefined || base.status !== "live" ? {} : { basedOn: base.subscription }),
+      ...(resume === undefined ? {} : { resume }),
     })
     if (Result.isFailure(outcome)) {
       session.socket.deliver({
@@ -342,6 +351,7 @@ export class FakeSyncServer {
       id: clientSubId,
       status: outcome.success.status,
       query: outcome.success.query,
+      ...(outcome.success.resumed === undefined ? {} : { resumed: outcome.success.resumed }),
     })
     // As in the Durable Object: the snapshot of the new subscription goes to this session only,
     // reduced to the members its base does not hold when the engine extended it.
@@ -357,6 +367,7 @@ export class FakeSyncServer {
         type: "snapshot",
         subscriptionId: clientSubId,
         cursor: event.cursor,
+        ...(event.version === undefined ? {} : { version: event.version }),
         rows: event.rows,
         members: event.members,
         complete: true,
@@ -396,6 +407,7 @@ export class FakeSyncServer {
                 type: "snapshot",
                 subscriptionId: clientSubId,
                 cursor: event.cursor,
+                ...(event.version === undefined ? {} : { version: event.version }),
                 rows: event.rows,
                 members: event.members,
                 complete: true,
@@ -441,6 +453,7 @@ export class FakeSyncServer {
             session.socket.deliver({
               type: "delta",
               cursor: event.cursor,
+              ...(event.version === undefined ? {} : { version: event.version }),
               origin: event.origin,
               rows,
               memberships,

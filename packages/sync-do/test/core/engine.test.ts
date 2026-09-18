@@ -44,6 +44,54 @@ const deltas = (events: ReadonlyArray<EngineEvent>) =>
   events.filter((e): e is Extract<EngineEvent, { type: "delta" }> => e.type === "delta")
 
 describe("SyncEngine: cursor and deduplication", () => {
+  it("revalidates unchanged views but snapshots changed data, queries and cache incarnations", () => {
+    const { engine } = makeEngine()
+    liveScope(engine, "Chatbot", [chatbot("a")])
+    const first = engine.subscribe({ table: "Chatbot" })
+    if (Result.isFailure(first)) throw first.failure
+    const snapshot = first.success.events.find((event) => event.type === "snapshot")
+    if (snapshot?.type !== "snapshot" || snapshot.version === undefined)
+      throw Error("missing version")
+    const resume = { version: snapshot.version, query: first.success.query }
+    const unchanged = engine.subscribe({ table: "Chatbot" }, { resume })
+    if (Result.isFailure(unchanged)) throw unchanged.failure
+    expect(unchanged.success.resumed?.cursor).toBe(0)
+    expect(unchanged.success.events).toEqual([])
+
+    // A changed authorization predicate must be resolved/materialized, even at the same cursor.
+    const restricted = engine.subscribe(
+      { table: "Chatbot", where: { op: "eq", column: "id", value: "other" } },
+      { resume },
+    )
+    if (Result.isFailure(restricted)) throw restricted.failure
+    expect(restricted.success.resumed).toBeUndefined()
+    expect(restricted.success.events.find((event) => event.type === "snapshot")).toMatchObject({
+      rows: [],
+      members: [],
+    })
+
+    const foreign = engine.subscribe(
+      { table: "Chatbot" },
+      { resume: { ...resume, version: "other-cache" } },
+    )
+    if (Result.isFailure(foreign)) throw foreign.failure
+    expect(foreign.success.resumed).toBeUndefined()
+
+    // A fill changes cache contents without advancing the source cursor; invalidate the proof.
+    liveScope(engine, "organization", [organization("org_1")])
+    expect(engine.appliedSeq).toBe(0)
+    const filled = engine.subscribe({ table: "Chatbot" }, { resume })
+    if (Result.isFailure(filled)) throw filled.failure
+    expect(filled.success.resumed).toBeUndefined()
+    const current = { version: engine.resumeVersion(), query: first.success.query }
+    engine.applyBatch(batch(schema, "org_1", [txn(1, [insert("Chatbot", chatbot("b"))])]))
+    const changed = engine.subscribe({ table: "Chatbot" }, { resume: current })
+    if (Result.isFailure(changed)) throw changed.failure
+    expect(changed.success.resumed).toBeUndefined()
+    const changedSnapshot = changed.success.events.find((event) => event.type === "snapshot")
+    expect(changedSnapshot?.type === "snapshot" && changedSnapshot.rows.length).toBe(2)
+  })
+
   it("applies in order, skips duplicates, rejects gaps and conflicting duplicates", () => {
     const { engine } = makeEngine()
     liveScope(engine, "Chatbot", [])

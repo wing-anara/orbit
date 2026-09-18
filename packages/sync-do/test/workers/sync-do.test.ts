@@ -525,6 +525,47 @@ describe("client sessions", () => {
     client.ws.close(1000, "done")
   })
 
+  it("revalidates a complete view across eviction and falls back after a source change", async () => {
+    const p = freshPartition()
+    const first = await connect(p, await token([p]))
+    first.send(hello(p, [{ id: "all", query: { table: "Chatbot" } }]))
+    await first.next("welcome")
+    const subscribed = await first.next("subscribed")
+    const req = (await pollFills()).requests.find((r) => r.partition === p)!
+    await uploadFill(req.fill_id, [chatbot("x")], 0)
+    const snapshot = await first.next("snapshot")
+    if (snapshot.version === undefined) throw Error("snapshot has no cache version")
+    const resume = { version: snapshot.version, query: subscribed.query }
+    const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+    await evictDurableObject(stub, { webSockets: "hibernate" })
+    const second = await connect(p, await token([p]))
+    second.send(
+      hello(p, [], {
+        subscriptions: [{ type: "subscribe", id: "resumed", query: { table: "Chatbot" }, resume }],
+      }),
+    )
+    await second.next("welcome")
+    expect((await second.next("subscribed")).resumed).toEqual({
+      version: resume.version,
+      cursor: 0,
+    })
+    second.send({ type: "ping", sentAt: 1 })
+    await second.next("pong")
+    expect(second.messages.some((m) => m.type === "snapshot")).toBe(false)
+    await deliver(p, [txn(1, [insert("Chatbot", chatbot("new"))])])
+    const delta = await second.next("delta")
+    expect(delta.version).toBeDefined()
+    expect(delta.version).not.toBe(resume.version)
+    second.send({ type: "subscribe", id: "stale", query: { table: "Chatbot" }, resume })
+    expect((await second.next("subscribed")).resumed).toBeUndefined()
+    expect((await second.next("snapshot")).members.map((m) => m.key[0]).sort()).toEqual([
+      "new",
+      "x",
+    ])
+    first.ws.close(1000, "done")
+    second.ws.close(1000, "done")
+  })
+
   it("multiple clients share one materialization and each gets deltas", async () => {
     const p = freshPartition()
     const a = await connect(p, await token([p], "alice"))

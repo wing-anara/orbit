@@ -89,6 +89,7 @@ interface Subscription {
   /** Set while the subscription has no references and waits out `queryTtlMs`. */
   retention: ReturnType<typeof setTimeout> | null
   onWire: boolean
+  resumeVersion: string | null
   /** The cache changed under an unreferenced subscription; it reads again when referenced. */
   dirty: boolean
   /** The query as planned locally at registration; identifies a grown window of it. */
@@ -376,8 +377,10 @@ export class ClientEngine {
                 Effect.catch((e) =>
                   Effect.sync(() => {
                     this.log("message.failed", { error: e.message })
-                    for (const sub of this.subscriptions.values())
+                    for (const sub of this.subscriptions.values()) {
+                      sub.resumeVersion = null
                       if (sub.status === "live") sub.status = "stale"
+                    }
                     this.notifyAll()
                   }).pipe(Effect.andThen(connection.reconnect)),
                 ),
@@ -429,6 +432,9 @@ export class ClientEngine {
           type: "subscribe" as const,
           id: s.id,
           query: s.ref,
+          ...(s.status !== "live" || s.dirty || s.resumeVersion === null
+            ? {}
+            : { resume: { version: s.resumeVersion, query: s.planned.query } }),
         })),
     })
     for (const s of this.subscriptions.values()) if (s.status === "live") s.status = "stale"
@@ -484,6 +490,7 @@ export class ClientEngine {
       pendingChunks: null,
       retention: null,
       onWire: false,
+      resumeVersion: null,
       dirty: false,
       localQuery: planned.query,
       basedOn: null,
@@ -692,6 +699,20 @@ export class ClientEngine {
           const sub = this.subscriptions.get(message.id)
           if (sub === undefined) return
           yield* this.lock.runEffect(this.adoptServerQuery(sub, message.query))
+          if (message.resumed !== undefined) {
+            if (sub.resumeVersion !== message.resumed.version) {
+              // A stale/invalid response cannot certify a local view.
+              return yield* Effect.fail(
+                new StoreError({ message: "resume version does not match cached view" }),
+              )
+            }
+            sub.status = "live"
+            sub.error = null
+            this.cursor = message.resumed.cursor
+            sub.snapshot = { ...sub.snapshot, status: "live", error: null, cursor: this.cursor }
+            for (const listener of sub.listeners) listener()
+            this.log("subscription.resumed", { subscription: sub.id, cursor: this.cursor })
+          }
           if (message.status === "pending") {
             sub.status =
               sub.snapshot.rows.length > 0 || sub.status === "stale" ? "stale" : "pending"
@@ -734,6 +755,7 @@ export class ClientEngine {
               )
               this.cursor = message.cursor
               sub.status = "live"
+              sub.resumeVersion = message.version ?? null
               sub.error = null
               const rebased = yield* this.confirmMutations()
               if (rebased) yield* this.refreshTables(null, true)
@@ -797,6 +819,9 @@ export class ClientEngine {
           for (const id of before) touched.add(id)
           yield* this.store.applyDeltas(messages)
           this.cursor = last.cursor
+          for (const sub of this.subscriptions.values())
+            if (sub.status === "live" && sub.onWire && !sub.dirty)
+              sub.resumeVersion = last.version ?? null
           const rebased = yield* this.confirmMutations()
           if (rebased) {
             yield* this.refreshTables(null, true)

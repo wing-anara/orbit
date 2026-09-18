@@ -8,7 +8,7 @@ Related documents: [architecture.md](architecture.md), [auth.md](auth.md), [quer
 
 The client protocol is defined in `packages/protocol/src/client-protocol.ts`. `CLIENT_PROTOCOL_VERSION` is `1`. Messages are JSON. Every message is a member of a tagged union. Decoding is exhaustive: an unknown message is an error.
 
-The cursor is the partition sequence (`applied_seq` of the Durable Object) at which the client's local state is consistent. Deltas carry the cursor they advance to. The client applies each delta in one local transaction and acknowledges the cursor.
+The cursor is the partition sequence (`applied_seq` of the Durable Object) at which the client's local state is consistent. Deltas carry the cursor they advance to. The client applies consecutive queued deltas in bounded, ordered atomic batches and acknowledges the last committed cursor. Snapshots and connection transitions are batching barriers.
 
 ### Connection
 
@@ -28,7 +28,9 @@ The client opens `GET {prefix}/ws?partition=P&token=T`. The Worker verifies the 
 | `cursor`          | integer or null      | Cursor of the local state. `null` when starting fresh.         |
 | `subscriptions`   | `SubscribeMessage[]` | Subscriptions to establish at once.                            |
 
-The server does not resume from `cursor`. It always answers with a fresh snapshot per subscription. The field is informational in v1.
+The server does not infer completeness from `hello.cursor`. A complete, active in-memory subscription may instead include `resume: { version, query }`, using the last server-issued cache version and the previously resolved query. The server resolves the query again with the current session identity. Only an exact normalized-query and cache-version match permits `subscribed.resumed: { version, cursor }` instead of a snapshot. Otherwise it sends the normal snapshot. Cached views loaded from disk, incomplete snapshots, dirty/released views and views affected by a local apply failure never request this fast path.
+
+Snapshots and deltas optionally carry `version`. The version combines schema, a persisted cache incarnation, stream epoch and source cursor. Cache fills, retries and resets invalidate the incarnation even when the cursor is unchanged. It survives Durable Object eviction. This is conditional revalidation, not historical delta replay: any source change the client has not applied requires a snapshot. Optional fields keep older clients and servers compatible; an older server simply sends a snapshot.
 
 `subscribe` has `id` (string, chosen by the client) and `query`, a `QueryRef`: either a named query `{ name, args }` or a raw `Query` (see [queries.md](queries.md)). Raw queries are accepted only when the Durable Object allows ad-hoc queries. The client uses the canonical JSON of the reference as `id`.
 

@@ -7,8 +7,8 @@
  *
  * Cursor model: `cursor` is the partition sequence (`applied_seq` of the Durable Object) at
  * which the client's local state is consistent. Deltas carry the cursor they advance to; the
- * client applies each delta in one local transaction and acknowledges the cursor. On reconnect
- * the client presents its cursor and subscriptions; the server replies with a fresh snapshot
+ * client commits queued deltas atomically and acknowledges the last cursor. On reconnect
+ * the server revalidates complete unchanged views, or replies with a fresh snapshot
  * per subscription taken at one consistent cursor (see `docs/protocol.md`).
  */
 
@@ -59,6 +59,8 @@ export const SubscribeMessage = Schema.Struct({
    * does not hold (`snapshot.basedOn`); the client keeps the base until that snapshot arrives.
    */
   basedOn: Schema.optionalKey(Schema.String),
+  /** A complete in-memory view may be revalidated; the server re-resolves authorization first. */
+  resume: Schema.optionalKey(Schema.Struct({ version: Schema.String, query: Query })),
 })
 export type SubscribeMessage = typeof SubscribeMessage.Type
 
@@ -146,6 +148,7 @@ export const ServerMessage = Schema.Union([
     type: Schema.Literal("snapshot"),
     subscriptionId: Schema.String,
     cursor: NonNegativeInt,
+    version: Schema.optionalKey(Schema.String),
     rows: Schema.Array(RowUpdate),
     members: Schema.Array(MemberRef),
     complete: Schema.Boolean,
@@ -163,6 +166,7 @@ export const ServerMessage = Schema.Union([
     type: Schema.Literal("delta"),
     cursor: NonNegativeInt,
     origin: DeltaOrigin,
+    version: Schema.optionalKey(Schema.String),
     rows: Schema.Array(RowUpdate),
     memberships: Schema.Array(MembershipChange),
   }),
@@ -173,6 +177,7 @@ export const ServerMessage = Schema.Union([
     status: Schema.Literals(["pending", "live"]),
     /** The resolved, normalized query the server materializes for this subscription. */
     query: Query,
+    resumed: Schema.optionalKey(Schema.Struct({ version: Schema.String, cursor: NonNegativeInt })),
   }),
   Schema.Struct({ type: Schema.Literal("unsubscribed"), id: Schema.String }),
   Schema.Struct({

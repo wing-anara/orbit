@@ -216,6 +216,52 @@ const reloadable = (driver: AsyncSqlDriver): AsyncSqlDriver => ({
 })
 
 describe("client engine end to end with the Durable Object core", () => {
+  it("does not resume a named query when its authorized resolution changes", async () => {
+    let allowed = "a"
+    const server = new FakeSyncServer(schema, "org_1", {
+      resolve: () => ({ table: "Chatbot", where: { op: "eq", column: "id", value: allowed } }),
+    })
+    const { engine, log } = makeClient(server)
+    await Effect.runPromise(engine.open())
+    const docs = await Effect.runPromise(
+      engine.subscribeNamed({ name: "authorized", args: {} }, { table: "Chatbot" }),
+    )
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill("Chatbot", [chatbot("a"), chatbot("b")])
+    await Effect.runPromise(engine.awaitLive(docs.id))
+    expect(docs.getSnapshot().rows.map((row) => row.row["id"])).toEqual(["a"])
+    allowed = "b"
+    server.dropAll()
+    await waitFor(() => docs.getSnapshot().rows[0]?.row["id"] === "b")
+    expect(docs.getSnapshot().rows.map((row) => row.row["id"])).toEqual(["b"])
+    expect(log.some(([event]) => event === "subscription.resumed")).toBe(false)
+    await Effect.runPromise(engine.close())
+  })
+
+  it("revalidates an unchanged active window on reconnect without replacing its rows", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine, log } = makeClient(server)
+    await Effect.runPromise(engine.open())
+    const docs = await Effect.runPromise(engine.subscribe({ table: "Chatbot", limit: 2000 }))
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill(
+      "Chatbot",
+      Array.from({ length: 2000 }, (_, i) => chatbot(String(i))),
+    )
+    await Effect.runPromise(engine.awaitLive(docs.id))
+    const rows = docs.getSnapshot().rows
+    const snapshots = log.filter(([event]) => event === "snapshot.applied").length
+    server.dropAll()
+    await waitFor(() => log.some(([event]) => event === "subscription.resumed"))
+    expect(docs.getSnapshot().status).toBe("live")
+    expect(docs.getSnapshot().rows).toBe(rows)
+    expect(log.filter(([event]) => event === "snapshot.applied").length).toBe(snapshots)
+    server.commit([remove("Chatbot", chatbot("0"))])
+    await waitFor(() => docs.getSnapshot().rows.length === 1999)
+    expect(docs.getSnapshot().rows.some((row) => row.row["id"] === "0")).toBe(false)
+    await Effect.runPromise(engine.close())
+  })
+
   it("recovers a failed local delta transaction from a fresh snapshot instead of dropping it", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const driver = nodeAsyncDriver()
