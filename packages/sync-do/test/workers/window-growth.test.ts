@@ -10,6 +10,7 @@ it("bounds growing-window reads in workerd, including the candidate membership p
   const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName("growth-read-budget"))
   const result = await runInDurableObject(stub, async (_object, state) => {
     let rowsRead = 0
+    let rowsReturned = 0
     const driver = durableObjectDriver(state.storage)
     const engine = new SyncEngine({
       schema,
@@ -22,6 +23,7 @@ it("bounds growing-window reads in workerd, including the candidate membership p
           const cursor = state.storage.sql.exec(sql, ...(params as SqlStorageValue[]))
           const rows = cursor.toArray()
           rowsRead += cursor.rowsRead
+          rowsReturned += rows.length
           return rows as SqlRecord[]
         },
       },
@@ -63,7 +65,25 @@ it("bounds growing-window reads in workerd, including the candidate membership p
     if (Result.isFailure(grown)) throw grown.failure
     const growthReads = rowsRead
     const snapshot = grown.success.events.find((e) => e.type === "snapshot")
+    const reused = []
+    for (const orphaned of [false, true]) {
+      if (orphaned) engine.markOrphaned(grown.success.subscription, Date.now())
+      rowsReturned = 0
+      const again = engine.subscribe(
+        { ...query, limit: 1100 },
+        { basedOn: base.success.subscription },
+      )
+      if (Result.isFailure(again)) throw again.failure
+      const extension = again.success.events.find((e) => e.type === "snapshot")
+      reused.push({
+        orphaned,
+        rowsReturned,
+        added: extension?.type === "snapshot" ? extension.rows.length : -1,
+        basedOn: extension?.type === "snapshot" && extension.basedOn === base.success.subscription,
+      })
+    }
     return {
+      reused,
       growthReads,
       bigints: snapshot?.type === "snapshot" ? snapshot.rows.map((r) => r.row?.["big"]) : [],
       added: snapshot?.type === "snapshot" ? snapshot.rows.length : -1,
@@ -75,6 +95,10 @@ it("bounds growing-window reads in workerd, including the candidate membership p
   // A subscription-first JSON join reads >100,000 rows for this workload in
   // workerd, even though Node SQLite chooses a fast plan for the same query.
   expect(result.growthReads).toBeLessThan(20_000)
+  for (const repeat of result.reused) {
+    expect(repeat).toMatchObject({ added: 100, basedOn: true })
+    expect(repeat.rowsReturned).toBeLessThan(300)
+  }
   expect(result.bigints).toEqual(
     Array.from({ length: 100 }, (_, i) =>
       i % 2 === 0 ? "9223372036854775807" : "-9223372036854775808",

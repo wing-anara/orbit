@@ -593,6 +593,63 @@ describe("SyncEngine: subscriptions and incremental maintenance", () => {
     )
   })
 
+  it.each(["live", "orphan", "stale"] as const)(
+    "reuses a %s larger view without walking a current prefix again",
+    (state) => {
+      const { engine, driver, deps } = makeEngine()
+      liveScope(engine, "Chatbot", [
+        chatbot("folder", { type: "GROUP" }),
+        ...Array.from({ length: 110 }, (_, i) =>
+          chatbot(`d${String(i).padStart(3, "0")}`, { groupId: "folder" }),
+        ),
+      ])
+      const query = (limit: number): Query => ({
+        table: "Chatbot",
+        where: { op: "eq", column: "type", value: "DOCUMENT" },
+        orderBy: [{ column: "id", direction: "asc" }],
+        limit,
+        include: ["folder"],
+      })
+      const base = engine.subscribe(query(100))
+      const first = engine.subscribe(query(110))
+      if (Result.isFailure(base) || Result.isFailure(first)) throw Error("subscribe failed")
+      if (state !== "live") engine.markOrphaned(first.success.subscription, 10)
+      if (state === "stale")
+        engine.applyBatch(
+          batch(schema, "org_1", [
+            txn(1, [
+              remove("Chatbot", chatbot("d105", { groupId: "folder" })),
+              insert("Chatbot", chatbot("d999", { groupId: "folder" })),
+            ]),
+          ]),
+        )
+      const reopened = new SyncEngine(deps)
+      reopened.init()
+      const read = driver.query.bind(driver)
+      let returned = 0
+      const spy = vi.spyOn(driver, "query").mockImplementation((sql, params) => {
+        const rows = read(sql, params)
+        returned += rows.length
+        return rows
+      })
+      // No resume token: a new tab has only the smaller base, while the DO can
+      // already own the larger view from an earlier visit or another client.
+      const grown = reopened.subscribe(query(110), { basedOn: base.success.subscription })
+      spy.mockRestore()
+      if (Result.isFailure(grown)) throw grown.failure
+      const snapshot = grown.success.events.find((event) => event.type === "snapshot")
+      if (snapshot?.type !== "snapshot") throw Error("missing snapshot")
+      expect(snapshot.basedOn).toBe(base.success.subscription)
+      expect(snapshot.rows).toHaveLength(10)
+      expect(snapshot.rows.some((row) => row.key[0] === "d105")).toBe(state !== "stale")
+      expect(snapshot.rows.some((row) => row.key[0] === "d999")).toBe(state === "stale")
+      expect(reopened.membershipOf(grown.success.subscription)).toEqual(
+        reopened.recompute(grown.success.subscription),
+      )
+      if (state !== "stale") expect(returned).toBeLessThan(75)
+    },
+  )
+
   it("extends a live window in place: seeded membership, snapshot of the extra members only", () => {
     const { engine } = makeEngine()
     liveScope(engine, "Chatbot", [chatbot("a"), chatbot("b"), chatbot("c"), chatbot("d")])

@@ -59,9 +59,6 @@ import {
 } from "@orbit/query"
 import {
   canonicalJson,
-  KEY_COLUMN,
-  localTableName,
-  quoteIdent,
   createIndexesSql,
   decodeRowSync,
   planMigration,
@@ -853,8 +850,15 @@ export class SyncEngine {
           }
         }
         // The base's members need no row images: the client has them.
+        const currentMembership =
+          existing === null ||
+          existing.live ||
+          (retainedVersion !== null && retainedVersion === this.resumeVersion())
+        // A current retained/live view has the same prefix guarantee as a new
+        // one. A new client need not have a resume token for this server-owned
+        // proof; it still receives every row beyond its live smaller base.
         const grows =
-          existing === null &&
+          currentMembership &&
           base !== null &&
           base.live &&
           base.planned.limit !== undefined &&
@@ -1041,7 +1045,7 @@ export class SyncEngine {
         base.id,
       ])[0]?.["n"] ?? 0,
     )
-    // Membership was seeded in SQL. Only evaluate roots beyond that prefix and their
+    // Membership was seeded in SQL or already proven current. Only evaluate roots beyond that prefix and their
     // includes; walking the entire old include graph on each page is quadratic work.
     // Sort and discard the prefix as keys, so SQLite does not copy large row
     // images into its ordering buffer before applying OFFSET.
