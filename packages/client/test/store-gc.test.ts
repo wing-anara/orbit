@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs"
-import { Effect, Schema } from "effect"
+import { Effect, Result, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { SyncSchema } from "@orbit/protocol"
 import { LocalStore } from "../src/store.ts"
@@ -111,6 +111,84 @@ it("replays unchanged snapshots without deleting or rewriting cached row images"
     expect(driver.db.prepare("SELECT * FROM writes").all()).toEqual([])
     await Effect.runPromise(store.applySnapshot("view", 5, [], []))
     expect(driver.db.prepare("SELECT op FROM writes").all()).toEqual([{ op: "delete" }])
+  } finally {
+    driver.db.close()
+  }
+})
+
+it("keeps window growth linear and restores only live subscriptions while retaining inherited rows", async () => {
+  const driver = nodeAsyncDriver()
+  const store = new LocalStore(driver, schema, "org_1")
+  try {
+    await Effect.runPromise(store.open({ clientId: "chain-test" }))
+    driver.db.exec(
+      "CREATE TEMP TABLE membership_writes (n INTEGER); INSERT INTO membership_writes VALUES (0); CREATE TEMP TRIGGER count_membership AFTER INSERT ON membership BEGIN UPDATE membership_writes SET n = n + 1; END;",
+    )
+    for (let window = 0; window < 20; window++) {
+      const id = String(window)
+      const query = { table: "organization", limit: (window + 1) * 10 }
+      await Effect.runPromise(store.registerSubscription(id, query, query))
+      const rows = Array.from({ length: 10 }, (_, i) => {
+        const key = String(window * 10 + i).padStart(4, "0")
+        return {
+          table: "organization",
+          key: [key],
+          row: { id: key, name: key, created_at: "2026-01-01 00:00:00", hipaa_enabled: false },
+        }
+      })
+      await Effect.runPromise(
+        store.applySnapshot(
+          id,
+          window,
+          rows,
+          rows.map((r) => ({ table: r.table, key: r.key })),
+          window === 0 ? null : String(window - 1),
+        ),
+      )
+      if (window > 0) await Effect.runPromise(store.removeSubscription(String(window - 1)))
+    }
+    expect(driver.db.prepare("SELECT n FROM membership_writes").get()?.["n"]).toBe(200)
+    expect((await Effect.runPromise(store.subscriptions())).map((s) => s.id)).toEqual(["19"])
+    await Effect.runPromise(store.open())
+    const planned = store.plan({ table: "organization", limit: 200 })
+    if (Result.isFailure(planned)) throw planned.failure
+    expect((await Effect.runPromise(store.readSubscription(planned.success, "19"))).length).toBe(
+      200,
+    )
+    // Reactivation must restore the base's subscription without losing its dependents.
+    await Effect.runPromise(
+      store.registerSubscription(
+        "0",
+        { table: "organization", limit: 10 },
+        { table: "organization", limit: 10 },
+      ),
+    )
+    expect((await Effect.runPromise(store.subscriptions())).map((s) => s.id).sort()).toEqual([
+      "0",
+      "19",
+    ])
+    await Effect.runPromise(store.removeSubscription("19"))
+    expect(driver.db.prepare("SELECT COUNT(*) AS n FROM t_organization").get()?.["n"]).toBe(10)
+    await Effect.runPromise(store.removeSubscription("0"))
+    expect(driver.db.prepare("SELECT COUNT(*) AS n FROM subscriptions").get()?.["n"]).toBe(0)
+    expect(driver.db.prepare("SELECT COUNT(*) AS n FROM membership").get()?.["n"]).toBe(0)
+    expect(driver.db.prepare("SELECT COUNT(*) AS n FROM t_organization").get()?.["n"]).toBe(0)
+  } finally {
+    driver.db.close()
+  }
+})
+
+it("adds cache-only retirement bookkeeping without discarding an existing cache", async () => {
+  const driver = nodeAsyncDriver()
+  const store = new LocalStore(driver, schema, "org_1")
+  try {
+    await Effect.runPromise(store.open({ clientId: "legacy" }))
+    await Effect.runPromise(
+      store.registerSubscription("view", { table: "organization" }, { table: "organization" }),
+    )
+    driver.db.exec("ALTER TABLE subscriptions DROP COLUMN retired")
+    expect((await Effect.runPromise(store.open())).action).toBe("none")
+    expect((await Effect.runPromise(store.subscriptions())).map((s) => s.id)).toEqual(["view"])
   } finally {
     driver.db.close()
   }

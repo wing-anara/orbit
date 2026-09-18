@@ -75,7 +75,7 @@ const STORE_DDL: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS membership (subscription TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, tbl, key))`,
   `CREATE INDEX IF NOT EXISTS membership_row ON membership (tbl, key)`,
-  `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, ref TEXT, cursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0, based_on TEXT)`,
+  `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, ref TEXT, cursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0, based_on TEXT, retired INTEGER NOT NULL DEFAULT 0)`,
   `CREATE TABLE IF NOT EXISTS mutation_outcomes (id INTEGER PRIMARY KEY, outcome TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS pending_mutations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, args TEXT NOT NULL, created_at INTEGER NOT NULL, pushed INTEGER NOT NULL DEFAULT 0)`,
 ]
@@ -193,6 +193,13 @@ export class LocalStore {
         yield* this.run([{ sql: `ALTER TABLE subscriptions ADD COLUMN ref TEXT`, params: [] }])
       if (!subscriptionColumns.some((c) => str(c["name"]) === "based_on"))
         yield* this.run([{ sql: `ALTER TABLE subscriptions ADD COLUMN based_on TEXT`, params: [] }])
+      if (!subscriptionColumns.some((c) => str(c["name"]) === "retired"))
+        yield* this.run([
+          {
+            sql: `ALTER TABLE subscriptions ADD COLUMN retired INTEGER NOT NULL DEFAULT 0`,
+            params: [],
+          },
+        ])
       const meta = yield* this.query(`SELECT key, value FROM meta`)
       const stored = new Map(meta.map((r) => [str(r["key"]), str(r["value"])] as const))
       const storedPartition = stored.get("partition")
@@ -276,7 +283,7 @@ export class LocalStore {
 
   /** Persisted subscriptions (ref and resolved query per client subscription id). */
   subscriptions(): Effect.Effect<ReadonlyArray<PersistedSubscription>, StoreError> {
-    return this.query(`SELECT id, query, ref, complete FROM subscriptions`).pipe(
+    return this.query(`SELECT id, query, ref, complete FROM subscriptions WHERE retired = 0`).pipe(
       Effect.map((rows) =>
         rows.map((r) => {
           const query = decodeStoredQuery(str(r["query"]))
@@ -295,7 +302,7 @@ export class LocalStore {
   registerSubscription(id: string, ref: QueryRef, query: Query): Effect.Effect<void, StoreError> {
     return this.run([
       {
-        sql: `INSERT INTO subscriptions (id, query, ref, cursor, complete) VALUES (?, ?, ?, 0, 0) ON CONFLICT(id) DO UPDATE SET query = excluded.query, ref = excluded.ref`,
+        sql: `INSERT INTO subscriptions (id, query, ref, cursor, complete) VALUES (?, ?, ?, 0, 0) ON CONFLICT(id) DO UPDATE SET query = excluded.query, ref = excluded.ref, retired = 0`,
         params: [id, JSON.stringify(query), JSON.stringify(ref)],
       },
     ])
@@ -312,18 +319,60 @@ export class LocalStore {
   }
 
   removeSubscription(id: string): Effect.Effect<void, StoreError> {
-    return this.run([
-      ...this.transferStatements(id),
-      ...this.gcStatementsForSubscription(id),
-      { sql: `DELETE FROM membership WHERE subscription = ?`, params: [id] },
-      { sql: `DELETE FROM subscriptions WHERE id = ?`, params: [id] },
-    ])
+    return this.collectRetired(id)
+  }
+
+  /** Keep inherited memberships in place until no live window needs the base chain. */
+  private collectRetired(retireId?: string): Effect.Effect<void, StoreError> {
+    return Effect.gen({ self: this }, function* () {
+      const rows = yield* this.query(`SELECT id, based_on, retired FROM subscriptions`)
+      const nodes = new Map(
+        rows.map((row) => [
+          str(row["id"]),
+          {
+            parent: typeof row["based_on"] === "string" ? row["based_on"] : null,
+            retired: row["retired"] === 1 || row["id"] === retireId,
+          },
+        ]),
+      )
+      const dependents = new Map<string, number>()
+      for (const node of nodes.values())
+        if (node.parent !== null)
+          dependents.set(node.parent, (dependents.get(node.parent) ?? 0) + 1)
+      const ready = [...nodes]
+        .filter(([id, node]) => node.retired && !dependents.get(id))
+        .map(([id]) => id)
+      const statements: Array<Statement> =
+        retireId === undefined
+          ? []
+          : [
+              {
+                sql: `UPDATE subscriptions SET retired = 1 WHERE id = ?`,
+                params: [retireId],
+              },
+            ]
+      while (ready.length > 0) {
+        const id = ready.pop()!
+        const node = nodes.get(id)!
+        statements.push(
+          ...this.gcStatementsForSubscription(id),
+          { sql: `DELETE FROM membership WHERE subscription = ?`, params: [id] },
+          { sql: `DELETE FROM subscriptions WHERE id = ?`, params: [id] },
+        )
+        nodes.delete(id)
+        if (node.parent !== null) {
+          const remaining = (dependents.get(node.parent) ?? 0) - 1
+          dependents.set(node.parent, remaining)
+          if (remaining === 0 && nodes.get(node.parent)?.retired) ready.push(node.parent)
+        }
+      }
+      if (statements.length > 0) yield* this.run(statements)
+    })
   }
 
   /**
-   * Hands the rows of a subscription to the subscriptions that extend it (`based_on`) before its
-   * membership goes away, and points them at its own base. The copy happens once, when a base
-   * retires or is replaced, not on every window growth.
+   * Hands the old rows to dependent windows before a new snapshot replaces this membership.
+   * Retirement keeps the base in place instead, avoiding a growing copy on every window.
    */
   private transferStatements(id: string): ReadonlyArray<Statement> {
     return [
@@ -428,7 +477,7 @@ export class LocalStore {
       },
       { sql: META_UPSERT, params: ["cursor", String(cursor)] },
     ]
-    return this.run(statements)
+    return this.run(statements).pipe(Effect.andThen(this.collectRetired()))
   }
 
   /** Applies one delta (one source transaction) atomically. */

@@ -353,6 +353,13 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.awaitLive(larger.id))
     expect(server.receivedBases.at(-1)).toBe(grown.id)
     expect(larger.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a", "b", "c", "d"])
+    // The retired base still owns a's cached membership. Its active descendants receive
+    // both row-only changes and removals through that inheritance chain.
+    server.commit([update("Chatbot", chatbot("a"), chatbot("a", { displayOrder: 7 }))])
+    await waitFor(() => larger.getSnapshot().rows[0]?.row["displayOrder"] === 7)
+    server.commit([remove("Chatbot", chatbot("a", { displayOrder: 7 }))])
+    await waitFor(() => larger.getSnapshot().rows.length === 3)
+    expect(larger.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["b", "c", "d"])
     await Effect.runPromise(engine.close())
   })
 
