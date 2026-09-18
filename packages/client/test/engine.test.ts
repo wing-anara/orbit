@@ -348,6 +348,61 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it.each([false, true])(
+    "preserves a pending growth base across expiry (retained target: %s)",
+    async (retained) => {
+      const server = new FakeSyncServer(schema, "org_1")
+      const { engine, log } = makeClient(server, nodeAsyncDriver(), 30_000)
+      const query = (limit: number) => ({
+        table: "Chatbot",
+        limit,
+        orderBy: [{ column: "id", direction: "asc" as const }],
+      })
+      await Effect.runPromise(engine.open())
+      const initial = await Effect.runPromise(engine.subscribe(query(retained ? 2100 : 2000)))
+      await waitFor(() => server.pendingFills.length === 1)
+      server.completeFill(
+        "Chatbot",
+        Array.from({ length: 2100 }, (_, i) => chatbot(String(i).padStart(4, "0"))),
+      )
+      await Effect.runPromise(engine.awaitLive(initial.id))
+      let small = initial
+      if (retained) {
+        await Effect.runPromise(initial.release())
+        small = await Effect.runPromise(engine.subscribe(query(2000)))
+        await Effect.runPromise(engine.awaitLive(small.id))
+        server.dropAll()
+        await waitFor(() => log.some(([event]) => event === "subscription.resumed"))
+        await Effect.runPromise(engine.awaitLive(small.id))
+      }
+      const receive = server.receive.bind(server)
+      let interrupted = false
+      server.receive = (socket, text) => {
+        const message = JSON.parse(text)
+        if (!interrupted && message.type === "subscribe" && message.query.limit === 2100) {
+          interrupted = true
+          socket.dropFromServer(4408)
+          return
+        }
+        receive(socket, text)
+      }
+      log.length = 0
+      const grown = await Effect.runPromise(engine.subscribe(query(2100)))
+      // The pending child must keep its base alive even after the UI releases it.
+      await Effect.runPromise(small.release())
+      await waitFor(() => interrupted)
+      await Effect.runPromise(engine.awaitLive(grown.id))
+      expect(grown.getSnapshot().rows).toHaveLength(2100)
+      expect(grown.getSnapshot().rows.at(-1)?.row["id"]).toBe("2099")
+      const snapshots = log.filter(
+        ([event, data]) => event === "snapshot.applied" && data["subscription"] === grown.id,
+      )
+      expect(snapshots).toHaveLength(1)
+      expect(snapshots[0]?.[1]).toMatchObject({ rows: 100, basedOn: small.id })
+      await Effect.runPromise(engine.close())
+    },
+  )
+
   it("recovers a failed local delta transaction from a fresh snapshot instead of dropping it", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const driver = nodeAsyncDriver()

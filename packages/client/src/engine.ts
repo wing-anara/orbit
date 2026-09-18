@@ -429,6 +429,19 @@ export class ClientEngine {
       if (!sub.onWire) sub.dirty = true
       sub.pendingChunks = null
     }
+    // A disconnect can interrupt a growing snapshot. Re-establish its pinned
+    // base first, then preserve the extension instead of replaying the whole
+    // larger window. Map insertion order is not enough for reactivated views.
+    const ordered: Array<Subscription> = []
+    const visited = new Set<string>()
+    const visit = (sub: Subscription): void => {
+      if (!sub.onWire || visited.has(sub.id)) return
+      visited.add(sub.id)
+      const base = sub.basedOn === null ? undefined : this.subscriptions.get(sub.basedOn)
+      if (base !== undefined) visit(base)
+      ordered.push(sub)
+    }
+    for (const sub of this.subscriptions.values()) visit(sub)
     send({
       type: "hello",
       protocolVersion: CLIENT_PROTOCOL_VERSION,
@@ -437,16 +450,17 @@ export class ClientEngine {
       partition: this.config.partition,
       schema: summary,
       cursor: this.cursor,
-      subscriptions: [...this.subscriptions.values()]
-        .filter((s) => s.onWire)
-        .map((s) => ({
-          type: "subscribe" as const,
-          id: s.id,
-          query: s.ref,
-          ...(s.status !== "live" || s.dirty || s.resumeVersion === null
-            ? {}
-            : { resume: { version: s.resumeVersion, query: s.planned.query } }),
-        })),
+      subscriptions: ordered.map((s) => ({
+        type: "subscribe" as const,
+        id: s.id,
+        query: s.ref,
+        ...(s.basedOn !== null && this.subscriptions.get(s.basedOn)?.onWire
+          ? { basedOn: s.basedOn }
+          : {}),
+        ...(s.status !== "live" || s.dirty || s.resumeVersion === null
+          ? {}
+          : { resume: { version: s.resumeVersion, query: s.planned.query } }),
+      })),
     })
     for (const s of this.subscriptions.values()) if (s.status === "live") s.status = "stale"
     this.notifyAll()
