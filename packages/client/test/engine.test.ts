@@ -1903,6 +1903,44 @@ describe("shared browser clients", () => {
     }
   })
 
+  it.each(["owner", "follower"] as const)(
+    "retains a prefetched snapshot through a same-turn %s consumer handoff",
+    async (role) => {
+      const env = await setup()
+      const owner = await env.open()
+      const client = role === "owner" ? owner : await env.open()
+      const query = clientQueries.documents({ type: "DOCUMENT" })
+      try {
+        const prefetch = client.liveQuery(query)
+        await waitFor(() => env.server.pendingFills.length === 2)
+        env.server.completeFill("Chatbot", [chatbot("a")])
+        env.server.completeFill("orbit_clients", [])
+        await waitFor(() => prefetch.getSnapshot().status === "live")
+        const snapshot = prefetch.getSnapshot()
+        // React runs passive cleanups before their replacement effects. There is
+        // briefly no holder while a prefetched window becomes the visible query.
+        const releasing = prefetch.release()
+        const view = client.liveQuery(query)
+        expect(view.getSnapshot()).toBe(snapshot)
+        await releasing
+        await settle(100)
+        expect(
+          env.server.receivedRefs.filter((ref) => "name" in ref && ref.name === "documents"),
+        ).toHaveLength(1)
+        await client.mutate.createDocument({ id: "0-new", groupId: null }).server
+        await waitFor(() => view.getSnapshot().rows[0]?.id === "0-new")
+        // A real release still drops the facade cache; this is not an unbounded TTL.
+        await view.release()
+        const fresh = client.liveQuery(query)
+        expect(fresh.getSnapshot().status).toBe("pending")
+        await fresh.release()
+      } finally {
+        await client.close()
+        if (client !== owner) await owner.close()
+      }
+    },
+  )
+
   it("three tabs share a client id, socket, optimistic writes and dense mutation ids", async () => {
     const env = await setup()
     const clients = await Promise.all([env.open(), env.open(), env.open()])

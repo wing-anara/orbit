@@ -327,6 +327,11 @@ export const createSharedOrbitClient = async <
         for (const listener of listeners) entry.listeners.delete(listener)
         listeners.clear()
         if (--entry.refs > 0) return
+        // React cleans up a prefetch before acquiring the visible query in the
+        // same passive-effect flush. Preserve its ready snapshot through that
+        // handoff, without retaining unused views beyond this microtask.
+        await Promise.resolve()
+        if (entry.refs > 0 || queries.get(entry.id) !== entry) return
         queries.delete(entry.id)
         queryIds.delete(key)
         if (ready) coordinator.command({ type: "release", id: entry.id })
