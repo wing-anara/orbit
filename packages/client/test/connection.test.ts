@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Deferred, Effect, Stream } from "effect"
 import { expect, it } from "vitest"
 
 import { makeConnection } from "../src/connection.ts"
@@ -63,4 +63,50 @@ it("delivers large snapshots and subsequent frames in socket order", async () =>
     { type: "snapshot", complete: true },
     { type: "pong" },
   ])
+})
+
+it("holds application messages and heartbeats until hello passes a busy client lock", async () => {
+  const socket = new Socket()
+  const sent: Array<{ type: string }> = []
+  socket.send = (data?: string) => {
+    sent.push(JSON.parse(data!))
+  }
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const release = yield* Deferred.make<void>()
+        const connection = yield* makeConnection({
+          target: () => Effect.succeed({ url: "ws://test", protocols: [] }),
+          makeWebSocket: () => socket as unknown as WebSocket,
+          pingIntervalMs: 5,
+          onOpen: (send) =>
+            Deferred.await(release).pipe(
+              Effect.andThen(
+                Effect.sync(() =>
+                  send({
+                    type: "hello",
+                    protocolVersion: 1,
+                    clientId: "test",
+                    token: "",
+                    partition: "org",
+                    schema: { schemaHash: "test", tables: [] },
+                    cursor: null,
+                    subscriptions: [],
+                  }),
+                ),
+              ),
+            ),
+        })
+        yield* Effect.sleep("10 millis")
+        socket.dispatchEvent(new Event("open"))
+        yield* Effect.sleep("25 millis")
+        expect(yield* connection.send({ type: "unsubscribe", id: "old" })).toBe(false)
+        expect(sent).toEqual([])
+        yield* Deferred.succeed(release, undefined)
+        yield* Effect.sleep("10 millis")
+        expect(yield* connection.send({ type: "unsubscribe", id: "old" })).toBe(true)
+        expect(sent[0]?.type).toBe("hello")
+      }),
+    ),
+  )
 })

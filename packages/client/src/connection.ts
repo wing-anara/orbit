@@ -7,7 +7,7 @@
  * queue; malformed messages are surfaced as typed errors, never dropped.
  */
 
-import { Data, Effect, Queue, Ref, Schema, Stream, type Scope } from "effect"
+import { Data, Effect, Fiber, Queue, Ref, Schema, Stream, type Scope } from "effect"
 import {
   CloseCode,
   ClientMessage,
@@ -106,6 +106,7 @@ export const makeConnection = (
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<ConnectionEvent>()
     let generation = 0
+    let readySocket: WebSocket | null = null
     let terminateAttempt: (() => void) | null = null
     const state = yield* Ref.make<ConnectionState>({ status: "connecting", attempt: 0 })
     const socket = yield* Ref.make<WebSocket | null>(null)
@@ -138,7 +139,7 @@ export const makeConnection = (
     const send = (message: ClientMessageType): Effect.Effect<boolean> =>
       Ref.get(socket).pipe(
         Effect.map((ws) => {
-          if (ws === null || ws.readyState !== WebSocket.OPEN) return false
+          if (ws === null || ws !== readySocket || ws.readyState !== WebSocket.OPEN) return false
           ws.send(JSON.stringify(encodeClient(message)))
           return true
         }),
@@ -162,8 +163,11 @@ export const makeConnection = (
         // Each attempt owns a fresh socket, so exactly one listener per event is attached to it.
         const closed = yield* Effect.callback<AttemptResult>((resume) => {
           let settled = false
+          let opening: ReturnType<typeof Effect.runFork> | null = null
           const detach = () => {
             terminateAttempt = null
+            if (readySocket === ws) readySocket = null
+            if (opening !== null) Effect.runFork(Fiber.interrupt(opening))
             if (heartbeat !== null) clearInterval(heartbeat)
             if (hasWindow) window.removeEventListener("offline", onOffline)
             ws.removeEventListener("open", onOpen)
@@ -193,7 +197,7 @@ export const makeConnection = (
             opened = true
             lastPongAt = Date.now()
             heartbeat = setInterval(() => {
-              if (ws.readyState !== WebSocket.OPEN) return
+              if (ws !== readySocket || ws.readyState !== WebSocket.OPEN) return
               if (lastPingAt > lastPongAt && Date.now() - lastPingAt > pongTimeout) {
                 terminate(4000, "heartbeat timeout")
                 return
@@ -205,10 +209,24 @@ export const makeConnection = (
                 terminate(4000, "send failed")
               }
             }, pingInterval)
-            Effect.runFork(
-              setState({ status: "open" }).pipe(
-                Effect.andThen(config.onOpen((m) => ws.send(JSON.stringify(encodeClient(m))))),
-              ),
+            opening = Effect.runFork(
+              config
+                .onOpen((m) => {
+                  if (
+                    settled ||
+                    generation !== attemptGeneration ||
+                    ws.readyState !== WebSocket.OPEN
+                  )
+                    return
+                  // Application sends and heartbeats must never overtake a hello waiting on SQLite.
+                  ws.send(JSON.stringify(encodeClient(m)))
+                  if (m.type === "hello") readySocket = ws
+                })
+                .pipe(
+                  Effect.andThen(
+                    Effect.suspend(() => (settled ? Effect.void : setState({ status: "open" }))),
+                  ),
+                ),
             )
           }
           const onMessage = (event: MessageEvent<unknown>) => {
