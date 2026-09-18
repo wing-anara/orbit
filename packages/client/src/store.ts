@@ -486,6 +486,27 @@ export class LocalStore {
     rows: ReadonlyArray<RowUpdate>,
     memberships: ReadonlyArray<MembershipChange>,
   ): Effect.Effect<void, StoreError> {
+    return this.run(this.deltaStatements(cursor, rows, memberships))
+  }
+
+  /** A bounded queued burst commits together, preserving every transaction's statement order. */
+  applyDeltas(
+    deltas: ReadonlyArray<{
+      readonly cursor: number
+      readonly rows: ReadonlyArray<RowUpdate>
+      readonly memberships: ReadonlyArray<MembershipChange>
+    }>,
+  ): Effect.Effect<void, StoreError> {
+    return this.run(
+      deltas.flatMap((delta) => this.deltaStatements(delta.cursor, delta.rows, delta.memberships)),
+    )
+  }
+
+  private deltaStatements(
+    cursor: number,
+    rows: ReadonlyArray<RowUpdate>,
+    memberships: ReadonlyArray<MembershipChange>,
+  ): Array<Statement> {
     const statements: Array<Statement> = []
     const removed: Array<MemberRef> = []
     for (const m of memberships) {
@@ -514,7 +535,7 @@ export class LocalStore {
       })
     }
     statements.push({ sql: META_UPSERT, params: ["cursor", String(cursor)] })
-    return this.run(statements)
+    return statements
   }
 
   /**

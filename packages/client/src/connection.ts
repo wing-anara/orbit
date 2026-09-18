@@ -61,9 +61,10 @@ export interface ConnectionConfig {
   readonly pongTimeoutMs?: number
 }
 
-export type ConnectionEvent =
+export type ConnectionEvent = (
   | { readonly type: "state"; readonly state: ConnectionState }
   | { readonly type: "message"; readonly message: ServerMessageType }
+) & { readonly generation: number }
 
 const decodeServer = Schema.decodeUnknownEffect(ServerMessage)
 const encodeClient = Schema.encodeSync(ClientMessage)
@@ -79,6 +80,8 @@ const FATAL_CLOSE_CODES = new Set<number>([
 export interface Connection {
   readonly events: Stream.Stream<ConnectionEvent>
   readonly send: (message: ClientMessageType) => Effect.Effect<boolean>
+  readonly reconnect: Effect.Effect<void>
+  readonly generation: () => number
   readonly state: Effect.Effect<ConnectionState>
 }
 
@@ -102,6 +105,8 @@ export const makeConnection = (
 ): Effect.Effect<Connection, never, Scope.Scope> =>
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<ConnectionEvent>()
+    let generation = 0
+    let terminateAttempt: (() => void) | null = null
     const state = yield* Ref.make<ConnectionState>({ status: "connecting", attempt: 0 })
     const socket = yield* Ref.make<WebSocket | null>(null)
     const backoffMin = config.backoffMinMs ?? 500
@@ -126,7 +131,7 @@ export const makeConnection = (
 
     const setState = (s: ConnectionState): Effect.Effect<void> =>
       Ref.set(state, s).pipe(
-        Effect.andThen(Queue.offer(events, { type: "state", state: s })),
+        Effect.andThen(Queue.offer(events, { type: "state", state: s, generation })),
         Effect.asVoid,
       )
 
@@ -142,6 +147,7 @@ export const makeConnection = (
     /** One connection attempt: resolves when the socket closes (with the close reason). */
     const attempt = (n: number): Effect.Effect<AttemptResult, ConnectionError> =>
       Effect.gen(function* () {
+        const attemptGeneration = ++generation
         yield* setState(attemptState(n))
         // The browser already knows it is offline: do not open a socket that cannot connect.
         // The loop then waits for the `online` event instead of a full backoff.
@@ -157,6 +163,7 @@ export const makeConnection = (
         const closed = yield* Effect.callback<AttemptResult>((resume) => {
           let settled = false
           const detach = () => {
+            terminateAttempt = null
             if (heartbeat !== null) clearInterval(heartbeat)
             if (hasWindow) window.removeEventListener("offline", onOffline)
             ws.removeEventListener("open", onOpen)
@@ -180,6 +187,7 @@ export const makeConnection = (
             if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
               ws.close(code, reason)
           }
+          terminateAttempt = () => terminate(4000, "local apply failed")
           const onOffline = () => terminate(4001, "offline")
           const onOpen = () => {
             opened = true
@@ -216,6 +224,7 @@ export const makeConnection = (
                 if (parsedResult._tag === "Failure") {
                   yield* Queue.offer(events, {
                     type: "message",
+                    generation: attemptGeneration,
                     message: {
                       type: "error",
                       error: { code: "invalid_message", message: "server sent non-JSON" },
@@ -228,6 +237,7 @@ export const makeConnection = (
                 if (decoded._tag === "Failure") {
                   yield* Queue.offer(events, {
                     type: "message",
+                    generation: attemptGeneration,
                     message: {
                       type: "error",
                       error: {
@@ -240,7 +250,11 @@ export const makeConnection = (
                   return
                 }
                 if (decoded.success.type === "pong") lastPongAt = Date.now()
-                yield* Queue.offer(events, { type: "message", message: decoded.success })
+                yield* Queue.offer(events, {
+                  type: "message",
+                  message: decoded.success,
+                  generation: attemptGeneration,
+                })
               }),
             )
           }
@@ -308,5 +322,15 @@ export const makeConnection = (
       }),
     )
 
-    return { events: Stream.fromQueue(events), send, state: Ref.get(state) }
+    return {
+      events: Stream.fromQueue(events),
+      send,
+      state: Ref.get(state),
+      generation: () => generation,
+      reconnect: Effect.sync(() => {
+        // Invalidate queued frames immediately; their cursor is no longer safe after an apply failure.
+        generation++
+        terminateAttempt?.()
+      }),
+    }
   })

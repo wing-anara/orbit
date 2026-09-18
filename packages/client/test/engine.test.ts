@@ -216,6 +216,74 @@ const reloadable = (driver: AsyncSqlDriver): AsyncSqlDriver => ({
 })
 
 describe("client engine end to end with the Durable Object core", () => {
+  it("recovers a failed local delta transaction from a fresh snapshot instead of dropping it", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const driver = nodeAsyncDriver()
+    let rejectNext = false
+    const { engine, log } = makeClient(server, {
+      ...driver,
+      batch: async (statements) => {
+        if (rejectNext) {
+          rejectNext = false
+          throw new Error("transient local write failure")
+        }
+        await driver.batch(statements)
+      },
+    })
+    await Effect.runPromise(engine.open())
+    const docs = await Effect.runPromise(engine.subscribe({ table: "Chatbot" }))
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill("Chatbot", [chatbot("deleted")])
+    await Effect.runPromise(engine.awaitLive(docs.id))
+    const stale: Array<string> = []
+    docs.subscribe(() => stale.push(docs.getSnapshot().status))
+    rejectNext = true
+    server.commit([remove("Chatbot", chatbot("deleted"))])
+    server.commit([insert("Chatbot", chatbot("survives"))])
+    await waitFor(() => log.some(([event]) => event === "message.failed"))
+    await waitFor(
+      () =>
+        docs.getSnapshot().status === "live" &&
+        docs.getSnapshot().rows.length === 1 &&
+        docs.getSnapshot().rows[0]?.row["id"] === "survives",
+    )
+    expect(stale).toContain("stale")
+    expect(engine.getStatus().cursor).toBe(2)
+    expect((await driver.query("SELECT id FROM t_Chatbot")).map((r) => r["id"])).toEqual([
+      "survives",
+    ])
+    await Effect.runPromise(engine.close())
+  })
+
+  it("drains queued import deltas without refreshing a view for every transaction", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine, driver, log } = makeClient(server)
+    await Effect.runPromise(engine.open())
+    const docs = await Effect.runPromise(
+      engine.subscribe({ table: "Chatbot", orderBy: [{ column: "id", direction: "asc" }] }),
+    )
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill("Chatbot", [])
+    await Effect.runPromise(engine.awaitLive(docs.id))
+    let refreshes = 0
+    docs.subscribe(() => refreshes++)
+    for (let i = 0; i < 32; i++) server.commit([insert("Chatbot", chatbot(`import-${i}`))])
+    for (let i = 0; i < 32; i++) server.commit([remove("Chatbot", chatbot(`import-${i}`))])
+    server.commit([insert("Chatbot", chatbot("healthy"))])
+    await waitFor(() => engine.getStatus().cursor === 65)
+    expect(docs.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["healthy"])
+    expect((await driver.query("SELECT id FROM t_Chatbot")).map((r) => r["id"])).toEqual([
+      "healthy",
+    ])
+    expect(refreshes).toBeLessThan(10)
+    const applied = log
+      .filter(([event]) => event === "delta.applied")
+      .map(([, data]) => Number(data["transactions"]))
+    expect(applied.reduce((sum, n) => sum + n, 0)).toBe(65)
+    expect(Math.max(...applied)).toBeLessThanOrEqual(32)
+    await Effect.runPromise(engine.close())
+  })
+
   it("bootstraps through a fill, serves live queries locally and applies deltas atomically", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const { engine, driver } = makeClient(server)

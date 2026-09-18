@@ -12,6 +12,42 @@ const schema = Schema.decodeUnknownSync(SyncSchema)(
   ),
 )
 
+it("rolls back the entire queued burst when a later transaction fails", async () => {
+  const driver = nodeAsyncDriver()
+  const store = new LocalStore(driver, schema, "org_1")
+  try {
+    await Effect.runPromise(store.open({ clientId: "burst-rollback" }))
+    await Effect.runPromise(
+      store.registerSubscription("view", { table: "organization" }, { table: "organization" }),
+    )
+    const member = { table: "organization", key: ["org_1"] }
+    const row = {
+      ...member,
+      row: { id: "org_1", name: "before", created_at: "2026-01-01 00:00:00", hipaa_enabled: false },
+    }
+    await Effect.runPromise(store.applySnapshot("view", 1, [row], [member]))
+    driver.db.exec(
+      "CREATE TEMP TRIGGER reject_bad BEFORE UPDATE ON t_organization WHEN NEW.name = 'bad' BEGIN SELECT RAISE(ABORT, 'test failure'); END",
+    )
+    await expect(
+      Effect.runPromise(
+        store.applyDeltas([
+          {
+            cursor: 2,
+            rows: [{ ...row, row: { ...row.row, name: "intermediate" } }],
+            memberships: [],
+          },
+          { cursor: 3, rows: [{ ...row, row: { ...row.row, name: "bad" } }], memberships: [] },
+        ]),
+      ),
+    ).rejects.toThrow("test failure")
+    expect(driver.db.prepare("SELECT name FROM t_organization").get()?.["name"]).toBe("before")
+    expect(await Effect.runPromise(store.cursor())).toBe(1)
+  } finally {
+    driver.db.close()
+  }
+})
+
 describe("subscription garbage collection", () => {
   it("checks only candidate rows, preserving other owners and transferred window memberships", async () => {
     const driver = nodeAsyncDriver()

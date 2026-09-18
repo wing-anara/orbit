@@ -322,7 +322,7 @@ export class ClientEngine {
                 fatal: false,
               }),
           }),
-        onOpen: (send) => Effect.sync(() => this.sendHello(send)),
+        onOpen: (send) => this.lock.runEffect(Effect.sync(() => this.sendHello(send))),
         ...(this.config.makeWebSocket === undefined
           ? {}
           : { makeWebSocket: this.config.makeWebSocket }),
@@ -341,14 +341,49 @@ export class ClientEngine {
       }).pipe(Scope.provide(scope))
       this.send = connection.send
       const consumer = connection.events.pipe(
-        Stream.runForEach((event) =>
-          event.type === "state"
-            ? Effect.sync(() => this.onConnectionState(event.state))
-            : this.onMessage(event.message).pipe(
+        // Drain work already queued while SQLite was busy. Do not wait for a timer: an
+        // isolated edit still applies immediately. Snapshots and connection events are barriers.
+        Stream.runForEachArray((events) =>
+          Effect.gen({ self: this }, function* () {
+            for (let i = 0; i < events.length;) {
+              const event = events[i++]
+              if (event === undefined) break
+              if (event.generation !== connection.generation()) continue
+              if (event.type === "state") {
+                this.onConnectionState(event.state)
+                continue
+              }
+              let work: Effect.Effect<void, StoreError>
+              if (event.message.type === "delta") {
+                const deltas = [event.message]
+                let rows = event.message.rows.length
+                while (i < events.length && deltas.length < 32 && rows < 2000) {
+                  const next = events[i]
+                  if (next === undefined) break
+                  if (
+                    next.generation !== event.generation ||
+                    next.type !== "message" ||
+                    next.message.type !== "delta"
+                  )
+                    break
+                  deltas.push(next.message)
+                  rows += next.message.rows.length
+                  i++
+                }
+                work = this.onDeltas(deltas)
+              } else work = this.onMessage(event.message)
+              yield* work.pipe(
                 Effect.catch((e) =>
-                  Effect.sync(() => this.log("message.failed", { error: e.message })),
+                  Effect.sync(() => {
+                    this.log("message.failed", { error: e.message })
+                    for (const sub of this.subscriptions.values())
+                      if (sub.status === "live") sub.status = "stale"
+                    this.notifyAll()
+                  }).pipe(Effect.andThen(connection.reconnect)),
                 ),
-              ),
+              )
+            }
+          }),
         ),
       )
       yield* Effect.forkIn(consumer, scope)
@@ -715,49 +750,8 @@ export class ClientEngine {
           })
           return
         }
-        case "delta": {
-          const started = this.now()
-          yield* this.lock.runEffect(
-            Effect.gen({ self: this }, function* () {
-              yield* this.store.applyDelta(message.cursor, message.rows, message.memberships)
-              this.cursor = message.cursor
-              const rebased = yield* this.confirmMutations()
-              if (rebased) {
-                yield* this.refreshTables(null, true)
-                return
-              }
-              // Only the subscriptions this delta can change re-run their query: those whose
-              // membership changed and those that hold one of the rows. A large window over
-              // a busy table does not pay for every unrelated change.
-              const touchedSubs = new Set<string>(message.memberships.map((m) => m.subscriptionId))
-              const holders =
-                message.rows.length === 0
-                  ? new Set<string>()
-                  : yield* this.store.subscriptionsHolding(
-                      message.rows.map((r) => ({ table: r.table, key: r.key })),
-                    )
-              for (const sub of this.subscriptions.values()) {
-                if (sub.status !== "live") continue
-                if (!touchedSubs.has(sub.id) && !holders.has(sub.id)) continue
-                yield* this.refresh(sub)
-              }
-            }),
-          )
-          if (this.send !== null) yield* this.send({ type: "ack", cursor: message.cursor })
-          this.updateStatus({
-            cursor: this.cursor,
-            lastDeltaAt: this.now(),
-            lastCommitTimestamp: message.origin.commitTimestamp,
-          })
-          this.log("delta.applied", {
-            cursor: message.cursor,
-            gtid: message.origin.gtid,
-            rows: message.rows.length,
-            applyMs: this.now() - started,
-            appliedAtDo: message.origin.appliedAt,
-          })
-          return
-        }
+        case "delta":
+          return yield* this.onDeltas([message])
         case "subscription_error": {
           const sub = this.subscriptions.get(message.id)
           if (sub === undefined) return
@@ -778,6 +772,57 @@ export class ClientEngine {
         case "pong":
           return
       }
+    })
+  }
+
+  /** Apply queued source transactions in order, then publish their final consistent view. */
+  private onDeltas(
+    messages: ReadonlyArray<Extract<ServerMessage, { type: "delta" }>>,
+  ): Effect.Effect<void, StoreError> {
+    return Effect.gen({ self: this }, function* () {
+      const last = messages[messages.length - 1]
+      if (last === undefined) return
+      const started = this.now()
+      yield* this.lock.runEffect(
+        Effect.gen({ self: this }, function* () {
+          const touched = new Set<string>()
+          const refs = new Map<string, MemberRef>()
+          for (const message of messages) {
+            for (const change of message.memberships) touched.add(change.subscriptionId)
+            for (const row of message.rows)
+              refs.set(JSON.stringify([row.table, row.key]), { table: row.table, key: row.key })
+          }
+          // Capture holders before deletions as well as after additions, including derived windows.
+          const before = yield* this.store.subscriptionsHolding([...refs.values()])
+          for (const id of before) touched.add(id)
+          yield* this.store.applyDeltas(messages)
+          this.cursor = last.cursor
+          const rebased = yield* this.confirmMutations()
+          if (rebased) {
+            yield* this.refreshTables(null, true)
+            return
+          }
+          const after = yield* this.store.subscriptionsHolding([...refs.values()])
+          for (const id of after) touched.add(id)
+          for (const sub of this.subscriptions.values()) {
+            if (sub.status === "live" && touched.has(sub.id)) yield* this.refresh(sub)
+          }
+        }),
+      )
+      if (this.send !== null) yield* this.send({ type: "ack", cursor: last.cursor })
+      this.updateStatus({
+        cursor: this.cursor,
+        lastDeltaAt: this.now(),
+        lastCommitTimestamp: last.origin.commitTimestamp,
+      })
+      this.log("delta.applied", {
+        cursor: last.cursor,
+        gtid: last.origin.gtid,
+        rows: messages.reduce((n, message) => n + message.rows.length, 0),
+        transactions: messages.length,
+        applyMs: this.now() - started,
+        appliedAtDo: last.origin.appliedAt,
+      })
     })
   }
 
