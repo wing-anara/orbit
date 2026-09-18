@@ -5,7 +5,7 @@ use orbit_protocol::schema::{
     IntrospectedColumn, IntrospectedSchema, IntrospectedTable, infer_kind, parse_enum_values,
 };
 
-use crate::client::VitessEndpoint;
+use crate::client::{Client, VitessEndpoint};
 use crate::decode::{RawRow, decode_row};
 use crate::error::VStreamError;
 use crate::proto::query::{BoundQuery, Field};
@@ -21,6 +21,11 @@ pub struct QueryResult {
 /// Executes a read-only query and returns the fields and the raw cells.
 pub async fn query(endpoint: &VitessEndpoint, keyspace: &str, sql: &str) -> Result<QueryResult, VStreamError> {
     let mut client = endpoint.connect().await?;
+    query_with_client(&mut client, keyspace, sql).await
+}
+
+/// Executes over an existing multiplexed gRPC channel. Callers can cheaply clone the client.
+pub async fn query_with_client(client: &mut Client, keyspace: &str, sql: &str) -> Result<QueryResult, VStreamError> {
     let req = ExecuteRequest {
         session: Some(Session {
             target_string: keyspace.to_string(),

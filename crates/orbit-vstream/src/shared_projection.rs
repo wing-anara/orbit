@@ -1,15 +1,18 @@
 //! Source reads for the cross-partition routing cache. Every query is rooted in a permission
 //! path whose recipient differs from the row's owning partition. No whole-table copy is used.
 
+use crate::client::Client;
 use crate::error::VStreamError;
-use crate::execute::query;
+use crate::execute::{QueryResult, query_with_client};
 use crate::fill::sql_literal;
 use crate::normalize::{TableProjection, query_fields};
 use crate::subscriber::{SubscriberConfig, quote_ident};
+use futures::{StreamExt, TryStreamExt, stream};
 use orbit_protocol::cdc::RowChange;
 use orbit_protocol::schema::{SyncSchema, TableSchema};
 use orbit_protocol::value::{CellValue, Row};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 
 fn fail(message: impl Into<String>) -> VStreamError {
     VStreamError::Malformed(message.into())
@@ -179,57 +182,204 @@ pub async fn load(
     schema: &SyncSchema,
     changes: Option<&[RowChange]>,
 ) -> Result<Vec<(String, Row)>, VStreamError> {
-    let mut result = BTreeMap::new();
-    for request in queries(schema, changes)? {
-        let table = schema.table(&request.table).expect("validated table");
-        let keys = table
-            .primary_key
-            .iter()
-            .map(|c| col(&request.alias, c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut last: Option<Row> = None;
-        loop {
-            let after = if let Some(last) = &last {
-                let values = table
-                    .primary_key
-                    .iter()
-                    .map(|c| literal(table, c, last))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                format!(" AND ({keys}) > ({values})")
-            } else {
-                String::new()
-            };
-            let sql = format!("{}{after} ORDER BY {keys} LIMIT 1000", request.sql);
-            let page = query(&config.endpoint, &config.keyspace, &sql).await?;
-            let projection = TableProjection::build(table, &query_fields(table, &page.fields)?)?;
-            for raw in &page.rows {
-                let row = projection.project(raw)?;
-                let key = table
-                    .primary_key
-                    .iter()
-                    .map(|c| row.get(c).expect("projected key"))
-                    .collect::<Vec<_>>();
-                result.insert(
-                    (table.name.clone(), serde_json::to_string(&key).expect("key serializes")),
-                    row.clone(),
-                );
-                last = Some(row);
-            }
-            if page.rows.len() < 1000 {
-                break;
-            }
-        }
+    let requests = queries(schema, changes)?;
+    if requests.is_empty() {
+        return Ok(vec![]);
     }
+    let client = config.endpoint.connect().await?;
+    load_requests(schema, requests, |sql| {
+        let mut client = client.clone();
+        async move { query_with_client(&mut client, &config.keyspace, &sql).await }
+    })
+    .await
+}
+
+/// Reuses the distributor's channel across transactions. A bounded set of independent reads
+/// shares its HTTP/2 connection; transaction routing itself remains strictly ordered.
+pub async fn load_with_client(
+    client: &Client,
+    keyspace: &str,
+    schema: &SyncSchema,
+    changes: Option<&[RowChange]>,
+) -> Result<Vec<(String, Row)>, VStreamError> {
+    load_requests(schema, queries(schema, changes)?, |sql| {
+        let mut client = client.clone();
+        async move { query_with_client(&mut client, keyspace, &sql).await }
+    })
+    .await
+}
+
+const READ_CONCURRENCY: usize = 4;
+
+async fn load_requests<F, Fut>(
+    schema: &SyncSchema,
+    requests: Vec<SharedQuery>,
+    execute: F,
+) -> Result<Vec<(String, Row)>, VStreamError>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<QueryResult, VStreamError>>,
+{
+    let result = stream::iter(requests)
+        .map(|request| {
+            let execute = &execute;
+            async move {
+                let mut result = BTreeMap::new();
+                let table = schema.table(&request.table).expect("validated table");
+                let keys = table
+                    .primary_key
+                    .iter()
+                    .map(|c| col(&request.alias, c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut last: Option<Row> = None;
+                loop {
+                    let after = if let Some(last) = &last {
+                        let values = table
+                            .primary_key
+                            .iter()
+                            .map(|c| literal(table, c, last))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .join(", ");
+                        format!(" AND ({keys}) > ({values})")
+                    } else {
+                        String::new()
+                    };
+                    let sql = format!("{}{after} ORDER BY {keys} LIMIT 1000", request.sql);
+                    let page = execute(sql).await?;
+                    let projection = TableProjection::build(table, &query_fields(table, &page.fields)?)?;
+                    for raw in &page.rows {
+                        let row = projection.project(raw)?;
+                        let key = table
+                            .primary_key
+                            .iter()
+                            .map(|c| row.get(c).expect("projected key"))
+                            .collect::<Vec<_>>();
+                        result.insert(
+                            (table.name.clone(), serde_json::to_string(&key).expect("key serializes")),
+                            row.clone(),
+                        );
+                        last = Some(row);
+                    }
+                    if page.rows.len() < 1000 {
+                        break;
+                    }
+                }
+                Ok::<_, VStreamError>(result)
+            }
+        })
+        .buffered(READ_CONCURRENCY)
+        // Drain in request order and deduplicate immediately. Retain at most four request
+        // results, not a second copy of every bootstrap projection until all reads complete.
+        .try_fold(BTreeMap::new(), |mut result, rows| async move {
+            result.extend(rows);
+            Ok(result)
+        })
+        .await?;
     Ok(result.into_iter().map(|((table, _), row)| (table, row)).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::query::{Field, Type};
     use orbit_protocol::cdc::RowOp;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    fn fields() -> Vec<Field> {
+        ["id", "org", "name"]
+            .into_iter()
+            .map(|name| Field {
+                name: name.into(),
+                r#type: Type::Varchar as i32,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hydration_is_bounded_and_deduplicates_in_request_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let requests = (0..12)
+            .map(|i| SharedQuery {
+                table: "doc".into(),
+                alias: "s0".into(),
+                sql: format!("SELECT {i}"),
+            })
+            .collect();
+        let result = load_requests(&schema(), requests, |sql| {
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(n, Ordering::SeqCst);
+                let i: usize = sql.split_whitespace().nth(1).unwrap().parse().unwrap();
+                tokio::time::sleep(Duration::from_millis((4 - i % 4) as u64 * 3)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(QueryResult {
+                    fields: fields(),
+                    rows: vec![vec![
+                        Some(bytes::Bytes::from_static(b"doc")),
+                        Some(bytes::Bytes::from_static(b"owner")),
+                        Some(i.to_string().into()),
+                    ]],
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), READ_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1.get("name"), Some(&CellValue::String("11".into())));
+    }
+
+    #[tokio::test]
+    async fn hydration_keeps_keyset_pagination_and_propagates_query_errors() {
+        let calls = AtomicUsize::new(0);
+        let request = SharedQuery {
+            table: "doc".into(),
+            alias: "s0".into(),
+            sql: "SELECT id, org, name FROM doc WHERE 1=1".into(),
+        };
+        let result = load_requests(&schema(), vec![request.clone()], |sql| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let range = if call == 0 {
+                    0..1000
+                } else {
+                    assert!(sql.contains("AND (`s0`.`id`) > ('0999')"));
+                    1000..1001
+                };
+                Ok(QueryResult {
+                    fields: fields(),
+                    rows: range
+                        .map(|i| {
+                            vec![
+                                Some(format!("{i:04}").into()),
+                                Some(bytes::Bytes::from_static(b"owner")),
+                                Some(bytes::Bytes::from_static(b"name")),
+                            ]
+                        })
+                        .collect(),
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result.len(), 1001);
+        let error = load_requests(&schema(), vec![request], |_| async { Err(fail("query failed")) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("query failed"));
+    }
     fn schema() -> SyncSchema {
         let c = |name: &str| json!({"name":name,"kind":"string","nullable":false,"source_type":"varchar(191)"});
         let mut schema:SyncSchema=serde_json::from_value(json!({"format_version":1,"schema_hash":"","app":"t","keyspace":"t",

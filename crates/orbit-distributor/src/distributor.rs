@@ -37,7 +37,7 @@ use orbit_vstream::execute::execute;
 use orbit_vstream::fill::sql_literal;
 use orbit_vstream::subscriber::{SubscriberConfig, current_position, quote_ident};
 use orbit_vstream::{StreamItem, VStreamError};
-use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::sync::{Notify, OnceCell, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -164,6 +164,7 @@ pub struct DistributorStatus {
 pub struct Distributor {
     shared: Arc<Shared>,
     fanout_source: Option<SubscriberConfig>,
+    fanout_client: OnceCell<orbit_vstream::client::Client>,
 }
 
 impl Distributor {
@@ -202,6 +203,7 @@ impl Distributor {
         let parent_tables = parent_tables(&schema).into_iter().collect();
         Ok(Self {
             fanout_source: None,
+            fanout_client: OnceCell::new(),
             shared: Arc::new(Shared {
                 schema,
                 config,
@@ -355,12 +357,30 @@ impl Distributor {
                 .fanout_source
                 .as_ref()
                 .ok_or_else(|| VStreamError::Malformed("missing shared-item hydration source".into()))?;
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                orbit_vstream::shared_projection::load(source, &shared.schema, Some(&tx.changes)),
-            )
+            let started = Instant::now();
+            let rows = tokio::time::timeout(Duration::from_secs(60), async {
+                let client = self.fanout_client.get_or_try_init(|| source.endpoint.connect()).await?;
+                orbit_vstream::shared_projection::load_with_client(
+                    client,
+                    &source.keyspace,
+                    &shared.schema,
+                    Some(&tx.changes),
+                )
+                .await
+            })
             .await
-            .map_err(|_| VStreamError::Timeout(Duration::from_secs(60)))??
+            .map_err(|_| VStreamError::Timeout(Duration::from_secs(60)))??;
+            let elapsed = started.elapsed();
+            metrics::histogram!("orbit_distributor_shared_hydration_seconds").record(elapsed.as_secs_f64());
+            if elapsed >= Duration::from_secs(1) {
+                warn!(
+                    ms = elapsed.as_millis() as u64,
+                    changes = tx.changes.len(),
+                    rows = rows.len(),
+                    "shared-item hydration delayed routing"
+                );
+            }
+            rows
         } else {
             vec![]
         };
