@@ -429,7 +429,7 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(first.engine.awaitLive(two.id))
     await Effect.runPromise(first.engine.close())
 
-    // The reload replays both, references only the first: the second retires after the TTL.
+    // Only the referenced view reconnects; the other cache retires after the TTL.
     const second = makeClient(server, driver, 60)
     await Effect.runPromise(second.engine.open())
     const again = await Effect.runPromise(second.engine.subscribe(byId(1)))
@@ -440,6 +440,81 @@ describe("client engine end to end with the Durable Object core", () => {
     expect(persisted.map((r) => r["id"])).toEqual([again.id])
     expect(again.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a"])
     await Effect.runPromise(second.engine.close())
+  })
+
+  it("replays only referenced views after reload and activates cached views on demand", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const driver = reloadable(nodeAsyncDriver())
+    const first = makeClient(server, driver, 60_000)
+    await Effect.runPromise(first.engine.open())
+    const queries = Array.from({ length: 20 }, (_, i) => ({
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" as const }],
+      limit: i + 1,
+    }))
+    const initial = await Effect.runPromise(first.engine.subscribe(queries[0]!))
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill("Chatbot", [chatbot("a"), chatbot("b")])
+    await Effect.runPromise(first.engine.awaitLive(initial.id))
+    for (const query of queries.slice(1)) {
+      const handle = await Effect.runPromise(first.engine.subscribe(query))
+      await Effect.runPromise(first.engine.awaitLive(handle.id))
+      await Effect.runPromise(handle.release())
+    }
+    await Effect.runPromise(first.engine.close())
+    server.receivedRefs.length = 0
+    const second = makeClient(server, driver, 60_000)
+    await Effect.runPromise(second.engine.open())
+    await waitFor(() => second.engine.getStatus().connection.status === "open")
+    await settle()
+    expect(server.receivedRefs).toEqual([])
+    expect(second.engine.getStatus().pendingSubscriptions).toBe(0)
+    const active = await Effect.runPromise(second.engine.subscribe(queries[0]!))
+    expect(active.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a"])
+    await Effect.runPromise(second.engine.awaitLive(active.id))
+    expect(server.receivedRefs).toEqual([queries[0]])
+    const other = await Effect.runPromise(second.engine.subscribe(queries[19]!))
+    await Effect.runPromise(second.engine.awaitLive(other.id))
+    expect(other.getSnapshot().rows).toHaveLength(2)
+    expect(server.receivedRefs).toEqual([queries[0], queries[19]])
+    await Effect.runPromise(second.engine.close())
+  })
+
+  it("does not replay released views on reconnect but catches them up when reopened", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const { engine } = makeClient(server, nodeAsyncDriver(), 60_000)
+    await Effect.runPromise(engine.open())
+    const small = {
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" as const }],
+      limit: 1,
+    }
+    const large = {
+      table: "Chatbot",
+      orderBy: [{ column: "id", direction: "asc" as const }],
+      limit: 10,
+    }
+    const active = await Effect.runPromise(engine.subscribe(small))
+    const cached = await Effect.runPromise(engine.subscribe(large))
+    await waitFor(() => server.pendingFills.length === 1)
+    server.completeFill("Chatbot", [chatbot("a")])
+    await Effect.runPromise(engine.awaitLive(active.id))
+    await Effect.runPromise(engine.awaitLive(cached.id))
+    await Effect.runPromise(cached.release())
+    server.reachable = false
+    server.dropAll()
+    await waitFor(() => engine.getStatus().connection.status === "reconnecting")
+    server.commit([insert("Chatbot", chatbot("b"))])
+    server.receivedRefs.length = 0
+    server.reachable = true
+    await waitFor(() => engine.getStatus().connection.status === "open")
+    await Effect.runPromise(engine.awaitLive(active.id))
+    expect(server.receivedRefs).toEqual([small])
+    const reopened = await Effect.runPromise(engine.subscribe(large))
+    await Effect.runPromise(engine.awaitLive(reopened.id))
+    expect(reopened.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["a", "b"])
+    expect(server.receivedRefs).toEqual([small, large])
+    await Effect.runPromise(engine.close())
   })
 
   it("reconnects after a drop and resumes with a consistent snapshot", async () => {

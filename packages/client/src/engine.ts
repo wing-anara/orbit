@@ -88,6 +88,7 @@ interface Subscription {
   pendingChunks: { rows: Array<RowUpdate>; members: Array<MemberRef> } | null
   /** Set while the subscription has no references and waits out `queryTtlMs`. */
   retention: ReturnType<typeof setTimeout> | null
+  onWire: boolean
   /** The cache changed under an unreferenced subscription; it reads again when referenced. */
   dirty: boolean
   /** The query as planned locally at registration; identifies a grown window of it. */
@@ -268,8 +269,7 @@ export class ClientEngine {
         const sub = this.register(persisted.id, persisted.ref, planned.success, 0)
         sub.status = persisted.complete ? "stale" : "pending"
         yield* this.refresh(sub)
-        // Restored for the query TTL, like a released query: the views the application opens
-        // again keep it, the rest retires instead of being replayed on every load.
+        // Restore cached views for offline use; only referenced views join the next connection.
         yield* this.retain(sub)
       }
       if (this.mutations !== null) yield* this.subscribeClientRow()
@@ -375,6 +375,11 @@ export class ClientEngine {
 
   private sendHello(send: (m: ClientMessage) => void): void {
     const summary = this.store.rt.summary()
+    for (const sub of this.subscriptions.values()) {
+      sub.onWire = sub.refs > 0
+      if (!sub.onWire) sub.dirty = true
+      sub.pendingChunks = null
+    }
     send({
       type: "hello",
       protocolVersion: CLIENT_PROTOCOL_VERSION,
@@ -383,11 +388,13 @@ export class ClientEngine {
       partition: this.config.partition,
       schema: summary,
       cursor: this.cursor,
-      subscriptions: [...this.subscriptions.values()].map((s) => ({
-        type: "subscribe" as const,
-        id: s.id,
-        query: s.ref,
-      })),
+      subscriptions: [...this.subscriptions.values()]
+        .filter((s) => s.onWire)
+        .map((s) => ({
+          type: "subscribe" as const,
+          id: s.id,
+          query: s.ref,
+        })),
     })
     for (const s of this.subscriptions.values()) if (s.status === "live") s.status = "stale"
     this.notifyAll()
@@ -441,6 +448,7 @@ export class ClientEngine {
       snapshot: { status: "pending", rows: [], error: null, cursor: null },
       pendingChunks: null,
       retention: null,
+      onWire: false,
       dirty: false,
       localQuery: planned.query,
       basedOn: null,
@@ -507,6 +515,9 @@ export class ClientEngine {
       if (fresh) {
         yield* this.store.registerSubscription(id, wire, planned.success.query)
         yield* this.refresh(sub)
+      }
+      if (!sub.onWire) {
+        sub.onWire = true
         const base = this.growthBase(sub)
         if (base !== null) {
           // A reference of its own keeps the base (and its rows) until the snapshot arrives.
@@ -576,7 +587,7 @@ export class ClientEngine {
     return Effect.gen({ self: this }, function* () {
       this.subscriptions.delete(sub.id)
       yield* this.unpin(sub)
-      if (this.send !== null) yield* this.send({ type: "unsubscribe", id: sub.id })
+      if (sub.onWire && this.send !== null) yield* this.send({ type: "unsubscribe", id: sub.id })
       yield* this.lock.runEffect(this.store.removeSubscription(sub.id)).pipe(Effect.ignore)
       this.updateStatus({ pendingSubscriptions: this.pendingCount() })
     })
@@ -584,7 +595,7 @@ export class ClientEngine {
 
   private pendingCount(): number {
     let n = 0
-    for (const s of this.subscriptions.values()) if (s.status !== "live") n += 1
+    for (const s of this.subscriptions.values()) if (s.refs > 0 && s.status !== "live") n += 1
     return n
   }
 
