@@ -58,6 +58,9 @@ import {
 } from "@orbit/query"
 import {
   canonicalJson,
+  KEY_COLUMN,
+  localTableName,
+  quoteIdent,
   createIndexesSql,
   decodeRowSync,
   planMigration,
@@ -942,7 +945,10 @@ export class SyncEngine {
   }
 
   /** Current members of a subscription, computed from the cache. */
-  private evaluate(planned: PlannedQuery): {
+  private evaluate(
+    planned: PlannedQuery,
+    skip?: ReadonlySet<string>,
+  ): {
     readonly members: Array<{
       readonly path: string
       readonly table: string
@@ -951,20 +957,46 @@ export class SyncEngine {
     }>
   } {
     const members: Array<{ path: string; table: string; key: string; record: SqlRecord }> = []
-    const primary = compileSelect(planned)
+    const options = { keysOnly: skip !== undefined }
+    const primary = compileSelect(planned, options)
     for (const record of this.db.query(primary.sql, primary.params))
       members.push({ path: "", table: planned.table.name, key: keyOfRecord(record), record })
     const keysByPath = new Map<string, Array<string>>([["", members.map((m) => m.key)]])
     for (const include of flattenIncludes(planned)) {
       const path = pathOf(include.path)
       const parents = keysByPath.get(pathOf(include.path.slice(0, -1))) ?? []
-      const inc = compileIncludeSelect(planned, include, {}, parents)
+      const inc = compileIncludeSelect(planned, include, options, parents)
       const keys: Array<string> = []
       for (const record of parents.length === 0 ? [] : this.db.query(inc.sql, inc.params)) {
         members.push({ path, table: include.target.name, key: keyOfRecord(record), record })
         keys.push(keyOfRecord(record))
       }
       keysByPath.set(path, keys)
+    }
+    if (skip !== undefined) {
+      // Window growth needs all membership keys, but the client already has the
+      // base's potentially large row images. Hydrate only rows the snapshot sends.
+      const needed = new Map<string, Set<string>>()
+      for (const m of members) {
+        if (skip.has(memberRef(m.table, m.key))) continue
+        const keys = needed.get(m.table) ?? new Set<string>()
+        keys.add(m.key)
+        needed.set(m.table, keys)
+      }
+      const records = new Map<string, SqlRecord>()
+      for (const [table, keys] of needed) {
+        for (const record of this.db.query(
+          `SELECT * FROM ${quoteIdent(localTableName(table))} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT value FROM json_each(?))`,
+          [JSON.stringify([...keys])],
+        ))
+          records.set(memberRef(table, keyOfRecord(record)), record)
+      }
+      for (const m of members) {
+        if (skip.has(memberRef(m.table, m.key))) continue
+        const record = records.get(memberRef(m.table, m.key))
+        if (record === undefined) throw new Error("snapshot lost a selected row")
+        m.record = record
+      }
     }
     return { members }
   }
@@ -975,7 +1007,7 @@ export class SyncEngine {
    * nothing but the rows that differ.
    */
   private materialize(sub: SubscriptionRow, skip?: ReadonlySet<string>): EngineEvent {
-    const { members } = this.evaluate(sub.planned)
+    const { members } = this.evaluate(sub.planned, skip)
     const wanted = new Set(members.map((m) => [m.path, m.table, m.key].join(" ")))
     const present = new Set<string>()
     for (const row of this.db.query(
@@ -1024,7 +1056,7 @@ export class SyncEngine {
         subscription: id,
         error: { code: "internal", message: "subscription is pending" },
       }
-    const { members } = this.evaluate(sub.planned)
+    const { members } = this.evaluate(sub.planned, skip)
     return this.snapshotFrom(id, members, skip)
   }
 

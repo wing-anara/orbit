@@ -351,7 +351,7 @@ export const compileIncludeSelect = (
   const parentTable = parentOf(planned, include)?.target ?? planned.table
   const parent =
     parentKeys === undefined
-      ? parentSelect(planned, include, options)
+      ? parentSelect(planned, include, { ...options, keysOnly: false })
       : {
           sql: {
             sql: `SELECT * FROM ${dialect.table(parentTable.name)} WHERE ${dialect.ident(KEY_COLUMN)} IN (SELECT value FROM json_each(?))`,
@@ -372,7 +372,12 @@ export const compileIncludeSelect = (
     where.push(
       compilePredicate(ctx, include.target, include.where, (c) => `${r}.${dialect.ident(c)}`),
     )
-  const sql = `SELECT ${selectList(dialect, include.target, r)} FROM ${dialect.table(include.target.name)} ${r} WHERE ${where.join(" AND ")} ORDER BY ${keyOrder(dialect, include.target, r)}`
+  if (options.keysOnly && !dialect.hasKeyColumn)
+    throw new Error("key projection requires the local cache dialect")
+  const projection = options.keysOnly
+    ? `${r}.${dialect.ident(KEY_COLUMN)}`
+    : selectList(dialect, include.target, r)
+  const sql = `SELECT ${projection} FROM ${dialect.table(include.target.name)} ${r} WHERE ${where.join(" AND ")} ORDER BY ${keyOrder(dialect, include.target, r)}`
   return { sql, params: ctx.params }
 }
 

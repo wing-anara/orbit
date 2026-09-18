@@ -1,5 +1,5 @@
 import { Result } from "effect"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import type { Query } from "@orbit/protocol"
 import type { RowUpdate } from "@orbit/protocol/client"
@@ -505,6 +505,52 @@ describe("SyncEngine: subscriptions and incremental maintenance", () => {
     expect(engine.status().subscriptions).toBe(1)
     engine.unsubscribe(Result.isSuccess(a) ? a.success.subscription : "")
     expect(engine.status().subscriptions).toBe(0)
+  })
+
+  it("reads only new row images when growing a window with nested includes", () => {
+    const { engine, driver } = makeEngine()
+    liveScope(engine, "Chatbot", [
+      chatbot("f0", { type: "GROUP", contents: "base folder" }),
+      chatbot("f1", { type: "GROUP", contents: "new folder" }),
+      ...Array.from({ length: 110 }, (_, i) =>
+        chatbot(`d${String(i).padStart(3, "0")}`, {
+          groupId: i < 100 ? "f0" : "f1",
+          contents: "x".repeat(4096),
+        }),
+      ),
+    ])
+    liveScope(engine, "organization", [organization("org_1")])
+    const query = (limit: number): Query => ({
+      table: "Chatbot",
+      where: { op: "eq", column: "type", value: "DOCUMENT" },
+      orderBy: [{ column: "id", direction: "asc" }],
+      limit,
+      include: [{ relation: "folder", include: ["organization"] }],
+    })
+    const base = engine.subscribe(query(100))
+    if (Result.isFailure(base)) throw base.failure
+    const read = driver.query.bind(driver)
+    let images = 0
+    const spy = vi.spyOn(driver, "query").mockImplementation((sql, params) => {
+      const rows = read(sql, params)
+      images += rows.filter((row) => Object.hasOwn(row, "contents")).length
+      return rows
+    })
+    const grown = engine.subscribe(query(110), { basedOn: base.success.subscription })
+    spy.mockRestore()
+    if (Result.isFailure(grown)) throw grown.failure
+    const snapshot = grown.success.events.find((event) => event.type === "snapshot")
+    if (snapshot?.type !== "snapshot") throw Error("missing snapshot")
+    expect(images).toBe(11) // ten documents and their newly included folder
+    expect(snapshot.rows).toHaveLength(11)
+    expect(snapshot.rows.find((row) => row.key[0] === "d109")?.row?.["contents"]).toBe(
+      "x".repeat(4096),
+    )
+    expect(snapshot.rows.some((row) => row.table === "organization")).toBe(false)
+    expect(snapshot.basedOn).toBe(base.success.subscription)
+    expect(engine.membershipOf(grown.success.subscription)).toEqual(
+      engine.recompute(grown.success.subscription),
+    )
   })
 
   it("extends a live window in place: seeded membership, snapshot of the extra members only", () => {

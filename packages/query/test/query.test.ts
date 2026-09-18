@@ -562,6 +562,9 @@ describe("relation predicates and nested includes", () => {
           const selected = compileIncludeSelect(p, inc, {}, keys)
           const actual = all(selected)
           expect(actual).toEqual(all(compileIncludeSelect(p, inc)))
+          const keyRows = actual.map((row) => ({ __key: row["__key"] }))
+          expect(all(compileIncludeSelect(p, inc, { keysOnly: true }, keys))).toEqual(keyRows)
+          expect(all(compileIncludeSelect(p, inc, { keysOnly: true }))).toEqual(keyRows)
           expect(all(compileIncludeSelect(p, inc, {}, []))).toEqual([])
           // The parent query's sort/limit and relation predicates are not evaluated again.
           expect(selected.sql).not.toContain("LIMIT")
