@@ -386,7 +386,7 @@ impl Distributor {
             .map_err(|_| VStreamError::Timeout(Duration::from_secs(60)))??;
             let elapsed = started.elapsed();
             metrics::histogram!("orbit_distributor_shared_hydration_seconds").record(elapsed.as_secs_f64());
-            if elapsed >= Duration::from_secs(1) {
+            if elapsed >= Duration::from_millis(100) {
                 warn!(
                     ms = elapsed.as_millis() as u64,
                     changes = tx.changes.len(),
@@ -407,6 +407,8 @@ impl Distributor {
         tx: SourceTransaction,
         hydrated: Vec<(String, Row)>,
     ) -> Result<(), DistributorError> {
+        let started = Instant::now();
+        let change_count = tx.changes.len();
         let shared = &self.shared;
         let parent_updates = self.parent_updates_of(&tx)?;
         let shard = ShardId {
@@ -515,6 +517,15 @@ impl Distributor {
         }
         drop(inner);
         shared.wake.notify_one();
+        let elapsed = started.elapsed();
+        metrics::histogram!("orbit_distributor_routing_seconds").record(elapsed.as_secs_f64());
+        if elapsed >= Duration::from_millis(100) {
+            warn!(
+                ms = elapsed.as_millis() as u64,
+                changes = change_count,
+                "local transaction routing delayed dispatch"
+            );
+        }
         Ok(())
     }
 }

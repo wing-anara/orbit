@@ -188,6 +188,13 @@ pub fn route_with_hydration(
     }
     let mut old: OverlayRows = BTreeMap::new();
     let tracked = tracked_tables(schema)?;
+    // Content-only updates cannot change reachability. Avoid walking the entire shared graph
+    // (or temporarily inserting private rows into it) for status polling, names and metadata.
+    let routing_changed = !hydrated.is_empty()
+        || source
+            .changes
+            .iter()
+            .any(|change| tracked.contains(&change.table) && changes_routing(schema, change));
     for (table, row) in hydrated {
         let key = row_key(schema, table, row)?;
         let identity = (table.clone(), json(&key)?);
@@ -199,6 +206,9 @@ pub fn route_with_hydration(
 
     for change in &source.changes {
         if !tracked.contains(&change.table) {
+            continue;
+        }
+        if !routing_changed && Snapshot(&tx).get(&change.table, &change.key)?.is_none() {
             continue;
         }
         let before_key = change
@@ -227,7 +237,9 @@ pub fn route_with_hydration(
         schema,
     };
     let routed = route_fanout(schema, &source.changes, &before, &Snapshot(&tx))?;
-    collect_unshared(&tx, schema)?;
+    if routing_changed {
+        collect_unshared(&tx, schema)?;
+    }
     tx.execute(
         "INSERT INTO fanout_journal(keyspace,shard,gtid,routed) VALUES (?1,?2,?3,?4)",
         params![source.keyspace, source.shard, source.gtid, json(&routed)?],
@@ -235,6 +247,28 @@ pub fn route_with_hydration(
     .map_err(error)?;
     tx.commit().map_err(error)?;
     Ok(routed)
+}
+
+fn changes_routing(schema: &SyncSchema, change: &RowChange) -> bool {
+    let (Some(before), Some(after), Some(table)) = (&change.before, &change.after, schema.table(&change.table)) else {
+        return true;
+    };
+    let mut columns = std::collections::BTreeSet::new();
+    columns.extend(table.primary_key.iter());
+    columns.insert(&table.partition_column);
+    for source in &schema.tables {
+        for relation in &source.relations {
+            if source.name == table.name {
+                columns.extend(relation.from_columns.iter());
+            }
+            if relation.target_table == table.name {
+                columns.extend(relation.to_columns.iter());
+            }
+        }
+    }
+    columns
+        .into_iter()
+        .any(|column| before.get(column) != after.get(column))
 }
 
 fn collect_unshared(db: &Connection, schema: &SyncSchema) -> Result<(), FanoutError> {
@@ -349,6 +383,55 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn content_updates_preserve_shared_fanout_without_caching_private_rows() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let schema = schema();
+        let permission = json!({"id":"p1","docId":"d1","org":"recipient","user":"alice"});
+        let original: Row = serde_json::from_value(json!({"id":"d1","org":"owner","name":"First"})).unwrap();
+        route_with_hydration(
+            &db,
+            &schema,
+            &transaction("source:1", permission.clone(), RowOp::Insert),
+            &[("doc".into(), original.clone())],
+        )
+        .unwrap();
+        let mut rename = transaction("source:2", permission.clone(), RowOp::Insert);
+        let mut renamed = original.clone();
+        renamed.insert("name".into(), "Renamed".into());
+        rename.changes = vec![RowChange {
+            table: "doc".into(),
+            op: RowOp::Update,
+            key: vec!["d1".into()],
+            before: Some(original),
+            after: Some(renamed.clone()),
+        }];
+        assert!(!changes_routing(&schema, &rename.changes[0]));
+        let result = route(&db, &schema, &rename).unwrap();
+        assert_eq!(result["recipient"][0].after.as_ref().unwrap()["name"], "Renamed");
+        let mut private = rename.clone();
+        private.gtid = "source:3".into();
+        private.changes[0].key = vec!["private".into()];
+        let change = &mut private.changes[0];
+        for row in change.before.iter_mut().chain(change.after.iter_mut()) {
+            row.insert("id".into(), "private".into());
+        }
+        assert!(route(&db, &schema, &private).unwrap().is_empty());
+        assert!(Snapshot(&db).get("doc", &vec!["private".into()]).unwrap().is_none());
+        let mut moved = rename.changes[0].clone();
+        moved.after.as_mut().unwrap().insert("org".into(), "recipient".into());
+        assert!(changes_routing(&schema, &moved));
+        let revoke = transaction("source:4", permission, RowOp::Delete);
+        assert_eq!(route(&db, &schema, &revoke).unwrap()["recipient"][0].op, RowOp::Delete);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM fanout_rows", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(route(&db, &schema, &rename).unwrap(), result);
+    }
+
     #[test]
     fn replay_after_later_revocation_uses_durable_original_decision() {
         let path = std::env::temp_dir().join(format!("orbit-fanout-{}.sqlite", std::process::id()));
