@@ -87,8 +87,8 @@ it("restores missing related rows without overwriting a still-live shared row", 
     const undo = new LocalMutationTx(driver, store, 3)
     await undo.localUndo.restore("organization", "root", { onlyMissing: true })
     await driver.batch(undo.statements)
-    expect((await undo.get("organization", { id: "org_1" }))?.name).toBe("newer shared value")
-    expect((await undo.get("organization", { id: "missing" }))?.name).toBe("🪐")
+    expect((await undo.get("organization", { id: "org_1" }))?.["name"]).toBe("newer shared value")
+    expect((await undo.get("organization", { id: "missing" }))?.["name"]).toBe("🪐")
   } finally {
     await driver.close()
   }
