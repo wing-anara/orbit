@@ -45,12 +45,17 @@ export const localTableName = (table: string): string => `t_${table}`
  */
 export const KEY_COLUMN = "__key"
 
-export const createTableSql = (table: TableSchema): string => {
+export interface StorageOptions {
+  /** Rowid tables keep large payloads in leaves instead of internal B-tree nodes. */
+  readonly rowid?: boolean
+}
+
+export const createTableSql = (table: TableSchema, options: StorageOptions = {}): string => {
   const cols = table.columns.map(
     (c) => `${quoteIdent(c.name)} ${sqliteType(c.kind)}${c.nullable ? "" : " NOT NULL"}`,
   )
   const unique = `UNIQUE (${table.primary_key.map(quoteIdent).join(", ")})`
-  return `CREATE TABLE IF NOT EXISTS ${quoteIdent(localTableName(table.name))} (${[`${quoteIdent(KEY_COLUMN)} TEXT NOT NULL PRIMARY KEY`, ...cols, unique].join(", ")}) WITHOUT ROWID`
+  return `CREATE TABLE IF NOT EXISTS ${quoteIdent(localTableName(table.name))} (${[`${quoteIdent(KEY_COLUMN)} TEXT NOT NULL PRIMARY KEY`, ...cols, unique].join(", ")})${options.rowid ? "" : " WITHOUT ROWID"}`
 }
 
 const indexSql = (table: string, columns: ReadonlyArray<string>): string =>
@@ -82,8 +87,8 @@ export const createIndexesSql = (schema: SyncSchema): ReadonlyArray<string> => {
   return out
 }
 
-export const allDdl = (schema: SyncSchema): ReadonlyArray<string> => [
-  ...schema.tables.map(createTableSql),
+export const allDdl = (schema: SyncSchema, options: StorageOptions = {}): ReadonlyArray<string> => [
+  ...schema.tables.map((table) => createTableSql(table, options)),
   ...createIndexesSql(schema),
 ]
 
@@ -118,18 +123,19 @@ export const planMigration = (
   schema: SyncSchema,
   existing: ReadonlyArray<ExistingTable>,
   storedHash: string | null,
+  options: StorageOptions = {},
 ): MigrationPlan => {
   if (storedHash === schema.schema_hash && existing.length > 0) return { action: "none" }
   const byName = new Map(
     existing.map((t) => [t.name, new Set(t.columns.filter((c) => c !== KEY_COLUMN))] as const),
   )
-  if (byName.size === 0) return { action: "create", statements: allDdl(schema) }
+  if (byName.size === 0) return { action: "create", statements: allDdl(schema, options) }
   const statements: Array<string> = []
   const added: Array<string> = []
   for (const t of schema.tables) {
     const cols = byName.get(localTableName(t.name))
     if (cols === undefined) {
-      statements.push(createTableSql(t))
+      statements.push(createTableSql(t, options))
       continue
     }
     for (const c of t.columns) {
@@ -137,7 +143,7 @@ export const planMigration = (
       if (!c.nullable) {
         return {
           action: "reset",
-          statements: resetStatements(schema, existing),
+          statements: resetStatements(schema, existing, options),
           reason: `column ${t.name}.${c.name} is required and cannot be added in place`,
         }
       }
@@ -150,7 +156,7 @@ export const planMigration = (
       if (!t.columns.some((c) => c.name === existingCol)) {
         return {
           action: "reset",
-          statements: resetStatements(schema, existing),
+          statements: resetStatements(schema, existing, options),
           reason: `column ${t.name}.${existingCol} was removed from the sync schema`,
         }
       }
@@ -169,9 +175,10 @@ export const planMigration = (
 const resetStatements = (
   schema: SyncSchema,
   existing: ReadonlyArray<ExistingTable>,
+  options: StorageOptions = {},
 ): ReadonlyArray<string> => [
   ...existing
     .filter((t) => t.name.startsWith("t_"))
     .map((t) => `DROP TABLE IF EXISTS ${quoteIdent(t.name)}`),
-  ...allDdl(schema),
+  ...allDdl(schema, options),
 ]

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs"
 import { Effect, Result, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { SyncSchema } from "@orbit/protocol"
+import { createTableSql } from "@orbit/schema"
 import { LocalStore } from "../src/store.ts"
 import type { Statement } from "../src/driver.ts"
 import { nodeAsyncDriver } from "./support/node-driver.ts"
@@ -225,6 +226,92 @@ it("adds cache-only retirement bookkeeping without discarding an existing cache"
     driver.db.exec("ALTER TABLE subscriptions DROP COLUMN retired")
     expect((await Effect.runPromise(store.open())).action).toBe("none")
     expect((await Effect.runPromise(store.subscriptions())).map((s) => s.id)).toEqual(["view"])
+  } finally {
+    driver.db.close()
+  }
+})
+
+it("migrates legacy cache layout atomically without losing offline work or resume state", async () => {
+  const driver = nodeAsyncDriver()
+  let failMigration = false
+  const batches: Array<ReadonlyArray<Statement>> = []
+  const store = new LocalStore(
+    {
+      ...driver,
+      batch: async (statements) => {
+        batches.push(statements)
+        if (failMigration && statements.some((s) => s.sql.includes("__orbit_layout_old"))) {
+          const at = statements.findIndex(
+            (s) => s.sql.startsWith("DROP TABLE") && s.sql.includes("__orbit_layout_old"),
+          )
+          await driver.batch([
+            ...statements.slice(0, at),
+            { sql: "INSERT INTO nonexistent VALUES (1)", params: [] },
+            ...statements.slice(at),
+          ])
+        } else await driver.batch(statements)
+      },
+    },
+    schema,
+    "org_1",
+  )
+  try {
+    await Effect.runPromise(store.open({ clientId: "durable-client" }))
+    await Effect.runPromise(
+      store.registerSubscription("view", { table: "organization" }, { table: "organization" }),
+    )
+    const member = { table: "organization", key: ["org_1"] }
+    await Effect.runPromise(
+      store.applySnapshot(
+        "view",
+        42,
+        [
+          {
+            ...member,
+            row: {
+              id: "org_1",
+              name: "Cached offline",
+              created_at: "2026-01-01 00:00:00",
+              hipaa_enabled: false,
+            },
+          },
+        ],
+        [member],
+      ),
+    )
+    driver.db.exec("INSERT INTO pending_mutations VALUES (7, 'rename', '{}', 123, 0)")
+    const table = schema.tables.find((t) => t.name === "organization")!
+    driver.db.exec(
+      `DROP VIEW v_organization; ALTER TABLE t_organization RENAME TO old_rows; ${createTableSql(table)}; INSERT INTO t_organization SELECT * FROM old_rows; DROP TABLE old_rows;`,
+    )
+    const saved = () => ({
+      rows: driver.db.prepare("SELECT * FROM t_organization").all(),
+      pending: driver.db.prepare("SELECT * FROM pending_mutations").all(),
+      membership: driver.db.prepare("SELECT * FROM membership").all(),
+      subscriptions: driver.db.prepare("SELECT * FROM subscriptions").all(),
+      meta: driver.db.prepare("SELECT * FROM meta ORDER BY key").all(),
+    })
+    const before = saved()
+    failMigration = true
+    await expect(Effect.runPromise(store.open())).rejects.toThrow("nonexistent")
+    expect(saved()).toEqual(before)
+    expect(
+      driver.db.prepare("SELECT wr FROM pragma_table_list WHERE name='t_organization'").get()?.[
+        "wr"
+      ],
+    ).toBe(1)
+    failMigration = false
+    const opened = await Effect.runPromise(store.open())
+    expect(opened).toMatchObject({ action: "none", cursor: 42, clientId: "durable-client" })
+    expect(saved()).toEqual(before)
+    expect(
+      driver.db.prepare("SELECT wr FROM pragma_table_list WHERE name='t_organization'").get()?.[
+        "wr"
+      ],
+    ).toBe(0)
+    batches.length = 0
+    await Effect.runPromise(store.open())
+    expect(batches.flat().some((s) => s.sql.includes("__orbit_layout_old"))).toBe(false)
   } finally {
     driver.db.close()
   }

@@ -45,6 +45,7 @@ import {
 import {
   allDdl,
   createIndexesSql,
+  createTableSql,
   KEY_COLUMN,
   localTableName,
   planMigration,
@@ -204,7 +205,7 @@ export class LocalStore {
       const stored = new Map(meta.map((r) => [str(r["key"]), str(r["value"])] as const))
       const storedPartition = stored.get("partition")
       const objects = yield* this.query(
-        `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')`,
+        `SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view')`,
       )
       const existing: Array<{ name: string; columns: ReadonlyArray<string> }> = []
       const overlays: Array<string> = []
@@ -229,11 +230,11 @@ export class LocalStore {
             action: "reset" as const,
             statements: [
               ...existing.map((t) => `DROP TABLE IF EXISTS ${quoteIdent(t.name)}`),
-              ...allDdl(this.schema),
+              ...allDdl(this.schema, { rowid: true }),
             ],
             reason: "partition changed",
           }
-        : planMigration(this.schema, existing, stored.get("schema_hash") ?? null)
+        : planMigration(this.schema, existing, stored.get("schema_hash") ?? null, { rowid: true })
       const statements: Array<Statement> = []
       // Views reference the tables the migration may drop; overlays are rebuilt from the log.
       for (const v of views)
@@ -242,6 +243,27 @@ export class LocalStore {
         statements.push({ sql: `DROP TABLE IF EXISTS ${quoteIdent(o)}`, params: [] })
       if (plan.action !== "none")
         for (const sql of plan.statements) statements.push({ sql, params: [] })
+      if (plan.action !== "reset" && plan.action !== "create") {
+        for (const table of this.schema.tables) {
+          const name = localTableName(table.name)
+          const object = objects.find((object) => object["name"] === name)
+          if (typeof object?.["sql"] !== "string" || !/WITHOUT\s+ROWID\s*$/i.test(object["sql"]))
+            continue
+          const old = `${name}__orbit_layout_old`
+          const columns = [KEY_COLUMN, ...table.columns.map((column) => column.name)]
+            .map(quoteIdent)
+            .join(", ")
+          statements.push(
+            { sql: `ALTER TABLE ${quoteIdent(name)} RENAME TO ${quoteIdent(old)}`, params: [] },
+            { sql: createTableSql(table, { rowid: true }), params: [] },
+            {
+              sql: `INSERT INTO ${quoteIdent(name)} (${columns}) SELECT ${columns} FROM ${quoteIdent(old)}`,
+              params: [],
+            },
+            { sql: `DROP TABLE ${quoteIdent(old)}`, params: [] },
+          )
+        }
+      }
       // Relation indexes are `IF NOT EXISTS`: an existing cache gains the ones it lacks.
       for (const sql of createIndexesSql(this.schema)) statements.push({ sql, params: [] })
       const fresh = plan.action === "reset" || plan.action === "create"
