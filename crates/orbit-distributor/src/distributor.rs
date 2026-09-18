@@ -30,6 +30,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::{StreamExt, stream};
+use orbit_protocol::value::Row;
+
 use orbit_protocol::cdc::{CdcBatch, CdcBatchAck, PartitionTransaction, RejectReason, SourceTransaction, TraceContext};
 use orbit_protocol::schema::SyncSchema;
 use orbit_vstream::checkpoint::{Checkpoint, ShardId};
@@ -269,6 +272,17 @@ impl Distributor {
         cancel: &CancellationToken,
     ) -> Result<(), DistributorError> {
         let shared = &self.shared;
+        // Prefetch only source reads. Routing, journal writes, sequence allocation and checkpoints
+        // still advance in stream order. A failed read stops before that transaction is routed.
+        // The bounded buffer also limits memory and upstream load when delivery is backpressured.
+        let prepared = prepare_ordered(stream::poll_fn(|cx| rx.poll_recv(cx)), |item| async move {
+            let hydrated = match &item {
+                StreamItem::Transaction(tx) => self.hydrate_transaction(tx).await?,
+                _ => vec![],
+            };
+            Ok::<_, DistributorError>((item, hydrated))
+        });
+        futures::pin_mut!(prepared);
         loop {
             // Backpressure: do not read more until in-flight work drains.
             loop {
@@ -282,14 +296,14 @@ impl Distributor {
                     _ = shared.drained.notified() => {}
                 }
             }
-            let item = tokio::select! {
+            let (item, hydrated) = tokio::select! {
                 _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
-                item = rx.recv() => item.ok_or(DistributorError::StreamClosed)?,
+                item = prepared.next() => item.ok_or(DistributorError::StreamClosed)??,
             };
             match item {
                 StreamItem::Transaction(tx) => tokio::select! {
                     _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
-                    result = self.route_transaction(tx) => result?,
+                    result = self.route_transaction(tx, hydrated) => result?,
                 },
                 StreamItem::Position { shard, position } | StreamItem::Ddl { shard, position, .. } => {
                     self.record_position(shard, position);
@@ -347,10 +361,10 @@ impl Distributor {
         Ok(updates)
     }
 
-    async fn route_transaction(&self, tx: SourceTransaction) -> Result<(), DistributorError> {
+    async fn hydrate_transaction(&self, tx: &SourceTransaction) -> Result<Vec<(String, Row)>, DistributorError> {
         let shared = &self.shared;
         let hydrate = shared.schema.tables.iter().any(|t| !t.partition_routes.is_empty())
-            && !shared.state.lock().expect("lock").fanout_has_journal(&tx)?
+            && !shared.state.lock().expect("lock").fanout_has_journal(tx)?
             && !orbit_vstream::shared_projection::queries(&shared.schema, Some(&tx.changes))?.is_empty();
         let hydrated = if hydrate {
             let source = self
@@ -385,6 +399,15 @@ impl Distributor {
             vec![]
         };
 
+        Ok(hydrated)
+    }
+
+    async fn route_transaction(
+        &self,
+        tx: SourceTransaction,
+        hydrated: Vec<(String, Row)>,
+    ) -> Result<(), DistributorError> {
+        let shared = &self.shared;
         let parent_updates = self.parent_updates_of(&tx)?;
         let shard = ShardId {
             keyspace: tx.keyspace.clone(),
@@ -894,4 +917,70 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Read-ahead is bounded independently of the delivery queue. `buffered` emits in input order,
+/// unlike `buffer_unordered`: checkpoints and relation overlays must not follow completion order.
+fn prepare_ordered<S, F, Fut>(input: S, prepare: F) -> impl futures::Stream<Item = Fut::Output>
+where
+    S: futures::Stream,
+    F: FnMut(S::Item) -> Fut,
+    Fut: std::future::Future,
+{
+    input.map(prepare).buffered(4)
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn delayed_reads_overlap_but_emit_in_order_with_bounded_work() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Notify::new());
+        let prepared = prepare_ordered(stream::iter(0..12), |i| {
+            let started = started.clone();
+            let gate = gate.clone();
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                if i == 0 {
+                    gate.notified().await;
+                }
+                i
+            }
+        });
+        futures::pin_mut!(prepared);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), prepared.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 4);
+        gate.notify_one();
+        let output: Vec<_> = prepared.collect().await;
+        assert_eq!(output, (0..12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn failed_read_does_not_emit_later_completed_work() {
+        use futures::TryStreamExt;
+        let prepared = prepare_ordered(stream::iter(0..12), |i| async move {
+            if i == 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Err("source unavailable")
+            } else {
+                Ok(i)
+            }
+        });
+        let mut routed = vec![];
+        let result = prepared
+            .try_for_each(|i| {
+                routed.push(i);
+                futures::future::ready(Ok(()))
+            })
+            .await;
+        assert_eq!(result, Err("source unavailable"));
+        assert_eq!(routed, vec![0, 1]);
+    }
 }
