@@ -893,11 +893,17 @@ export class SyncEngine {
     const primary = compileSelect(planned)
     for (const record of this.db.query(primary.sql, primary.params))
       members.push({ path: "", table: planned.table.name, key: keyOfRecord(record), record })
+    const keysByPath = new Map<string, Array<string>>([["", members.map((m) => m.key)]])
     for (const include of flattenIncludes(planned)) {
-      const inc = compileIncludeSelect(planned, include)
       const path = pathOf(include.path)
-      for (const record of this.db.query(inc.sql, inc.params))
+      const parents = keysByPath.get(pathOf(include.path.slice(0, -1))) ?? []
+      const inc = compileIncludeSelect(planned, include, {}, parents)
+      const keys: Array<string> = []
+      for (const record of parents.length === 0 ? [] : this.db.query(inc.sql, inc.params)) {
         members.push({ path, table: include.target.name, key: keyOfRecord(record), record })
+        keys.push(keyOfRecord(record))
+      }
+      keysByPath.set(path, keys)
     }
     return { members }
   }

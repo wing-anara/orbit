@@ -331,10 +331,27 @@ export const compileIncludeSelect = (
   planned: PlannedQuery,
   include: PlannedInclude,
   options: SelectOptions = {},
+  parentKeys?: ReadonlyArray<string>,
 ): CompiledSql => {
   const ctx = makeCtx(planned, options)
   const { dialect } = ctx
-  const parent = parentSelect(planned, include, options)
+  // Cache readers already evaluated the parent level. Reuse exactly those rows rather than
+  // repeating its permission predicates, ordering and limit for every included relation.
+  // Fetch relation columns from the table so composite keys, NULLs and affinities retain
+  // SQLite's normal semantics. One JSON parameter avoids the bind-variable limit.
+  if (parentKeys !== undefined && !dialect.hasKeyColumn)
+    throw new Error("parent keys require the local cache dialect")
+  const parentTable = parentOf(planned, include)?.target ?? planned.table
+  const parent =
+    parentKeys === undefined
+      ? parentSelect(planned, include, options)
+      : {
+          sql: {
+            sql: `SELECT * FROM ${dialect.table(parentTable.name)} WHERE ${dialect.ident(KEY_COLUMN)} IN (SELECT value FROM json_each(?))`,
+            params: [JSON.stringify(parentKeys)],
+          },
+          table: parentTable,
+        }
   ctx.params.push(...parent.sql.params)
   const r = "r"
   // A non-correlated `IN (SELECT ...)`: the parent level is evaluated once into an ephemeral

@@ -595,8 +595,15 @@ export const readNodes = async (
     Array<{ readonly key: string; readonly row: ReturnType<typeof rowFromRecord> }>
   >()
   for (const include of flattenIncludes(planned)) {
-    const inc = compileIncludeSelect(planned, include, opts)
-    const related = await driver.query(inc.sql, inc.params)
+    const parents =
+      include.path.length === 1 ? rows : (byPath.get(include.path.slice(0, -1).join("/")) ?? [])
+    const inc = compileIncludeSelect(
+      planned,
+      include,
+      opts,
+      parents.map((r) => r.key),
+    )
+    const related = parents.length === 0 ? [] : await driver.query(inc.sql, inc.params)
     byPath.set(
       include.path.join("/"),
       related.map((r) => ({ key: keyOfRecord(r), row: rowFromRecord(include.target, r) })),

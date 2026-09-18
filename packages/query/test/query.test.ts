@@ -534,6 +534,43 @@ describe("relation predicates and nested includes", () => {
     expect(all(missing)).toEqual([])
   })
 
+  it("reuses selected parent keys with identical filtered, limited and nested results", () => {
+    for (const limit of [1, 2, 100]) {
+      for (const direction of ["asc", "desc"] as const) {
+        const p = plan({
+          table: "Chatbot",
+          where: {
+            op: "exists",
+            relation: "documents",
+            where: { op: "gte", column: "score", value: 0.1 },
+          },
+          orderBy: [{ column: "displayOrder", direction }],
+          limit,
+          include: [
+            "folder",
+            "organization",
+            {
+              relation: "documents",
+              where: { op: "gte", column: "score", value: 0.5 },
+              include: ["organization", "folder"],
+            },
+          ],
+        })
+        const byPath = new Map([["", all(compileSelect(p))]])
+        for (const inc of flattenIncludes(p)) {
+          const keys = byPath.get(inc.path.slice(0, -1).join("/"))!.map((r) => String(r["__key"]))
+          const selected = compileIncludeSelect(p, inc, {}, keys)
+          const actual = all(selected)
+          expect(actual).toEqual(all(compileIncludeSelect(p, inc)))
+          expect(all(compileIncludeSelect(p, inc, {}, []))).toEqual([])
+          // The parent query's sort/limit and relation predicates are not evaluated again.
+          expect(selected.sql).not.toContain("LIMIT")
+          byPath.set(inc.path.join("/"), actual)
+        }
+      }
+    }
+  })
+
   it("computes derived columns from their source in MySQL and reads them stored in SQLite", () => {
     const withDerived: typeof schema = {
       ...schema,
