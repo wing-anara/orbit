@@ -50,6 +50,8 @@ pub struct SharedQuery {
     pub table: String,
     pub alias: String,
     pub sql: String,
+    /// Identical join/predicate: an empty projection proves every projection in this scope empty.
+    pub scope: String,
 }
 
 /// With `changes`, select only sharing paths touched by a new/changed relationship. Deletes
@@ -169,6 +171,7 @@ pub fn queries(schema: &SyncSchema, changes: Option<&[RowChange]>) -> Result<Vec
                         table: table.name.clone(),
                         alias,
                         sql,
+                        scope: format!("{from} WHERE {predicate}"),
                     },
                 );
             }
@@ -220,48 +223,62 @@ where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<QueryResult, VStreamError>>,
 {
-    let result = stream::iter(requests)
-        .map(|request| {
+    let mut scopes: BTreeMap<String, Vec<(usize, SharedQuery)>> = BTreeMap::new();
+    for (index, request) in requests.into_iter().enumerate() {
+        scopes.entry(request.scope.clone()).or_default().push((index, request));
+    }
+    let result = stream::iter(scopes.into_values())
+        .map(|requests| {
             let execute = &execute;
             async move {
                 let mut result = BTreeMap::new();
-                let table = schema.table(&request.table).expect("validated table");
-                let keys = table
-                    .primary_key
-                    .iter()
-                    .map(|c| col(&request.alias, c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut last: Option<Row> = None;
-                loop {
-                    let after = if let Some(last) = &last {
-                        let values = table
-                            .primary_key
-                            .iter()
-                            .map(|c| literal(table, c, last))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .join(", ");
-                        format!(" AND ({keys}) > ({values})")
-                    } else {
-                        String::new()
-                    };
-                    let sql = format!("{}{after} ORDER BY {keys} LIMIT 1000", request.sql);
-                    let page = execute(sql).await?;
-                    let projection = TableProjection::build(table, &query_fields(table, &page.fields)?)?;
-                    for raw in &page.rows {
-                        let row = projection.project(raw)?;
-                        let key = table
-                            .primary_key
-                            .iter()
-                            .map(|c| row.get(c).expect("projected key"))
-                            .collect::<Vec<_>>();
-                        result.insert(
-                            (table.name.clone(), serde_json::to_string(&key).expect("key serializes")),
-                            row.clone(),
-                        );
-                        last = Some(row);
+                for (ordinal, (index, request)) in requests.into_iter().enumerate() {
+                    let mut found = false;
+                    let table = schema.table(&request.table).expect("validated table");
+                    let keys = table
+                        .primary_key
+                        .iter()
+                        .map(|c| col(&request.alias, c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut last: Option<Row> = None;
+                    loop {
+                        let after = if let Some(last) = &last {
+                            let values = table
+                                .primary_key
+                                .iter()
+                                .map(|c| literal(table, c, last))
+                                .collect::<Result<Vec<_>, _>>()?
+                                .join(", ");
+                            format!(" AND ({keys}) > ({values})")
+                        } else {
+                            String::new()
+                        };
+                        let sql = format!("{}{after} ORDER BY {keys} LIMIT 1000", request.sql);
+                        metrics::counter!("orbit_shared_hydration_queries_total").increment(1);
+                        let page = execute(sql).await?;
+                        found |= !page.rows.is_empty();
+                        let projection = TableProjection::build(table, &query_fields(table, &page.fields)?)?;
+                        for raw in &page.rows {
+                            let row = projection.project(raw)?;
+                            let key = table
+                                .primary_key
+                                .iter()
+                                .map(|c| row.get(c).expect("projected key"))
+                                .collect::<Vec<_>>();
+                            result.insert(
+                                (table.name.clone(), serde_json::to_string(&key).expect("key serializes")),
+                                (index, row.clone()),
+                            );
+                            last = Some(row);
+                        }
+                        if page.rows.len() < 1000 {
+                            break;
+                        }
                     }
-                    if page.rows.len() < 1000 {
+                    // Own-org writes normally have no matching foreign permission. Do not issue
+                    // the remaining projections of the exact same empty join.
+                    if ordinal == 0 && !found {
                         break;
                     }
                 }
@@ -272,11 +289,16 @@ where
         // Drain in request order and deduplicate immediately. Retain at most four request
         // results, not a second copy of every bootstrap projection until all reads complete.
         .try_fold(BTreeMap::new(), |mut result, rows| async move {
-            result.extend(rows);
+            for (key, (index, row)) in rows {
+                // Grouping must not change which projection wins when paths overlap.
+                if result.get(&key).is_none_or(|(old, _)| *old <= index) {
+                    result.insert(key, (index, row));
+                }
+            }
             Ok(result)
         })
         .await?;
-    Ok(result.into_iter().map(|((table, _), row)| (table, row)).collect())
+    Ok(result.into_iter().map(|((table, _), (_, row))| (table, row)).collect())
 }
 
 #[cfg(test)]
@@ -303,6 +325,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_join_skips_its_other_projections_but_not_other_scopes() {
+        let calls = AtomicUsize::new(0);
+        let requests = (0..8)
+            .map(|i| SharedQuery {
+                table: "doc".into(),
+                alias: "s0".into(),
+                sql: format!("SELECT {i}"),
+                scope: if i < 4 { "empty".into() } else { "matching".into() },
+            })
+            .collect();
+        let rows = load_requests(&schema(), requests, |sql| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let i: usize = sql.split_whitespace().nth(1).unwrap().parse().unwrap();
+                Ok(QueryResult {
+                    fields: fields(),
+                    rows: if i < 4 {
+                        vec![]
+                    } else {
+                        vec![vec![
+                            Some("doc".into()),
+                            Some("owner".into()),
+                            Some(i.to_string().into()),
+                        ]]
+                    },
+                })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.get("name"), Some(&CellValue::String("7".into())));
+    }
+
+    #[tokio::test]
     async fn hydration_is_bounded_and_deduplicates_in_request_order() {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -311,6 +369,7 @@ mod tests {
                 table: "doc".into(),
                 alias: "s0".into(),
                 sql: format!("SELECT {i}"),
+                scope: i.to_string(),
             })
             .collect();
         let result = load_requests(&schema(), requests, |sql| {
@@ -347,6 +406,7 @@ mod tests {
             table: "doc".into(),
             alias: "s0".into(),
             sql: "SELECT id, org, name FROM doc WHERE 1=1".into(),
+            scope: "doc".into(),
         };
         let result = load_requests(&schema(), vec![request.clone()], |sql| {
             let call = calls.fetch_add(1, Ordering::SeqCst);
