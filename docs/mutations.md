@@ -174,6 +174,7 @@ Values are converted per column kind. On the way in: `bool` becomes 0 or 1, `jso
 A client mutator can retain already-cached row images with
 `await tx.localUndo?.capture("Document", undoKey, rows)` before deleting them.
 The matching restore mutator calls `await tx.localUndo?.restore("Document", undoKey)`.
+Use `{ onlyMissing: true }` when restoring related rows that may still be live (for example a shared tag), to avoid overwriting newer cached values.
 The server must still implement and authorize the real restore; `localUndo` is absent
 on server transactions and captured images never enter the push payload.
 

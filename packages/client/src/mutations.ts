@@ -210,7 +210,11 @@ export class LocalMutationTx {
         params: [name, group, this.mutationId, JSON.stringify(images)],
       })
     },
-    restore: async (name: string, group: string): Promise<void> => {
+    restore: async (
+      name: string,
+      group: string,
+      options?: { readonly onlyMissing?: boolean },
+    ): Promise<void> => {
       const table = this.table(name)
       const records = await this.driver.query(
         `SELECT images FROM local_undo WHERE tbl = ? AND undo_group = ? AND mutation_id < ? ORDER BY mutation_id DESC LIMIT 1`,
@@ -220,10 +224,27 @@ export class LocalMutationTx {
       if (typeof value !== "string") return
       const images: unknown = JSON.parse(value)
       if (!Array.isArray(images)) throw new Error("invalid local undo images")
-      for (const row of images) {
+      const restored = images.map((row) => {
         if (!isRecord(row)) throw new Error("invalid local undo row")
         const image = this.image(table, row)
-        this.write(table, SchemaRuntime.keyString(this.store.rt.keyOf(table, image)), image)
+        return { image, key: SchemaRuntime.keyString(this.store.rt.keyOf(table, image)) }
+      })
+      const existing = new Set<string>()
+      if (options?.onlyMissing) {
+        for (let i = 0; i < restored.length; i += 40) {
+          const keys = restored.slice(i, i + 40).map((row) => row.key)
+          const current = await this.driver.query(
+            `SELECT ${quoteIdent(KEY_COLUMN)} FROM ${quoteIdent(overlayViewName(name))} WHERE ${quoteIdent(KEY_COLUMN)} IN (${keys.map(() => "?").join(",")})`,
+            keys,
+          )
+          for (const row of current) existing.add(String(row[KEY_COLUMN]))
+        }
+      }
+      for (const { key, image } of restored) {
+        const written = this.written.get(`${name}\u0000${key}`)
+        if (options?.onlyMissing && (written === undefined ? existing.has(key) : written !== null))
+          continue
+        this.write(table, key, image)
       }
     },
   }

@@ -72,3 +72,24 @@ it("bounds completed history while preserving all captures needed by pending com
     await driver.close()
   }
 })
+
+it("restores missing related rows without overwriting a still-live shared row", async () => {
+  const driver = nodeAsyncDriver()
+  const store = new LocalStore(driver, schema, "org_1")
+  try {
+    await Effect.runPromise(store.open())
+    const capture = new LocalMutationTx(driver, store, 1)
+    await capture.localUndo.capture("organization", "root", [row, { ...row, id: "missing" }])
+    await driver.batch(capture.statements)
+    const update = new LocalMutationTx(driver, store, 2)
+    await update.insert("organization", { ...row, name: "newer shared value" })
+    await driver.batch(update.statements)
+    const undo = new LocalMutationTx(driver, store, 3)
+    await undo.localUndo.restore("organization", "root", { onlyMissing: true })
+    await driver.batch(undo.statements)
+    expect((await undo.get("organization", { id: "org_1" }))?.name).toBe("newer shared value")
+    expect((await undo.get("organization", { id: "missing" }))?.name).toBe("🪐")
+  } finally {
+    await driver.close()
+  }
+})

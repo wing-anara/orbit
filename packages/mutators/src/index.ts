@@ -58,7 +58,11 @@ export interface MutationTx<D> {
       group: string,
       rows: ReadonlyArray<RowOf<D, N>>,
     ) => Promise<void>
-    readonly restore: <N extends SyncedTables<D>>(table: N, group: string) => Promise<void>
+    readonly restore: <N extends SyncedTables<D>>(
+      table: N,
+      group: string,
+      options?: { readonly onlyMissing?: boolean },
+    ) => Promise<void>
   }
   /** Inserts a full row (every synced column; columns the server defaults may be omitted). */
   readonly insert: <N extends SyncedTables<D>>(
