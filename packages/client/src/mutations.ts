@@ -123,6 +123,20 @@ export class LocalMutationTx {
     private readonly mutationId: number,
   ) {}
 
+  deletedKeys(): ReadonlyMap<string, ReadonlySet<string>> | undefined {
+    const removed = new Map<string, Set<string>>()
+    for (const [identity, image] of this.written) {
+      if (image !== null) return undefined
+      const separator = identity.indexOf("\u0000")
+      const table = identity.slice(0, separator),
+        key = identity.slice(separator + 1)
+      const keys = removed.get(table) ?? new Set<string>()
+      keys.add(key)
+      removed.set(table, keys)
+    }
+    return removed.size === 0 ? undefined : removed
+  }
+
   private table(name: string): TableSchema {
     const table = this.store.rt.table(name)
     if (table === undefined) throw new Error(`table ${name} is not in the sync schema`)
@@ -239,7 +253,10 @@ export interface MutationManagerConfig {
   readonly lock: AsyncLock
   readonly onLog: (event: string, data: Record<string, unknown>) => void
   /** Called (under the lock) after the overlay changed; `null` means every table may have changed. */
-  readonly onChanged: (tables: ReadonlySet<string> | null) => Promise<void>
+  readonly onChanged: (
+    tables: ReadonlySet<string> | null,
+    deleted?: ReadonlyMap<string, ReadonlySet<string>>,
+  ) => Promise<void>
   readonly onPendingCount: (n: number) => void
   readonly now: () => number
   readonly backoffMinMs?: number
@@ -429,7 +446,7 @@ export class MutationManager {
       throw new PersistedMutationError(`mutator ${name} failed: ${error}`)
     }
     this.emit({ id, name, status: "applied_locally" })
-    await this.config.onChanged(tx.touched)
+    await this.config.onChanged(tx.touched, tx.deletedKeys())
   }
 
   // ---------------------------------------------------------------------------------------------

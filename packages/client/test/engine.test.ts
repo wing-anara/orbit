@@ -1280,6 +1280,58 @@ const serverQueries = defineQueries(sync, {
 })
 
 describe("named queries", () => {
+  it("publishes durable deletions before waiting for query refill reads", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const inner = nodeAsyncDriver()
+    let block = false,
+      release!: () => void,
+      entered!: () => void
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const driver: AsyncSqlDriver = {
+      ...inner,
+      query: async (sql, params) => {
+        if (block && sql.includes("v_Chatbot")) {
+          entered()
+          await gate
+        }
+        return inner.query(sql, params)
+      },
+      batch: async (statements) => {
+        await inner.batch(statements)
+        if (statements.some((s) => s.sql.includes("INSERT INTO pending_mutations"))) block = true
+      },
+    }
+    const client = await createOrbitClient({
+      definition: sync,
+      schema,
+      url: "http://fake",
+      partition: "org_1",
+      getToken: async () => "t",
+      driver,
+      makeWebSocket: server.connect,
+      mutators,
+    })
+    try {
+      const docs = client.liveQuery(q(sync).from("Chatbot").orderBy("id"))
+      await waitFor(() => server.pendingFills.length > 0)
+      server.completeFill("Chatbot", [chatbot("a"), chatbot("b")])
+      await waitFor(() => docs.getSnapshot().status === "live")
+      const deletion = client.mutate.removeDocument({ id: "a" })
+      await waiting
+      expect(docs.getSnapshot().rows.map((r) => r.id)).toEqual(["b"])
+      release()
+      await deletion.local
+    } finally {
+      release()
+      await client.close()
+    }
+  })
+
   it("publishes all locally changed views together and preserves unaffected query rows", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const client = await createOrbitClient({

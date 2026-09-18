@@ -247,7 +247,10 @@ export class ClientEngine {
           fetch: this.config.fetch,
           lock: this.lock,
           onLog: (event, data) => this.log(event, data),
-          onChanged: (tables) => Effect.runPromise(this.refreshTables(tables, true)),
+          onChanged: (tables, deleted) => {
+            if (deleted !== undefined) this.removeDeletedRoots(deleted)
+            return Effect.runPromise(this.refreshTables(tables, true))
+          },
           onPendingCount: (n) => this.updateStatus({ pendingMutations: n }),
           now: () => this.now(),
           ...(this.config.pushBackoffMinMs === undefined
@@ -757,6 +760,21 @@ export class ClientEngine {
       sub.snapshot = { status: sub.status, rows: shared, error: sub.error, cursor: this.cursor }
       if (notify) for (const l of sub.listeners) l()
     })
+  }
+
+  /** Publish committed tombstones before refilling windows and re-reading related rows. */
+  private removeDeletedRoots(deleted: ReadonlyMap<string, ReadonlySet<string>>): void {
+    const listeners = new Set<() => void>()
+    for (const sub of this.subscriptions.values()) {
+      if (sub.refs === 0) continue
+      const keys = deleted.get(sub.planned.table.name)
+      if (keys === undefined) continue
+      const rows = sub.snapshot.rows.filter((row) => !keys.has(row.key))
+      if (rows.length === sub.snapshot.rows.length) continue
+      sub.snapshot = { ...sub.snapshot, rows }
+      for (const listener of sub.listeners) listeners.add(listener)
+    }
+    for (const listener of listeners) listener()
   }
 
   /** Re-runs the queries over `tables` (every table when null); `any` includes non-live queries. */
