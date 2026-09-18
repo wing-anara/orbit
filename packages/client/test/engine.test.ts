@@ -1280,6 +1280,49 @@ const serverQueries = defineQueries(sync, {
 })
 
 describe("named queries", () => {
+  it("publishes all locally changed views together and preserves unaffected query rows", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const client = await createOrbitClient({
+      definition: sync,
+      schema,
+      url: "http://fake",
+      partition: "org_1",
+      getToken: async () => "t",
+      driver: nodeAsyncDriver(),
+      makeWebSocket: server.connect,
+      mutators,
+    })
+    try {
+      const docs = client.liveQuery(
+        q(sync)
+          .from("Chatbot")
+          .where((c) => c.eq("type", "DOCUMENT"))
+          .orderBy("id"),
+      )
+      const folders = client.liveQuery(
+        q(sync)
+          .from("Chatbot")
+          .where((c) => c.eq("type", "GROUP")),
+      )
+      const all = client.liveQuery(q(sync).from("Chatbot").orderBy("id"))
+      await waitFor(() => server.pendingFills.length > 0)
+      server.completeFill("Chatbot", [chatbot("a"), chatbot("b"), chatbot("g", { type: "GROUP" })])
+      await waitFor(() => [docs, folders, all].every((q) => q.getSnapshot().status === "live"))
+      const originalFolder = folders.getSnapshot()
+      const originalB = docs.getSnapshot().rows[1]
+      const seen: string[][] = []
+      const off = docs.subscribe(() => seen.push(all.getSnapshot().rows.map((r) => r.id)))
+      await client.mutate.removeDocument({ id: "a" }).local
+      expect(docs.getSnapshot().rows.map((r) => r.id)).toEqual(["b"])
+      expect(docs.getSnapshot().rows[0]).toBe(originalB)
+      expect(folders.getSnapshot()).toBe(originalFolder)
+      expect(seen).toEqual([["b", "g"]])
+      off()
+    } finally {
+      await client.close()
+    }
+  })
+
   it("preserves public row identities across window growth and status changes without hiding relation updates", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const client = await createOrbitClient({

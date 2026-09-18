@@ -43,6 +43,7 @@ import { ConnectionError, makeConnection, type ConnectionState } from "./connect
 import type { AsyncSqlDriver } from "./driver.ts"
 import { AsyncLock, MutationManager, type MutationEvent, type MutationHandle } from "./mutations.ts"
 import { LocalStore, StoreError } from "./store.ts"
+import { shareResultRows } from "./result-sharing.ts"
 
 export type LiveQueryStatus = "pending" | "stale" | "live" | "error"
 
@@ -716,7 +717,11 @@ export class ClientEngine {
     return n
   }
 
-  private refresh(sub: Subscription, base?: Subscription): Effect.Effect<void, StoreError> {
+  private refresh(
+    sub: Subscription,
+    base?: Subscription,
+    notify = true,
+  ): Effect.Effect<void, StoreError> {
     return Effect.gen({ self: this }, function* () {
       // A retained query nobody references (a window the user scrolled past, a query the
       // application left) is not re-read on every change: it reads once when referenced again.
@@ -741,8 +746,16 @@ export class ClientEngine {
           : reusable
             ? yield* this.store.readGrowingSubscription(sub.planned, sub.id, base.snapshot.rows)
             : yield* this.store.readSubscription(sub.planned, sub.id)
-      sub.snapshot = { status: sub.status, rows, error: sub.error, cursor: this.cursor }
-      for (const l of sub.listeners) l()
+      const shared = shareResultRows(sub.snapshot.rows, rows)
+      if (
+        shared === sub.snapshot.rows &&
+        sub.snapshot.status === sub.status &&
+        sub.snapshot.error === sub.error &&
+        sub.snapshot.cursor === this.cursor
+      )
+        return
+      sub.snapshot = { status: sub.status, rows: shared, error: sub.error, cursor: this.cursor }
+      if (notify) for (const l of sub.listeners) l()
     })
   }
 
@@ -752,12 +765,17 @@ export class ClientEngine {
     any: boolean,
   ): Effect.Effect<void, StoreError> {
     return Effect.gen({ self: this }, function* () {
+      const listeners = new Set<() => void>()
       for (const sub of this.subscriptions.values()) {
         if (!any && sub.status !== "live") continue
         if (sub.status === "error") continue
         if (tables !== null && ![...sub.planned.tables].some((t) => tables.has(t))) continue
-        yield* this.refresh(sub)
+        const before = sub.snapshot
+        yield* this.refresh(sub, undefined, false)
+        if (sub.snapshot !== before) for (const listener of sub.listeners) listeners.add(listener)
       }
+      // Publish the transaction after all affected views have advanced together.
+      for (const listener of listeners) listener()
     })
   }
 
