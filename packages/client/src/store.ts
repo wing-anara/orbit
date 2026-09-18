@@ -340,12 +340,19 @@ export class LocalStore {
     ])
   }
 
-  removeSubscription(id: string): Effect.Effect<void, StoreError> {
-    return this.collectRetired(id)
+  /** Returns whether another bounded collection pass is needed. */
+  removeSubscription(id: string): Effect.Effect<boolean, StoreError> {
+    return this.run([
+      { sql: `UPDATE subscriptions SET retired = 1 WHERE id = ?`, params: [id] },
+    ]).pipe(Effect.andThen(this.collectRetired()))
   }
 
-  /** Keep inherited memberships in place until no live window needs the base chain. */
-  private collectRetired(retireId?: string): Effect.Effect<void, StoreError> {
+  /**
+   * Retired windows can form a long inherited chain. Reclaim at most 128 row
+   * references and 16 empty subscriptions per transaction, retaining live bases.
+   * The engine schedules additional passes outside the foreground write lock.
+   */
+  collectRetired(): Effect.Effect<boolean, StoreError> {
     return Effect.gen({ self: this }, function* () {
       const rows = yield* this.query(`SELECT id, based_on, retired FROM subscriptions`)
       const nodes = new Map(
@@ -353,7 +360,7 @@ export class LocalStore {
           str(row["id"]),
           {
             parent: typeof row["based_on"] === "string" ? row["based_on"] : null,
-            retired: row["retired"] === 1 || row["id"] === retireId,
+            retired: row["retired"] === 1,
           },
         ]),
       )
@@ -364,23 +371,46 @@ export class LocalStore {
       const ready = [...nodes]
         .filter(([id, node]) => node.retired && !dependents.get(id))
         .map(([id]) => id)
-      const statements: Array<Statement> =
-        retireId === undefined
-          ? []
-          : [
-              {
-                sql: `UPDATE subscriptions SET retired = 1 WHERE id = ?`,
-                params: [retireId],
-              },
-            ]
-      while (ready.length > 0) {
+      const statements: Array<Statement> = []
+      let budget = 128
+      let visited = 0
+      while (ready.length > 0 && budget > 0 && visited < 16) {
         const id = ready.pop()!
         const node = nodes.get(id)!
-        statements.push(
-          ...this.gcStatementsForSubscription(id),
-          { sql: `DELETE FROM membership WHERE subscription = ?`, params: [id] },
-          { sql: `DELETE FROM subscriptions WHERE id = ?`, params: [id] },
+        visited += 1
+        const candidates = yield* this.query(
+          `SELECT tbl, key FROM membership WHERE subscription = ? LIMIT ?`,
+          [id, budget + 1],
         )
+        const selected = candidates.slice(0, budget)
+        const byTable = new Map<string, Array<string>>()
+        for (const row of selected) {
+          const table = str(row["tbl"])
+          const keys = byTable.get(table) ?? []
+          keys.push(str(row["key"]))
+          byTable.set(table, keys)
+        }
+        // A reopened partially collected view must never advertise completeness,
+        // including if it closes again before its replacement snapshot arrives.
+        statements.push({ sql: `UPDATE subscriptions SET complete = 0 WHERE id = ?`, params: [id] })
+        for (const [table, keys] of byTable) {
+          const name = quoteIdent(localTableName(table))
+          if (this.rt.table(table) !== undefined)
+            statements.push({
+              sql: `DELETE FROM ${name} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT value FROM json_each(?)) AND NOT EXISTS (SELECT 1 FROM membership WHERE tbl = ? AND key = ${name}.${quoteIdent(KEY_COLUMN)} AND subscription <> ?)`,
+              params: [JSON.stringify(keys), table, id],
+            })
+          statements.push({
+            sql: `DELETE FROM membership WHERE subscription = ? AND tbl = ? AND key IN (SELECT value FROM json_each(?))`,
+            params: [id, table, JSON.stringify(keys)],
+          })
+        }
+        budget -= Math.max(1, selected.length)
+        if (candidates.length > selected.length) {
+          ready.push(id)
+          break
+        }
+        statements.push({ sql: `DELETE FROM subscriptions WHERE id = ?`, params: [id] })
         nodes.delete(id)
         if (node.parent !== null) {
           const remaining = (dependents.get(node.parent) ?? 0) - 1
@@ -389,6 +419,7 @@ export class LocalStore {
         }
       }
       if (statements.length > 0) yield* this.run(statements)
+      return ready.length > 0
     })
   }
 
@@ -479,7 +510,7 @@ export class LocalStore {
     // reads follow the link, so a grown window writes only its new members (see
     // `snapshot.basedOn` in the protocol).
     basedOn: string | null = null,
-  ): Effect.Effect<void, StoreError> {
+  ): Effect.Effect<boolean, StoreError> {
     const statements: Array<Statement> = [
       ...this.transferStatements(subscription),
       ...this.gcStatementsForSubscription(subscription, members),

@@ -172,6 +172,8 @@ export class ClientEngine {
   private clientIdValue: string
   private mutations: MutationManager | null = null
   private onlineHandler: (() => void) | null = null
+  private collectionTimer: ReturnType<typeof setTimeout> | null = null
+  private closing = false
 
   constructor(private readonly config: EngineConfig) {
     this.store = new LocalStore(config.driver, config.schema, config.partition)
@@ -401,11 +403,15 @@ export class ClientEngine {
         ),
       )
       yield* Effect.forkIn(consumer, scope)
+      this.scheduleCollection()
     })
   }
 
   close(): Effect.Effect<void> {
     return Effect.gen({ self: this }, function* () {
+      this.closing = true
+      if (this.collectionTimer !== null) clearTimeout(this.collectionTimer)
+      this.collectionTimer = null
       for (const sub of this.subscriptions.values()) {
         if (sub.retention !== null) clearTimeout(sub.retention)
         sub.retention = null
@@ -418,7 +424,7 @@ export class ClientEngine {
         this.onlineHandler = null
       }
       if (scope !== null) yield* Scope.close(scope, Exit.void)
-      yield* this.store.close().pipe(Effect.ignore)
+      yield* this.lock.runEffect(this.store.close()).pipe(Effect.ignore)
     })
   }
 
@@ -664,9 +670,29 @@ export class ClientEngine {
       this.subscriptions.delete(sub.id)
       yield* this.unpin(sub)
       if (sub.onWire && this.send !== null) yield* this.send({ type: "unsubscribe", id: sub.id })
-      yield* this.lock.runEffect(this.store.removeSubscription(sub.id)).pipe(Effect.ignore)
+      const pending = yield* this.lock
+        .runEffect(this.store.removeSubscription(sub.id))
+        .pipe(Effect.orElseSucceed(() => true))
+      if (pending) this.scheduleCollection()
       this.updateStatus({ pendingSubscriptions: this.pendingCount() })
     })
+  }
+
+  /** Yield between bounded cache cleanup passes so sync and edits get the lock. */
+  private scheduleCollection(delay = 100): void {
+    if (this.collectionTimer !== null || this.closing || !this.opened) return
+    this.collectionTimer = setTimeout(() => {
+      this.collectionTimer = null
+      if (this.closing) return
+      void Effect.runPromise(this.lock.runEffect(this.store.collectRetired())).then(
+        (pending) => {
+          if (pending) this.scheduleCollection()
+        },
+        () => this.scheduleCollection(1000),
+      )
+    }, delay)
+    if (typeof this.collectionTimer === "object" && "unref" in this.collectionTimer)
+      this.collectionTimer.unref()
   }
 
   private pendingCount(): number {
@@ -788,13 +814,14 @@ export class ClientEngine {
           }
           yield* this.lock.runEffect(
             Effect.gen({ self: this }, function* () {
-              yield* this.store.applySnapshot(
+              const pendingCollection = yield* this.store.applySnapshot(
                 sub.id,
                 message.cursor,
                 chunks.rows,
                 chunks.members,
                 basedOn,
               )
+              if (pendingCollection) this.scheduleCollection()
               this.cursor = message.cursor
               sub.status = "live"
               sub.resumeVersion = message.version ?? null

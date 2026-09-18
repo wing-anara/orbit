@@ -121,6 +121,8 @@ A session that subscribes to a query other sessions already hold receives the sn
 
 The client engine then re-runs every live query whose subscription or tables were touched. `readSubscription` filters the local table by the membership of that subscription, so a live query shows exactly the members the server computed. Includes are attached in memory from the local include rows.
 
+Browser query retirement is also bounded. An expired inherited chain releases at most 128 membership references and 16 empty subscriptions per transaction. The engine yields between cleanup passes, giving sync and optimistic edits access to the write lock. Live descendants keep their bases; other subscriptions keep shared row images. Retirement is persisted before cleanup so a failed batch or closed tab can resume later. A partly collected view is marked incomplete before deletion, preventing a rapid reopen/close from persisting a truncated offline snapshot as complete. Closing the engine cancels future cleanup and waits for an in-flight batch before closing storage. No journal or durability settings are weakened.
+
 ## Cost per change
 
 Measured with the engine core on Node (`docs/benchmarks.md` has the full table): on a partition with 100,000 documents and the example schema's 11 subscriptions, one insert or one rename costs a few milliseconds and a handful of rows written, and the cost does not change between 2,000 and 100,000 documents. The full re-evaluation the engine used before cost 1.2 s per insert at 2,000 documents and grew linearly.

@@ -1155,6 +1155,38 @@ describe("local-first reads and query retention", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it("continues bounded retirement after reopening and cancels cleanup on close", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    const db = nodeAsyncDriver()
+    const driver = { ...db, close: async () => {} }
+    const first = makeClient(server, driver).engine
+    let reopened: ClientEngine | undefined
+    try {
+      await Effect.runPromise(first.open())
+      const view = await Effect.runPromise(first.subscribe({ table: "Chatbot" }))
+      await waitFor(() => server.pendingFills.length === 1)
+      server.completeFill(
+        "Chatbot",
+        Array.from({ length: 1200 }, (_, i) => chatbot(String(i))),
+      )
+      await Effect.runPromise(first.awaitLive(view.id))
+      await Effect.runPromise(view.release())
+      const count = () => Number(db.db.prepare(`SELECT COUNT(*) AS n FROM t_Chatbot`).get()?.["n"])
+      expect(count()).toBe(1072)
+      await Effect.runPromise(first.close())
+      await settle(200)
+      expect(count()).toBe(1072)
+      reopened = makeClient(server, driver).engine
+      await Effect.runPromise(reopened.open())
+      await waitFor(() => count() === 0, 5000, "retired cache collection")
+      expect(await driver.query(`SELECT * FROM subscriptions`)).toEqual([])
+    } finally {
+      await Effect.runPromise(first.close())
+      if (reopened !== undefined) await Effect.runPromise(reopened.close())
+      db.db.close()
+    }
+  })
+
   it("keeps a released query subscribed and cached until its TTL, then retires it", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const { engine, driver } = makeClient(server, nodeAsyncDriver(), 150)

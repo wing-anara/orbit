@@ -50,6 +50,90 @@ it("rolls back the entire queued burst when a later transaction fails", async ()
 })
 
 describe("subscription garbage collection", () => {
+  it("bounds a large retired view, preserves other owners and invalidates partial completeness", async () => {
+    const driver = nodeAsyncDriver()
+    const store = new LocalStore(driver, schema, "org_1")
+    try {
+      await Effect.runPromise(store.open({ clientId: "bounded-gc" }))
+      const query = { table: "organization" }
+      const rows = Array.from({ length: 1200 }, (_, n) => {
+        const id = String(n).padStart(4, "0")
+        return {
+          table: "organization",
+          key: [id],
+          row: { id, name: id, created_at: "2026-01-01 00:00:00", hipaa_enabled: false },
+        }
+      })
+      for (const id of ["old", "live"])
+        await Effect.runPromise(store.registerSubscription(id, query, query))
+      await Effect.runPromise(store.applySnapshot("old", 1, rows, rows))
+      await Effect.runPromise(store.applySnapshot("live", 1, rows.slice(0, 50), rows.slice(0, 50)))
+      expect(await Effect.runPromise(store.removeSubscription("old"))).toBe(true)
+      expect(
+        driver.db
+          .prepare(`SELECT COUNT(*) AS n FROM membership WHERE subscription = 'old'`)
+          .get()?.["n"],
+      ).toBe(1072)
+      expect(
+        driver.db.prepare(`SELECT complete FROM subscriptions WHERE id = 'old'`).get()?.[
+          "complete"
+        ],
+      ).toBe(0)
+      expect(driver.db.prepare(`SELECT COUNT(*) AS n FROM t_organization`).get()?.["n"]).toBe(1122)
+      // Reopening and closing again before a replacement snapshot must not
+      // persist a partially deleted view as a complete offline snapshot.
+      await Effect.runPromise(store.registerSubscription("old", query, query))
+      const reopened = new LocalStore(driver, schema, "org_1")
+      await Effect.runPromise(reopened.open())
+      expect(
+        (await Effect.runPromise(reopened.subscriptions())).find((s) => s.id === "old")?.complete,
+      ).toBe(false)
+      await Effect.runPromise(reopened.applySnapshot("old", 2, rows, rows))
+      expect(driver.db.prepare(`SELECT COUNT(*) AS n FROM t_organization`).get()?.["n"]).toBe(1200)
+      let pending = await Effect.runPromise(reopened.removeSubscription("old"))
+      while (pending) {
+        const before = Number(
+          driver.db.prepare(`SELECT COUNT(*) AS n FROM membership`).get()?.["n"],
+        )
+        pending = await Effect.runPromise(reopened.collectRetired())
+        const after = Number(driver.db.prepare(`SELECT COUNT(*) AS n FROM membership`).get()?.["n"])
+        expect(before - after).toBeLessThanOrEqual(128)
+      }
+      expect(driver.db.prepare(`SELECT COUNT(*) AS n FROM t_organization`).get()?.["n"]).toBe(50)
+    } finally {
+      driver.db.close()
+    }
+  })
+
+  it("retries a rolled-back cleanup from its durable retirement marker", async () => {
+    const driver = nodeAsyncDriver()
+    const store = new LocalStore(driver, schema, "org_1")
+    try {
+      await Effect.runPromise(store.open({ clientId: "gc-rollback" }))
+      const query = { table: "organization" }
+      await Effect.runPromise(store.registerSubscription("old", query, query))
+      const row = {
+        table: "organization",
+        key: ["old"],
+        row: { id: "old", name: "old", created_at: "2026-01-01 00:00:00", hipaa_enabled: false },
+      }
+      await Effect.runPromise(store.applySnapshot("old", 1, [row], [row]))
+      driver.db.exec(
+        `CREATE TEMP TRIGGER reject_gc BEFORE DELETE ON t_organization BEGIN SELECT RAISE(ABORT, 'busy'); END`,
+      )
+      await expect(Effect.runPromise(store.removeSubscription("old"))).rejects.toThrow("busy")
+      expect(
+        driver.db.prepare(`SELECT retired, complete FROM subscriptions WHERE id = 'old'`).get(),
+      ).toEqual({ retired: 1, complete: 1 })
+      expect(driver.db.prepare(`SELECT COUNT(*) AS n FROM membership`).get()?.["n"]).toBe(1)
+      driver.db.exec(`DROP TRIGGER reject_gc`)
+      expect(await Effect.runPromise(store.collectRetired())).toBe(false)
+      expect(driver.db.prepare(`SELECT COUNT(*) AS n FROM t_organization`).get()?.["n"]).toBe(0)
+    } finally {
+      driver.db.close()
+    }
+  })
+
   it("checks only candidate rows, preserving other owners and transferred window memberships", async () => {
     const driver = nodeAsyncDriver()
     const batches: Array<ReadonlyArray<Statement>> = []
@@ -204,7 +288,11 @@ it("keeps window growth linear and restores only live subscriptions while retain
       "0",
       "19",
     ])
-    await Effect.runPromise(store.removeSubscription("19"))
+    expect(await Effect.runPromise(store.removeSubscription("19"))).toBe(true)
+    expect(driver.db.prepare("SELECT COUNT(*) AS n FROM t_organization").get()?.["n"]).toBe(72)
+    while (await Effect.runPromise(store.collectRetired())) {
+      /* drain bounded passes */
+    }
     expect(driver.db.prepare("SELECT COUNT(*) AS n FROM t_organization").get()?.["n"]).toBe(10)
     await Effect.runPromise(store.removeSubscription("0"))
     expect(driver.db.prepare("SELECT COUNT(*) AS n FROM subscriptions").get()?.["n"]).toBe(0)
