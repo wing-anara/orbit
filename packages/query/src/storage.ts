@@ -45,14 +45,21 @@ export const upsertChangedWhere = (table: TableSchema): string =>
 export const deleteByKeySql = (table: TableSchema): string =>
   `DELETE FROM ${quoteIdent(localTableName(table.name))} WHERE ${quoteIdent(KEY_COLUMN)} = ?`
 
-export const selectByKeySql = (table: TableSchema): string => {
+const selectRowSql = (table: TableSchema): string => {
   const cols = table.columns.map((c) =>
     c.kind === "bigint"
       ? `CAST(${quoteIdent(c.name)} AS TEXT) AS ${quoteIdent(c.name)}`
       : quoteIdent(c.name),
   )
-  return `SELECT ${quoteIdent(KEY_COLUMN)}, ${cols.join(", ")} FROM ${quoteIdent(localTableName(table.name))} WHERE ${quoteIdent(KEY_COLUMN)} = ?`
+  return `SELECT ${quoteIdent(KEY_COLUMN)}, ${cols.join(", ")} FROM ${quoteIdent(localTableName(table.name))}`
 }
+
+export const selectByKeySql = (table: TableSchema): string =>
+  `${selectRowSql(table)} WHERE ${quoteIdent(KEY_COLUMN)} = ?`
+
+/** Bulk hydration retains the same lossless bigint projection as single-row reads. */
+export const selectByKeysSql = (table: TableSchema): string =>
+  `${selectRowSql(table)} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT value FROM json_each(?))`
 
 export const countSql = (table: TableSchema): string =>
   `SELECT COUNT(*) AS n FROM ${quoteIdent(localTableName(table.name))}`

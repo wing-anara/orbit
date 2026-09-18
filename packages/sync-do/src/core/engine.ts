@@ -51,6 +51,7 @@ import {
   rowFromRecord,
   rowToParams,
   selectByKeySql,
+  selectByKeysSql,
   upsertSql,
   UnstorableValueError,
   type PlannedQuery,
@@ -1018,10 +1019,9 @@ export class SyncEngine {
       }
       const records = new Map<string, SqlRecord>()
       for (const [table, keys] of needed) {
-        for (const record of this.db.query(
-          `SELECT * FROM ${quoteIdent(localTableName(table))} WHERE ${quoteIdent(KEY_COLUMN)} IN (SELECT value FROM json_each(?))`,
-          [JSON.stringify([...keys])],
-        ))
+        const schema = this.rt.table(table)
+        if (schema === undefined) throw new Error("snapshot table is not in schema")
+        for (const record of this.db.query(selectByKeysSql(schema), [JSON.stringify([...keys])]))
           records.set(memberRef(table, keyOfRecord(record)), record)
       }
       for (const m of members) {

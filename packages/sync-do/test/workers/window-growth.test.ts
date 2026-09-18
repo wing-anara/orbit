@@ -37,7 +37,7 @@ it("bounds growing-window reads in workerd, including the candidate membership p
       contents: "payload",
       createdAt: "2026-01-01 00:00:00",
       score: null,
-      big: null,
+      big: i % 2 === 0 ? "9223372036854775807" : "-9223372036854775808",
       price: null,
       blob: null,
       day: null,
@@ -65,6 +65,7 @@ it("bounds growing-window reads in workerd, including the candidate membership p
     const snapshot = grown.success.events.find((e) => e.type === "snapshot")
     return {
       growthReads,
+      bigints: snapshot?.type === "snapshot" ? snapshot.rows.map((r) => r.row?.["big"]) : [],
       added: snapshot?.type === "snapshot" ? snapshot.rows.length : -1,
       basedOn: snapshot?.type === "snapshot" && snapshot.basedOn === base.success.subscription,
       members: engine.membershipOf(grown.success.subscription).length,
@@ -74,4 +75,9 @@ it("bounds growing-window reads in workerd, including the candidate membership p
   // A subscription-first JSON join reads >100,000 rows for this workload in
   // workerd, even though Node SQLite chooses a fast plan for the same query.
   expect(result.growthReads).toBeLessThan(20_000)
+  expect(result.bigints).toEqual(
+    Array.from({ length: 100 }, (_, i) =>
+      i % 2 === 0 ? "9223372036854775807" : "-9223372036854775808",
+    ),
+  )
 })
