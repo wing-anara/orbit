@@ -10,7 +10,11 @@ import { compileSyncSchema, defineSyncSchema, type IntrospectedShape } from "@or
 
 import { defineMutator, defineMutators, type MutationContext } from "../../src/index.ts"
 import type { PushDb, SqlParam, SqlTx } from "../../src/server/db.ts"
-import { SELECT_LAST_MUTATION_SQL, UPSERT_CLIENT_SQL } from "../../src/server/push-handler.ts"
+import {
+  ENSURE_CLIENT_SQL,
+  SELECT_LAST_MUTATION_SQL,
+  UPSERT_CLIENT_SQL,
+} from "../../src/server/push-handler.ts"
 
 type Kind = IntrospectedShape["tables"][number]["columns"][number]["kind"]
 
@@ -183,6 +187,8 @@ export class FakeDb implements PushDb {
       },
       execute: async (sql, params) => {
         record(sql, params)
+        if (sql === ENSURE_CLIENT_SQL && !pendingLast.has(String(params[0])))
+          pendingLast.set(String(params[0]), 0)
         if (sql === UPSERT_CLIENT_SQL) pendingLast.set(String(params[0]), Number(params[2]))
       },
     }

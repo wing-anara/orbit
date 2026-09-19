@@ -8,15 +8,15 @@
  * applies the mutation's rows, and drops its optimistic overlay atomically with them.
  *
  * Per mutation, in order:
- * 1. `SELECT last_mutation_id ... FOR UPDATE` locks the client's row (a missing row counts as 0).
+ * 1. Ensure the client's row exists at counter 0, then lock/read it with `SELECT ... FOR UPDATE`.
  * 2. `id <= last`: `duplicate`, nothing is written.
  * 3. `id > last + 1`: the push stops and is `refused` as `out_of_order` with the server's
  *    `last_mutation_id`; the client resynchronizes from there.
  * 4. Otherwise the arguments are decoded, the mutator runs against a `MutationTx` over the
  *    transaction, the bookkeeping row is upserted, and the transaction commits: `applied`.
  * 5. When the arguments are invalid or the mutator throws, the transaction rolls back, a second
- *    transaction records `last_mutation_id = id` so the client drops the mutation, and the outcome
- *    is `failed` with the error message. RetryableMutationError instead leaves the id unconsumed.
+ *    transaction locks the counter again and records the failure unless a concurrent retry has
+ *    already consumed it. RetryableMutationError instead leaves the id unconsumed.
  *
  * Runs on the Web standard `Request`/`Response`, so it fits Cloudflare Workers and Node alike.
  */
@@ -63,6 +63,13 @@ export type PushHandler = (request: Request) => Promise<Response>
 
 export const SELECT_LAST_MUTATION_SQL = `SELECT last_mutation_id FROM ${ORBIT_CLIENTS_TABLE} WHERE client_id = ? FOR UPDATE`
 
+// Lock a real row before reading the counter. SELECT FOR UPDATE on a missing key
+// takes a gap lock under REPEATABLE READ; concurrent new clients then deadlock
+// when they try to insert into the same gap.
+export const ENSURE_CLIENT_SQL =
+  `INSERT INTO ${ORBIT_CLIENTS_TABLE} (client_id, partition_key, last_mutation_id, updated_at) VALUES (?, ?, 0, ?) ` +
+  `ON DUPLICATE KEY UPDATE client_id = VALUES(client_id)`
+
 export const UPSERT_CLIENT_SQL =
   `INSERT INTO ${ORBIT_CLIENTS_TABLE} (client_id, partition_key, last_mutation_id, updated_at) VALUES (?, ?, ?, ?) ` +
   `ON DUPLICATE KEY UPDATE last_mutation_id = VALUES(last_mutation_id), partition_key = VALUES(partition_key), updated_at = VALUES(updated_at)`
@@ -96,6 +103,11 @@ const readLast = async (tx: SqlTx, clientId: string): Promise<number> => {
 const recordLast = (tx: SqlTx, body: PushRequest, id: number): Promise<void> =>
   tx.execute(UPSERT_CLIENT_SQL, [body.clientId, body.partition, id, nowWire()])
 
+const lockClient = async (tx: SqlTx, body: PushRequest): Promise<number> => {
+  await tx.execute(ENSURE_CLIENT_SQL, [body.clientId, body.partition, nowWire()])
+  return readLast(tx, body.clientId)
+}
+
 /** Transient application failures leave the durable mutation queued for another push. */
 export class RetryableMutationError extends Error {}
 
@@ -122,7 +134,7 @@ export const createPushHandler = <D, M extends MutatorDefinitions<D>>(
     mutation: PushRequest["mutations"][number],
   ): Promise<Step> => {
     const attempt = db.transaction(async (tx): Promise<Step> => {
-      const last = await readLast(tx, body.clientId)
+      const last = await lockClient(tx, body)
       if (mutation.id <= last) return { kind: "duplicate", last }
       if (mutation.id > last + 1) return { kind: "out_of_order", last }
       const ctx: MutationContext = {
@@ -147,7 +159,17 @@ export const createPushHandler = <D, M extends MutatorDefinitions<D>>(
       if (e instanceof ApplyFailure) return { kind: "failed", error: errorText(e.cause) }
       throw e
     })
-    if (step.kind === "failed") await db.transaction((tx) => recordLast(tx, body, mutation.id))
+    if (step.kind === "failed") {
+      return db.transaction(async (tx): Promise<Step> => {
+        // A retry of this client can commit while the failed attempt rolls back.
+        // Never let failure bookkeeping rewind a newer committed counter.
+        const last = await lockClient(tx, body)
+        if (last >= mutation.id) return { kind: "duplicate", last }
+        if (mutation.id !== last + 1) return { kind: "out_of_order", last }
+        await recordLast(tx, body, mutation.id)
+        return step
+      })
+    }
     return step
   }
 

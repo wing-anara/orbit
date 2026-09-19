@@ -16,6 +16,7 @@ export {
   RetryableMutationError,
   MAX_ERROR_LENGTH,
   SELECT_LAST_MUTATION_SQL,
+  ENSURE_CLIENT_SQL,
   UPSERT_CLIENT_SQL,
   type PushAuthorization,
   type PushHandler,

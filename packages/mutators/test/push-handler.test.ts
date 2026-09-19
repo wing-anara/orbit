@@ -5,6 +5,7 @@ import { decodePushResponse, MUTATION_PROTOCOL_VERSION, type PushRequest } from 
 import {
   createPushHandler,
   RetryableMutationError,
+  ENSURE_CLIENT_SQL,
   SELECT_LAST_MUTATION_SQL,
   UPSERT_CLIENT_SQL,
 } from "../src/server/index.ts"
@@ -42,6 +43,11 @@ const selectLast = (clientId = "c1"): Statement => ({
   sql: SELECT_LAST_MUTATION_SQL,
   params: [clientId],
 })
+
+const lockClient = () => [
+  { sql: ENSURE_CLIENT_SQL, params: ["c1", "org_1", expect.stringMatching(WIRE_DATETIME)] },
+  selectLast(),
+]
 
 const upsert = (id: number, clientId = "c1", partition = "org_1") => ({
   sql: UPSERT_CLIENT_SQL,
@@ -131,7 +137,7 @@ describe("createPushHandler mutation flow", () => {
       lastMutationId: 1,
     })
     expect(db.rolledBack).toEqual([])
-    expect(db.committed).toEqual([[selectLast(), insertItem("i1", "first", 1), upsert(1)]])
+    expect(db.committed).toEqual([[...lockClient(), insertItem("i1", "first", 1), upsert(1)]])
     expect(db.last.get("c1")).toBe(1)
     expect(observed.contexts).toEqual([
       {
@@ -163,8 +169,8 @@ describe("createPushHandler mutation flow", () => {
       lastMutationId: 4,
     })
     expect(db.committed).toEqual([
-      [selectLast(), insertItem("i1", "a", 1), upsert(3)],
-      [selectLast(), insertItem("i2", "b", 1), upsert(4)],
+      [...lockClient(), insertItem("i1", "a", 1), upsert(3)],
+      [...lockClient(), insertItem("i2", "b", 1), upsert(4)],
     ])
   })
 
@@ -188,9 +194,9 @@ describe("createPushHandler mutation flow", () => {
       lastMutationId: 4,
     })
     expect(db.committed).toEqual([
-      [selectLast()],
-      [selectLast()],
-      [selectLast(), insertItem("i3", "new", 1), upsert(4)],
+      [...lockClient()],
+      [...lockClient()],
+      [...lockClient(), insertItem("i3", "new", 1), upsert(4)],
     ])
     expect(observed.contexts.map((c) => c.mutationId)).toEqual([4])
   })
@@ -212,8 +218,8 @@ describe("createPushHandler mutation flow", () => {
       lastMutationId: 2,
     })
     expect(db.committed).toEqual([
-      [selectLast(), insertItem("i1", "a", 1), upsert(2)],
-      [selectLast()],
+      [...lockClient(), insertItem("i1", "a", 1), upsert(2)],
+      [...lockClient()],
     ])
     expect(db.last.get("c1")).toBe(2)
     expect(observed.contexts.map((c) => c.mutationId)).toEqual([2])
@@ -237,7 +243,7 @@ describe("createPushHandler mutation flow", () => {
     })
     expect(db.rolledBack).toEqual([
       [
-        selectLast(),
+        ...lockClient(),
         {
           sql: "INSERT INTO `_orbit_mut` (`id`, `org`, `name`, `flag`) VALUES (?, ?, ?, ?)",
           params: ["doomed", "org_1", "doomed", 0],
@@ -245,8 +251,8 @@ describe("createPushHandler mutation flow", () => {
       ],
     ])
     expect(db.committed).toEqual([
-      [upsert(1)],
-      [selectLast(), insertItem("i1", "after", 1), upsert(2)],
+      [...lockClient(), upsert(1)],
+      [...lockClient(), insertItem("i1", "after", 1), upsert(2)],
     ])
   })
 
@@ -292,6 +298,36 @@ describe("createPushHandler mutation flow", () => {
     expect(attempts).toBe(2)
   })
 
+  it("does not rewind a counter advanced by a retry between rollback and failure bookkeeping", async () => {
+    const db = new FakeDb()
+    const handler = createPushHandler({
+      schema,
+      mutators,
+      db: {
+        transaction: async (f) => {
+          try {
+            return await db.transaction(f)
+          } catch (error) {
+            // Another request acquired the released lock and committed ids 1 and 2.
+            db.last.set("c1", 2)
+            throw error
+          }
+        },
+      },
+      authorize: async () => ({ subject: "alice" }),
+    })
+    const response = await handler(
+      request(push([{ id: 1, name: "writeThenBoom", args: { id: "rolled-back" } }])),
+    )
+    expect(decodePushResponse(await response.json())).toEqual({
+      type: "ok",
+      outcomes: [{ id: 1, status: "duplicate" }],
+      lastMutationId: 2,
+    })
+    expect(db.last.get("c1")).toBe(2)
+    expect(db.committed).toEqual([[...lockClient()]])
+  })
+
   it("treats invalid arguments and unknown mutators as failed and consumes the ids", async () => {
     const { send, db } = setup()
     const r = await send(
@@ -311,11 +347,11 @@ describe("createPushHandler mutation flow", () => {
       ],
       lastMutationId: 3,
     })
-    expect(db.rolledBack).toEqual([[selectLast()], [selectLast()]])
+    expect(db.rolledBack).toEqual([[...lockClient()], [...lockClient()]])
     expect(db.committed).toEqual([
-      [upsert(1)],
-      [upsert(2)],
-      [selectLast(), insertItem("i1", "ok", 1), upsert(3)],
+      [...lockClient(), upsert(1)],
+      [...lockClient(), upsert(2)],
+      [...lockClient(), insertItem("i1", "ok", 1), upsert(3)],
     ])
   })
 
@@ -335,7 +371,7 @@ describe("createPushHandler mutation flow", () => {
       ],
       lastMutationId: 1,
     })
-    expect(db.committed).toEqual([[upsert(1)]])
+    expect(db.committed).toEqual([[...lockClient(), upsert(1)]])
   })
 
   it("truncates long error messages to 500 characters", async () => {
@@ -399,12 +435,14 @@ describe("createPushHandler mutation flow", () => {
       lastMutationId: 3,
     })
     expect(db.committed[0]!.map((s) => s.sql)).toEqual([
+      ENSURE_CLIENT_SQL,
       SELECT_LAST_MUTATION_SQL,
       "SELECT `id`, `org`, `name`, `flag`, `n`, `big`, `price`, `meta`, `at`, `day`, `tm`, `data`, `score`, `parentId` FROM `_orbit_mut` WHERE `id` = ?",
       "UPDATE `_orbit_mut` SET `name` = ? WHERE `id` = ?",
       UPSERT_CLIENT_SQL,
     ])
     expect(db.committed[2]!.map((s) => s.sql.slice(0, 6))).toEqual([
+      "INSERT",
       "SELECT",
       "SELECT",
       "SELECT",
