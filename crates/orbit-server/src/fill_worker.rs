@@ -12,8 +12,8 @@ use orbit_protocol::errors::EngineError;
 use orbit_protocol::fill::{FillChunk, FillPollResponse, FillRequest, FillResult};
 use orbit_protocol::schema::SyncSchema;
 use orbit_vstream::SubscriberConfig;
-use orbit_vstream::fill::{run_derived_fill, run_fill};
-use tokio::sync::Semaphore;
+use orbit_vstream::fill::{run_derived_fill_with_client, run_fill_with_client};
+use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -22,6 +22,7 @@ pub struct FillWorker {
     pub worker_url: String,
     pub secret: String,
     pub subscriber: SubscriberConfig,
+    pub source_client: OnceCell<orbit_vstream::client::Client>,
     pub schema: Arc<SyncSchema>,
     pub concurrency: usize,
     pub timeout: Duration,
@@ -115,37 +116,48 @@ impl FillWorker {
             .schema
             .table(&req.table)
             .is_some_and(|t| !t.partition_routes.is_empty());
-        let outcome = if routed {
-            orbit_vstream::routed_fill::run_routed_fill(
-                &self.subscriber,
-                &self.schema,
-                &req.table,
-                &req.partition,
-                self.timeout,
-                cancel,
-            )
-            .await
-        } else if derived {
-            run_derived_fill(
-                &self.subscriber,
-                &self.schema,
-                &req.table,
-                &req.partition,
-                self.timeout,
-                cancel,
-            )
-            .await
-        } else {
-            run_fill(
-                &self.subscriber,
-                &self.schema,
-                &req.table,
-                &req.partition,
-                self.timeout,
-                cancel,
-            )
-            .await
-        };
+        let outcome = retry_fill(self.timeout, cancel, || async {
+            let client = self
+                .source_client
+                .get_or_try_init(|| self.subscriber.endpoint.connect())
+                .await?
+                .clone();
+            if routed {
+                orbit_vstream::routed_fill::run_routed_fill_with_client(
+                    &self.subscriber,
+                    &self.schema,
+                    &req.table,
+                    &req.partition,
+                    self.timeout,
+                    cancel,
+                    client,
+                )
+                .await
+            } else if derived {
+                run_derived_fill_with_client(
+                    &self.subscriber,
+                    &self.schema,
+                    &req.table,
+                    &req.partition,
+                    self.timeout,
+                    cancel,
+                    client,
+                )
+                .await
+            } else {
+                run_fill_with_client(
+                    &self.subscriber,
+                    &self.schema,
+                    &req.table,
+                    &req.partition,
+                    self.timeout,
+                    cancel,
+                    client,
+                )
+                .await
+            }
+        })
+        .await;
         match outcome {
             Ok(outcome) => {
                 let row_count = outcome.rows.len() as u64;
@@ -262,5 +274,101 @@ impl FillWorker {
             Ok(r) => warn!(fill_id, status = %r.status(), "could not drop fill from registry"),
             Err(e) => warn!(fill_id, error = %e, "could not drop fill from registry"),
         }
+    }
+}
+
+/// Retry an entire read-only snapshot on transient source errors. Every attempt
+/// acquires its own position fence and rows; partial snapshots never escape.
+async fn retry_fill<T, F, Fut>(
+    timeout: Duration,
+    cancel: &CancellationToken,
+    mut run: F,
+) -> Result<T, orbit_vstream::error::VStreamError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, orbit_vstream::error::VStreamError>>,
+{
+    use orbit_vstream::error::VStreamError;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(VStreamError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => return Err(VStreamError::Timeout(timeout)),
+            result = run() => result,
+        };
+        match result {
+            Err(error) if error.is_retryable() => {
+                metrics::counter!("orbit_fill_source_retries_total").increment(1);
+                warn!(error = %error, backoff_ms = backoff.as_millis() as u64, "transient fill source failure; retrying snapshot");
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(VStreamError::Cancelled),
+                    _ = tokio::time::sleep_until(deadline) => return Err(VStreamError::Timeout(timeout)),
+                    _ = tokio::time::sleep(backoff) => {},
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbit_vstream::error::VStreamError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retries_transient_snapshot_from_scratch() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_fill(Duration::from_secs(2), &CancellationToken::new(), || async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(VStreamError::EndedUnexpectedly)
+            } else {
+                Ok(vec!["complete snapshot"])
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, vec!["complete snapshot"]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn never_retries_fatal_errors() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), _> = retry_fill(Duration::from_secs(1), &CancellationToken::new(), || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(VStreamError::Unauthenticated)
+        })
+        .await;
+        assert!(matches!(result, Err(VStreamError::Unauthenticated)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bounds_retries_and_inflight_reads_by_one_deadline() {
+        let timeout = Duration::from_millis(20);
+        let result: Result<(), _> = retry_fill(timeout, &CancellationToken::new(), || async {
+            Err(VStreamError::EndedUnexpectedly)
+        })
+        .await;
+        assert!(matches!(result, Err(VStreamError::Timeout(t)) if t == timeout));
+        let result: Result<(), _> = retry_fill(timeout, &CancellationToken::new(), || std::future::pending()).await;
+        assert!(matches!(result, Err(VStreamError::Timeout(t)) if t == timeout));
+    }
+
+    #[tokio::test]
+    async fn cancellation_prevents_new_source_reads() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result: Result<(), _> = retry_fill(Duration::from_secs(1), &cancel, || async {
+            panic!("cancelled fill must not start a source read")
+        })
+        .await;
+        assert!(matches!(result, Err(VStreamError::Cancelled)));
     }
 }

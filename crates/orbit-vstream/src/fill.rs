@@ -26,12 +26,12 @@ use tracing::{debug, info};
 
 use crate::checkpoint::ShardId;
 use crate::error::VStreamError;
-use crate::execute::{execute, query};
+use crate::execute::{execute_with_client, query_with_client};
 use crate::normalize::{TableProjection, query_fields};
 use crate::proto::binlogdata::{Filter, Rule, ShardGtid, VGtid};
 use crate::proto::vtgate::VStreamRequest;
 use crate::stream::{Assembler, StepPolicy, StreamItem};
-use crate::subscriber::{SubscriberConfig, current_position, flags_for, quote_ident, shards_or_all};
+use crate::subscriber::{SubscriberConfig, current_position_with_client, flags_for, quote_ident, shards_or_all};
 
 /// Parent keys per `IN (...)` list in a derived fill.
 pub const DERIVED_FILL_CHUNK: usize = 500;
@@ -86,6 +86,19 @@ pub async fn run_fill(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<FillOutcome, VStreamError> {
+    let client = config.endpoint.connect().await?;
+    run_fill_with_client(config, schema, table, partition, timeout, cancel, client).await
+}
+
+pub async fn run_fill_with_client(
+    config: &SubscriberConfig,
+    schema: &SyncSchema,
+    table: &str,
+    partition: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    mut client: crate::client::Client,
+) -> Result<FillOutcome, VStreamError> {
     let table_schema = schema
         .table(table)
         .ok_or_else(|| VStreamError::Unsupported(format!("unknown table {table}")))?;
@@ -98,7 +111,6 @@ pub async fn run_fill(
     );
     let started = Instant::now();
 
-    let mut client = config.endpoint.connect().await?;
     let shard_gtids = shards_or_all(config)
         .into_iter()
         .map(|shard| ShardGtid {
@@ -238,6 +250,19 @@ pub async fn run_derived_fill(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<FillOutcome, VStreamError> {
+    let client = config.endpoint.connect().await?;
+    run_derived_fill_with_client(config, schema, table, partition, timeout, cancel, client).await
+}
+
+pub async fn run_derived_fill_with_client(
+    config: &SubscriberConfig,
+    schema: &SyncSchema,
+    table: &str,
+    partition: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    mut client: crate::client::Client,
+) -> Result<FillOutcome, VStreamError> {
     let table_schema = schema
         .table(table)
         .ok_or_else(|| VStreamError::Unsupported(format!("unknown table {table}")))?;
@@ -262,7 +287,9 @@ pub async fn run_derived_fill(
 
     let work = async {
         // 1. The fill position, before any select.
-        let positions = current_position(config, schema).await?.positions;
+        let positions = current_position_with_client(config, schema, client.clone())
+            .await?
+            .positions;
 
         // 2. The parent keys of the partition.
         let keys_sql = format!(
@@ -273,7 +300,7 @@ pub async fn run_derived_fill(
             sql_literal(schema.partition.key_kind, partition)?
         );
         debug!(sql = %keys_sql, "reading parent keys for derived fill");
-        let keys: Vec<String> = execute(&config.endpoint, &config.keyspace, &keys_sql)
+        let keys: Vec<String> = execute_with_client(&mut client, &config.keyspace, &keys_sql)
             .await?
             .into_iter()
             .filter_map(|row| row.into_iter().next().flatten())
@@ -301,7 +328,7 @@ pub async fn run_derived_fill(
                 quote_ident(table),
                 quote_ident(&table_schema.partition_column),
             );
-            let result = query(&config.endpoint, &config.keyspace, &sql).await?;
+            let result = query_with_client(&mut client, &config.keyspace, &sql).await?;
             let fields = query_fields(table_schema, &result.fields)?;
             let projection = TableProjection::build(table_schema, &fields)?;
             for raw in &result.rows {

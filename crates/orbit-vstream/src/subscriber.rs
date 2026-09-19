@@ -97,7 +97,16 @@ pub fn quote_ident(name: &str) -> String {
 /// Reads the server's current position for every shard by opening a stream at `current` and
 /// taking the first VGTID. Used to validate checkpoints before resuming.
 pub async fn current_position(config: &SubscriberConfig, schema: &SyncSchema) -> Result<Checkpoint, VStreamError> {
-    let mut client = config.endpoint.connect().await?;
+    let client = config.endpoint.connect().await?;
+    current_position_with_client(config, schema, client).await
+}
+
+/// Reads a position using an existing multiplexed channel; each call gets its own stream.
+pub async fn current_position_with_client(
+    config: &SubscriberConfig,
+    schema: &SyncSchema,
+    mut client: crate::client::Client,
+) -> Result<Checkpoint, VStreamError> {
     let cp = Checkpoint::empty(0);
     let req = VStreamRequest {
         tablet_type: config.tablet_type as i32,

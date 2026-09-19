@@ -3,10 +3,10 @@
 //! Duplicate permissions and overlapping routes are deduplicated by primary key.
 
 use crate::error::VStreamError;
-use crate::execute::query;
+use crate::execute::query_with_client;
 use crate::fill::{FillOutcome, sql_literal};
 use crate::normalize::{TableProjection, query_fields};
-use crate::subscriber::{SubscriberConfig, current_position, quote_ident};
+use crate::subscriber::{SubscriberConfig, current_position_with_client, quote_ident};
 use orbit_protocol::schema::{SyncSchema, TableSchema};
 use orbit_protocol::value::Row;
 use std::collections::BTreeMap;
@@ -119,6 +119,19 @@ pub async fn run_routed_fill(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<FillOutcome, VStreamError> {
+    let client = config.endpoint.connect().await?;
+    run_routed_fill_with_client(config, schema, table, partition, timeout, cancel, client).await
+}
+
+pub async fn run_routed_fill_with_client(
+    config: &SubscriberConfig,
+    schema: &SyncSchema,
+    table: &str,
+    partition: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    mut client: crate::client::Client,
+) -> Result<FillOutcome, VStreamError> {
     let table = schema
         .table(table)
         .ok_or_else(|| malformed(format!("unknown table {table}")))?;
@@ -127,13 +140,15 @@ pub async fn run_routed_fill(
     let work = async {
         // Fence before SELECT, as with derived fills. Later full CDC images are replayed by
         // the Durable Object; changes at/before the fence are already reflected in the reads.
-        let positions = current_position(config, schema).await?.positions;
+        let positions = current_position_with_client(config, schema, client.clone())
+            .await?
+            .positions;
         if positions.is_empty() {
             return Err(malformed("current position has no shard"));
         }
         let mut rows: BTreeMap<String, Row> = BTreeMap::new();
         for sql in statements {
-            let result = query(&config.endpoint, &config.keyspace, &sql).await?;
+            let result = query_with_client(&mut client, &config.keyspace, &sql).await?;
             let projection = TableProjection::build(table, &query_fields(table, &result.fields)?)?;
             for raw in &result.rows {
                 let row = projection.project(raw)?;

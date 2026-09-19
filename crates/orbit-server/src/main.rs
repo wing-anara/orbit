@@ -157,6 +157,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             worker_url: args.worker_url.clone(),
             secret: args.worker_secret.clone(),
             subscriber: sub_cfg,
+            source_client: tokio::sync::OnceCell::new(),
             schema: schema.clone(),
             concurrency: args.fill_concurrency,
             timeout: args.fill_timeout(),

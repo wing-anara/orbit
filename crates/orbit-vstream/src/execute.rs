@@ -69,7 +69,16 @@ pub async fn execute(
     keyspace: &str,
     sql: &str,
 ) -> Result<Vec<Vec<Option<String>>>, VStreamError> {
-    let result = query(endpoint, keyspace, sql).await?;
+    let mut client = endpoint.connect().await?;
+    execute_with_client(&mut client, keyspace, sql).await
+}
+
+pub async fn execute_with_client(
+    client: &mut Client,
+    keyspace: &str,
+    sql: &str,
+) -> Result<Vec<Vec<Option<String>>>, VStreamError> {
+    let result = query_with_client(client, keyspace, sql).await?;
     Ok(result
         .rows
         .into_iter()
