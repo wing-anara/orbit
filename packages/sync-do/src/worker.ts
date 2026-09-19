@@ -167,6 +167,15 @@ export const createOrbitHandler = <Env extends OrbitWorkerEnv>(config: OrbitHand
         target.pathname = "/next"
         return stub.fetch(new Request(target, { method: "GET" }))
       }
+      if (path === "/internal/fills/claim" && request.method === "POST") {
+        const stub = env.ORBIT_FILL_REGISTRY.get(env.ORBIT_FILL_REGISTRY.idFromName("registry"))
+        return stub.fetch(
+          new Request("https://registry/claim", {
+            method: "POST",
+            headers: request.headers,
+          }),
+        )
+      }
       const upload = /^\/internal\/fills\/(.+)$/.exec(path)
       if (upload !== null && request.method === "POST") {
         const fillId = decodeURIComponent(upload[1] ?? "")

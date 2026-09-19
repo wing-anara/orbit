@@ -31,6 +31,9 @@ pub struct FillWorker {
 impl FillWorker {
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         let permits = Arc::new(Semaphore::new(self.concurrency));
+        // Reserve a batch before polling. Polling as soon as a single slot frees
+        // otherwise degenerates to one request per network round trip under load.
+        let batch_size = self.concurrency.clamp(1, 16);
         let mut backoff = Duration::from_millis(250);
         loop {
             if cancel.is_cancelled() {
@@ -38,11 +41,11 @@ impl FillWorker {
             }
             let permit = tokio::select! {
                 _ = cancel.cancelled() => return,
-                p = permits.clone().acquire_owned() => p.expect("semaphore"),
+                p = permits.clone().acquire_many_owned(batch_size as u32) => p.expect("semaphore"),
             };
             let poll = tokio::select! {
                 _ = cancel.cancelled() => return,
-                r = self.poll() => r,
+                r = self.poll(batch_size) => r,
             };
             match poll {
                 Ok(resp) => {
@@ -72,8 +75,12 @@ impl FillWorker {
         }
     }
 
-    async fn poll(&self) -> Result<FillPollResponse, String> {
-        let url = format!("{}/internal/fills/next?wait=25", self.worker_url.trim_end_matches('/'));
+    async fn poll(&self, capacity: usize) -> Result<FillPollResponse, String> {
+        let url = format!(
+            "{}/internal/fills/next?wait=25&ack=1&limit={}",
+            self.worker_url.trim_end_matches('/'),
+            capacity.min(16)
+        );
         let resp = self
             .client
             .get(&url)
@@ -82,12 +89,37 @@ impl FillWorker {
             .send()
             .await
             .map_err(|e| e.to_string())?;
+        let lease = resp.headers().get("x-orbit-fill-lease").cloned();
         let status = resp.status();
         let body = resp.text().await.map_err(|e| e.to_string())?;
         if !status.is_success() {
             return Err(format!("http {status}: {}", body.chars().take(200).collect::<String>()));
         }
-        serde_json::from_str(&body).map_err(|e| format!("invalid poll response: {e}"))
+        let batch: FillPollResponse = serde_json::from_str(&body).map_err(|e| format!("invalid poll response: {e}"))?;
+        if let Some(lease) = lease.filter(|_| !batch.requests.is_empty()) {
+            // Receiving the body, not sending the poll, establishes ownership. If this
+            // acknowledgement is lost, still execute the received work: the registry
+            // can redeliver it and fill completion is idempotent.
+            let claim = self
+                .client
+                .post(format!(
+                    "{}/internal/fills/claim",
+                    self.worker_url.trim_end_matches('/')
+                ))
+                .bearer_auth(&self.secret)
+                .header("x-orbit-fill-lease", lease)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await;
+            match claim {
+                Ok(r) if r.status().is_success() => {}
+                other => {
+                    warn!(result = ?other.map(|r| r.status()), "fill receipt acknowledgement failed; executing received batch");
+                    metrics::counter!("orbit_fill_claim_errors_total").increment(1);
+                }
+            }
+        }
+        Ok(batch)
     }
 
     async fn execute(&self, req: FillRequest, cancel: &CancellationToken) {
@@ -320,6 +352,43 @@ mod tests {
     use super::*;
     use orbit_vstream::error::VStreamError;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn executes_received_work_when_claim_response_is_lost() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut poll, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let n = poll.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).contains("ack=1&limit=3"));
+            let body = r#"{"requests":[{"fill_id":"org:1","schema_hash":"test","partition":"org","table":"Chatbot","requested_at_ms":1}]}"#;
+            poll.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-orbit-fill-lease: receipt\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            drop(poll);
+            let (mut claim, _) = listener.accept().await.unwrap();
+            let n = claim.read(&mut request).await.unwrap();
+            let headers = String::from_utf8_lossy(&request[..n]);
+            assert!(headers.starts_with("POST /internal/fills/claim"));
+            assert!(headers.contains("x-orbit-fill-lease: receipt"));
+            // The registry may already have committed the claim; lose only its response.
+            drop(claim);
+        });
+        let worker = FillWorker {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            worker_url: format!("http://{addr}"),
+            secret: "synthetic-test".into(),
+            subscriber: SubscriberConfig::new(orbit_vstream::client::VitessEndpoint::new("http://127.0.0.1:1"), "test"),
+            source_client: OnceCell::new(),
+            schema: Arc::new(serde_json::from_str(include_str!("../../../schema/fixtures/SyncSchema.json")).unwrap()),
+            concurrency: 3,
+            timeout: Duration::from_secs(120),
+        };
+        let received = worker.poll(3).await.unwrap();
+        assert_eq!(received.requests.len(), 1);
+        assert_eq!(received.requests[0].fill_id, "org:1");
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn retries_transient_snapshot_from_scratch() {

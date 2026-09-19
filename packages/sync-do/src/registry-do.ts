@@ -10,15 +10,24 @@ import { Schema } from "effect"
 import { FillPollResponse, FillRequest } from "@orbit/protocol"
 
 const MAX_PER_POLL = 16
+const OFFER_LEASE_MS = 5_000
+const ACTIVE_LEASE_MS = 180_000
 
 export class FillRegistryDurableObject extends DurableObject<Record<string, unknown>> {
-  private waiters: Array<() => void> = []
+  private waiters = new Set<() => void>()
 
   constructor(ctx: DurableObjectState, env: Record<string, unknown>) {
     super(ctx, env)
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS fills (fill_id TEXT PRIMARY KEY, request TEXT NOT NULL, enqueued_at INTEGER NOT NULL, leased_until INTEGER NOT NULL DEFAULT 0)`,
     )
+    const columns = ctx.storage.sql.exec(`PRAGMA table_info(fills)`).toArray()
+    if (!columns.some((c) => c["name"] === "lease_id"))
+      ctx.storage.sql.exec(`ALTER TABLE fills ADD COLUMN lease_id TEXT`)
+    ctx.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS fills_lease ON fills(leased_until, enqueued_at)`,
+    )
+    ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS fills_receipt ON fills(lease_id)`)
   }
 
   /** Called by Sync Durable Objects. Idempotent per fill id. */
@@ -31,7 +40,7 @@ export class FillRegistryDurableObject extends DurableObject<Record<string, unkn
       Date.now(),
     )
     const waiters = this.waiters
-    this.waiters = []
+    this.waiters = new Set()
     for (const w of waiters) w()
   }
 
@@ -40,12 +49,12 @@ export class FillRegistryDurableObject extends DurableObject<Record<string, unkn
     this.ctx.storage.sql.exec(`DELETE FROM fills WHERE fill_id = ?`, fillId)
   }
 
-  private takeReady(now: number): FillPollResponse {
+  private takeReady(now: number, leaseId: string | null, limit: number): FillPollResponse {
     const rows = this.ctx.storage.sql
       .exec(
         `SELECT fill_id, request FROM fills WHERE leased_until < ? ORDER BY enqueued_at LIMIT ?`,
         now,
-        MAX_PER_POLL,
+        limit,
       )
       .toArray()
     const requests: Array<FillRequest> = []
@@ -55,34 +64,65 @@ export class FillRegistryDurableObject extends DurableObject<Record<string, unkn
       // A lease keeps two pollers from running the same fill; it expires so a crashed server's
       // fills are handed out again. Completion removes the row.
       this.ctx.storage.sql.exec(
-        `UPDATE fills SET leased_until = ? WHERE fill_id = ?`,
-        now + 180_000,
+        `UPDATE fills SET leased_until = ?, lease_id = ? WHERE fill_id = ?`,
+        now + (leaseId === null ? ACTIVE_LEASE_MS : OFFER_LEASE_MS),
+        leaseId,
         parsed.fill_id,
       )
     }
     return { requests }
   }
 
-  /** Long poll: waits up to `waitMs` for at least one request. */
-  async next(waitMs: number): Promise<FillPollResponse> {
-    const first = this.takeReady(Date.now())
+  /** Long poll, also waking when a lost delivery's provisional lease expires. */
+  async next(
+    waitMs: number,
+    leaseId: string | null = null,
+    limit = MAX_PER_POLL,
+  ): Promise<FillPollResponse> {
+    const first = this.takeReady(Date.now(), leaseId, limit)
     if (first.requests.length > 0) return first
+    const nextLease = this.ctx.storage.sql
+      .exec(`SELECT MIN(leased_until) AS expiry FROM fills`)
+      .one()["expiry"]
+    const untilLease =
+      typeof nextLease === "number" ? Math.max(1, nextLease - Date.now() + 1) : 25_000
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, Math.min(Math.max(waitMs, 0), 25_000))
-      this.waiters.push(() => {
+      const wake = () => {
         clearTimeout(timer)
+        this.waiters.delete(wake)
         resolve()
-      })
+      }
+      const timer = setTimeout(wake, Math.min(Math.max(waitMs, 0), 25_000, untilLease))
+      this.waiters.add(wake)
     })
-    return this.takeReady(Date.now())
+    return this.takeReady(Date.now(), leaseId, limit)
   }
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === "GET" && url.pathname === "/next") {
       const wait = Number(url.searchParams.get("wait") ?? "20") * 1000
-      const resp = await this.next(wait)
-      return Response.json(Schema.encodeSync(FillPollResponse)(resp))
+      // Opt-in preserves old engines: only receipt-aware pollers get short offers.
+      const leaseId = url.searchParams.get("ack") === "1" ? crypto.randomUUID() : null
+      const requestedLimit = Number(url.searchParams.get("limit") ?? MAX_PER_POLL)
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(MAX_PER_POLL, Math.floor(requestedLimit)))
+        : MAX_PER_POLL
+      const resp = await this.next(wait, leaseId, limit)
+      return Response.json(Schema.encodeSync(FillPollResponse)(resp), {
+        headers: leaseId === null ? {} : { "x-orbit-fill-lease": leaseId },
+      })
+    }
+    if (request.method === "POST" && url.pathname === "/claim") {
+      const leaseId = request.headers.get("x-orbit-fill-lease")
+      if (leaseId === null) return new Response("missing lease", { status: 400 })
+      // A stale receipt cannot claim requests already offered to another poller.
+      this.ctx.storage.sql.exec(
+        `UPDATE fills SET leased_until = ? WHERE lease_id = ?`,
+        Date.now() + ACTIVE_LEASE_MS,
+        leaseId,
+      )
+      return new Response(null, { status: 204 })
     }
     if (request.method === "POST" && url.pathname === "/enqueue") {
       const body: unknown = await request.json()

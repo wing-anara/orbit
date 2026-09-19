@@ -27,7 +27,9 @@ When any table is pending, the subscription stays `pending` and the client recei
 
 The registry (`packages/sync-do/src/registry-do.ts`) stores requests in a SQLite table with `INSERT OR IGNORE`, so an enqueue is idempotent per fill id.
 
-The Rust fill worker (`crates/orbit-server/src/fill_worker.rs`) calls `GET /orbit/internal/fills/next?wait=25`. The registry answers at once when a request is ready. Otherwise it waits up to 25 s for an enqueue, then answers with what is ready. `takeReady` returns at most 16 requests per poll. Each returned request gets a lease of 180 s. A leased request is not handed out again until the lease expires. Completion deletes the row.
+The Rust fill worker (`crates/orbit-server/src/fill_worker.rs`) reserves execution slots, then calls `GET /orbit/internal/fills/next?wait=25&ack=1&limit=N`, with at most 16 requests per batch. The registry answers immediately when work is ready, or waits up to 25 seconds for an enqueue or lease expiry. Receipt-aware polls get a five-second provisional lease and an `x-orbit-fill-lease` response header. After decoding the complete response, the engine posts that header to `/orbit/internal/fills/claim` to extend the batch lease to 180 seconds. A lost poll response therefore delays redelivery by five seconds rather than three minutes. A stale receipt cannot extend work offered to another poller. Receipt lookup is indexed.
+
+The engine still executes received work if the claim response is lost: completion is idempotent, and discarding received work would recreate the lost-response stall. The DO buffers each upload before synchronously applying its rows and completion; subsequent uploads for the same completed fill are ignored. Completion deletes the registry row. Legacy engines that omit `ack=1` retain the original 180-second lease; new engines also accept legacy responses without a receipt header. This permits either deployment order.
 
 The worker checks the `schema_hash` of the request. A mismatch produces a failed result without a fill. It then runs the fill under a per-fill timeout (`FILL_TIMEOUT_SECS`, default 120 s).
 
