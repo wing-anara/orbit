@@ -28,5 +28,6 @@ rand = { workspace = true }
 tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 proptest = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -119,10 +119,11 @@ pub fn queries(schema: &SyncSchema, changes: Option<&[RowChange]>) -> Result<Vec
             if let Some(node) = owner_node {
                 nodes.push(node);
             }
-            let mut predicate = format!("{recipient} IS NOT NULL AND NOT ({recipient} <=> {owner})");
+            let base_predicate = format!("{recipient} IS NOT NULL AND NOT ({recipient} <=> {owner})");
+            let mut predicates = Vec::new();
             if let Some(changes) = changes {
-                let mut affected = BTreeSet::new();
                 for (table, alias) in &nodes {
+                    let mut affected = BTreeSet::new();
                     let mut routing_columns: BTreeSet<&str> = table.primary_key.iter().map(String::as_str).collect();
                     routing_columns.insert(&table.partition_column);
                     for relation in &table.relations {
@@ -149,31 +150,41 @@ pub fn queries(schema: &SyncSchema, changes: Option<&[RowChange]>) -> Result<Vec
                         let key = table
                             .primary_key
                             .iter()
-                            .map(|c| Ok(format!("{} = {}", col(alias, c), literal(table, c, after)?)))
+                            .map(|c| literal(table, c, after))
                             .collect::<Result<Vec<_>, VStreamError>>()?
-                            .join(" AND ");
+                            .join(", ");
                         affected.insert(format!("({key})"));
                     }
+                    // Keep each changed alias independently indexable. OR across joined
+                    // aliases prevents key lookups and makes private inserts scan unrelated
+                    // sharing paths. Bounded tuple-IN lists also cap SQL parsing work.
+                    let keys = table
+                        .primary_key
+                        .iter()
+                        .map(|c| col(alias, c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let values: Vec<_> = affected.into_iter().collect();
+                    for chunk in values.chunks(512) {
+                        predicates.push(format!("{base_predicate} AND ({keys}) IN ({})", chunk.join(", ")));
+                    }
                 }
-                if affected.is_empty() {
-                    continue;
-                }
-                predicate.push_str(&format!(
-                    " AND ({})",
-                    affected.into_iter().collect::<Vec<_>>().join(" OR ")
-                ));
+            } else {
+                predicates.push(base_predicate);
             }
-            for (table, alias) in nodes {
-                let sql = format!("SELECT {}{from} WHERE {predicate}", selected(table, &alias));
-                result.insert(
-                    sql.clone(),
-                    SharedQuery {
-                        table: table.name.clone(),
-                        alias,
-                        sql,
-                        scope: format!("{from} WHERE {predicate}"),
-                    },
-                );
+            for predicate in predicates {
+                for (table, alias) in &nodes {
+                    let sql = format!("SELECT {}{from} WHERE {predicate}", selected(table, alias));
+                    result.insert(
+                        sql.clone(),
+                        SharedQuery {
+                            table: table.name.clone(),
+                            alias: alias.clone(),
+                            sql,
+                            scope: format!("{from} WHERE {predicate}"),
+                        },
+                    );
+                }
             }
         }
     }
@@ -466,6 +477,83 @@ mod tests {
         assert!(queries(&schema(), Some(&[])).unwrap().is_empty());
     }
     #[test]
+    fn batched_composite_keys_and_independent_aliases_match_the_full_join_oracle() {
+        let mut schema = schema();
+        schema
+            .tables
+            .iter_mut()
+            .find(|t| t.name == "permission")
+            .unwrap()
+            .primary_key = vec!["id".into(), "org".into()];
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE doc(id TEXT PRIMARY KEY, org TEXT, name TEXT); CREATE TABLE permission(id TEXT, org TEXT, docId TEXT, role TEXT, PRIMARY KEY(id,org));").unwrap();
+        let mut changes = vec![];
+        let mut expected = BTreeSet::new();
+        for i in 0..1200 {
+            let id = format!("d{i}");
+            let grant = format!("p{i}");
+            let recipient = if i % 2 == 0 { "owner" } else { "recipient" };
+            db.execute("INSERT INTO doc VALUES (?, 'owner', 'name')", [&id])
+                .unwrap();
+            db.execute(
+                "INSERT INTO permission VALUES (?, ?, ?, 'VIEWER')",
+                [&grant, recipient, &id],
+            )
+            .unwrap();
+            if i < 1100 {
+                changes.push(RowChange {
+                    table: "doc".into(),
+                    op: RowOp::Insert,
+                    key: vec![id.clone().into()],
+                    before: None,
+                    after: Some(serde_json::from_value(json!({"id":id,"org":"owner","name":"name"})).unwrap()),
+                });
+            } else if i < 1110 {
+                changes.push(RowChange {
+                    table: "permission".into(),
+                    op: RowOp::Insert,
+                    key: vec![grant.clone().into(), recipient.into()],
+                    before: None,
+                    after: Some(
+                        serde_json::from_value(json!({"id":grant,"org":recipient,"docId":id,"role":"VIEWER"})).unwrap(),
+                    ),
+                });
+            }
+            if i < 1110 && recipient != "owner" {
+                expected.insert(("doc".to_owned(), vec![id.clone(), "name".into(), "owner".into()]));
+                // Projection columns are sorted by name, independently of primary-key order.
+                expected.insert((
+                    "permission".to_owned(),
+                    vec![id, grant, recipient.into(), "VIEWER".into()],
+                ));
+            }
+        }
+        let queries = queries(&schema, Some(&changes)).unwrap();
+        let mut actual = BTreeSet::new();
+        for query in queries {
+            assert!(
+                !query.sql.contains(" OR "),
+                "aliases must remain independently indexable"
+            );
+            assert!(query.sql.len() < 10_000, "key predicates must stay bounded");
+            let sql = query.sql.replace("<=>", "IS");
+            let mut stmt = db.prepare(&sql).unwrap();
+            let width = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|c| row.get::<_, String>(c))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap();
+            for row in rows {
+                actual.insert((query.table.clone(), row.unwrap()));
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn new_share_hydration_is_scoped_to_the_changed_permission_key() {
         let row: Row =
             serde_json::from_value(json!({"id":"grant'1","docId":"d1","org":"recipient","role":"VIEWER"})).unwrap();
@@ -478,7 +566,7 @@ mod tests {
         };
         let result = queries(&schema(), Some(std::slice::from_ref(&change))).unwrap();
         assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|q| q.sql.contains("`s1`.`id` = 'grant''1'")));
+        assert!(result.iter().all(|q| q.sql.contains("(`s1`.`id`) IN (('grant''1'))")));
         let mut role_change = change.clone();
         role_change.op = RowOp::Update;
         role_change.before = Some(row.clone());

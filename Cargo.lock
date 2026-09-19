@@ -1413,6 +1413,7 @@ dependencies = [
  "proptest",
  "prost",
  "rand 0.10.2",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror",
