@@ -98,3 +98,9 @@ The Durable Object keeps the last 2,000 `(seq, gtid)` pairs (`SEQ_LOG_RETENTION`
 The routing journal uses SQLite WAL with synchronous FULL. Do not estimate fleet capacity from tmpfs runs: disk fsync latency can dominate even when delivery queues are empty. The distributor commits up to 64 already-ready routing decisions together, preserving source order and per-transaction replay records. A group failure rolls back the entire group; delivery checkpoints can only prune covered decisions. The in-flight delivery cap still applies to each transaction.
 
 Run `cargo run --release -p orbit-distributor --example durable_journal_capacity -- /path/on/target-disk/new-directory` to compare group sizes on the intended storage. This is a component diagnostic, not a substitute for an end-to-end fleet hold.
+
+### Cold-fill dispatch
+
+Fill concurrency bounds both reserved poll capacity and executing source reads. Larger budgets use up to eight polling lanes, each requesting at most 16 fills. This overlaps registry polling and lease-receipt round trips without creating an unbounded queue of leased work. A received request keeps its reserved permit until its fill finishes; responses exceeding the reserved capacity are rejected before acknowledgement.
+
+Size `FILL_CONCURRENCY` against the source database and measure cold-fill throughput separately from steady CDC delivery. A large fleet of warm caches does not validate simultaneous cold startup.

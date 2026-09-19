@@ -30,16 +30,33 @@ pub struct FillWorker {
 
 impl FillWorker {
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
-        let permits = Arc::new(Semaphore::new(self.concurrency));
-        // Reserve a batch before polling. Polling as soon as a single slot frees
-        // otherwise degenerates to one request per network round trip under load.
-        let batch_size = self.concurrency.clamp(1, 16);
+        let capacity = self.concurrency.max(1);
+        let permits = Arc::new(Semaphore::new(capacity));
+        // Overlap registry round trips without leasing work beyond the execution budget.
+        // Each lane owns its credits through polling, receipt acknowledgement and execution.
+        let lanes = capacity.div_ceil(16).clamp(1, 8);
+        let batch_size = (capacity / lanes).clamp(1, 16);
+        let mut pollers = tokio::task::JoinSet::new();
+        for _ in 0..lanes {
+            let worker = self.clone();
+            let permits = permits.clone();
+            let cancel = cancel.clone();
+            pollers.spawn(async move { worker.run_lane(permits, batch_size, cancel).await });
+        }
+        while let Some(result) = pollers.join_next().await {
+            if let Err(error) = result {
+                error!(%error, "fill polling lane failed");
+            }
+        }
+    }
+
+    async fn run_lane(self: Arc<Self>, permits: Arc<Semaphore>, batch_size: usize, cancel: CancellationToken) {
         let mut backoff = Duration::from_millis(250);
         loop {
             if cancel.is_cancelled() {
                 return;
             }
-            let permit = tokio::select! {
+            let mut permit = tokio::select! {
                 _ = cancel.cancelled() => return,
                 p = permits.clone().acquire_many_owned(batch_size as u32) => p.expect("semaphore"),
             };
@@ -50,9 +67,10 @@ impl FillWorker {
             match poll {
                 Ok(resp) => {
                     backoff = Duration::from_millis(250);
-                    drop(permit);
                     for req in resp.requests {
-                        let permit = permits.clone().acquire_owned().await.expect("semaphore");
+                        // Transfer reserved credits directly. Releasing then reacquiring lets a
+                        // competing poller steal them and strand work whose lease is ticking.
+                        let permit = permit.split(1).expect("response fits reserved capacity");
                         let me = self.clone();
                         let cancel = cancel.clone();
                         tokio::spawn(async move {
@@ -96,6 +114,9 @@ impl FillWorker {
             return Err(format!("http {status}: {}", body.chars().take(200).collect::<String>()));
         }
         let batch: FillPollResponse = serde_json::from_str(&body).map_err(|e| format!("invalid poll response: {e}"))?;
+        if batch.requests.len() > capacity.min(16) {
+            return Err("fill poll exceeded reserved capacity".into());
+        }
         if let Some(lease) = lease.filter(|_| !batch.requests.is_empty()) {
             // Receiving the body, not sending the poll, establishes ownership. If this
             // acknowledgement is lost, still execute the received work: the registry
@@ -352,6 +373,90 @@ mod tests {
     use super::*;
     use orbit_vstream::error::VStreamError;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn polling_worker(url: String, concurrency: usize) -> Arc<FillWorker> {
+        Arc::new(FillWorker {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            worker_url: url,
+            secret: "synthetic-test".into(),
+            subscriber: SubscriberConfig::new(orbit_vstream::client::VitessEndpoint::new("http://127.0.0.1:1"), "test"),
+            source_client: OnceCell::new(),
+            schema: Arc::new(serde_json::from_str(include_str!("../../../schema/fixtures/SyncSchema.json")).unwrap()),
+            concurrency,
+            timeout: Duration::from_secs(120),
+        })
+    }
+
+    #[tokio::test]
+    async fn overlaps_slow_registry_polls_and_cancels_without_waiting_for_http_timeout() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (observed, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..n]).contains("ack=1&limit=16"));
+                held.push(socket);
+            }
+            observed.send(()).unwrap();
+            // Both full batches consume the 32-credit budget while the registry is slow.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+            drop(held);
+        });
+        let cancel = CancellationToken::new();
+        let worker = polling_worker(format!("http://{addr}"), 32);
+        let token = cancel.clone();
+        let running = tokio::spawn(async move { worker.run(token).await });
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_poll_response_larger_than_reserved_capacity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            socket.read(&mut request).await.unwrap();
+            let body = serde_json::json!({"requests":(0..4).map(|i|serde_json::json!({
+                "fill_id":format!("org:{i}"),"schema_hash":"test","partition":"org","table":"Chatbot","requested_at_ms":1
+            })).collect::<Vec<_>>()}).to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let worker = polling_worker(format!("http://{addr}"), 3);
+        assert_eq!(
+            worker.poll(3).await.unwrap_err(),
+            "fill poll exceeded reserved capacity"
+        );
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn executes_received_work_when_claim_response_is_lost() {
