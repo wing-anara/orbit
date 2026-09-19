@@ -110,8 +110,12 @@ pub struct RunArgs {
     /// Maximum simultaneous HTTP deliveries to independent organization partitions.
     #[arg(long, env = "MAX_CONCURRENT_DELIVERIES", default_value_t = 256)]
     pub max_concurrent_deliveries: usize,
-    #[arg(long, env = "MAX_INFLIGHT_TRANSACTIONS", default_value_t = 2000)]
+    /// Bounded checkpoint window; completed transactions behind a slow ack still count.
+    #[arg(long, env = "MAX_INFLIGHT_TRANSACTIONS", default_value_t = orbit_distributor::distributor::DEFAULT_MAX_INFLIGHT_TRANSACTIONS)]
     pub max_inflight_transactions: usize,
+    /// Soft serialized-work budget for that window, not a process memory limit.
+    #[arg(long, env = "MAX_INFLIGHT_BYTES", default_value_t = orbit_distributor::distributor::DEFAULT_MAX_INFLIGHT_BYTES)]
+    pub max_inflight_bytes: usize,
 }
 
 impl RunArgs {

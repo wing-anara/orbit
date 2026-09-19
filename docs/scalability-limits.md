@@ -53,13 +53,14 @@ A query without `limit` returns every matching row of the partition. Every row t
 | --------------------------- | ----------------------------------------------------- |
 | `max_batch_transactions`    | 200                                                   |
 | `max_batch_bytes`           | 4 MiB (soft; one oversized transaction is sent alone) |
-| `max_inflight_transactions` | 2,000                                                 |
+| `max_inflight_transactions` | 32,768                                                 |
+| `max_inflight_bytes` | 128 MiB serialized work (soft, not RSS) |
 | `max_concurrent_deliveries` | 256                                                    |
 | `retry_backoff_min` / `max` | 100 ms / 30 s                                         |
 | `max_reject_attempts`       | 20                                                    |
 | `checkpoint_interval`       | 500 ms                                                |
 
-When the in-flight count reaches the cap, the distributor stops reading the subscriber channel. The channel holds 256 items (`SubscriberConfig.channel_capacity`); when it is full, the gRPC stream is not read and HTTP/2 flow control pushes back on vtgate. One slow partition therefore slows the whole stream once its transactions fill the in-flight window.
+When either the in-flight count or serialized-work byte budget reaches its cap, the distributor stops reading the subscriber channel. The channel holds 256 items (`SubscriberConfig.channel_capacity`); when it is full, the gRPC stream is not read and HTTP/2 flow control pushes back on vtgate. One slow partition can still slow the whole stream once the uncheckpointed window fills, including completed transactions behind its acknowledgment. The count budget covers 30 seconds at 833 transactions/s; the byte budget separately constrains large payloads. A single oversized transaction can exceed the byte budget, then blocks subsequent routing until checkpoint progress releases it. Subscriber/hydration buffers are separate from this accounting.
 
 A single source transaction is one `PartitionTransaction`. It is never split. A transaction with 5,000 row changes was streamed intact in the live Vitess test (`large_transaction_arrives_intact`), but its JSON body must fit the Worker request limits and the Durable Object must apply it in one SQLite transaction.
 

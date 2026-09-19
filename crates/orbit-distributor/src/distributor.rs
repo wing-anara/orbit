@@ -51,6 +51,11 @@ use crate::state::{ParentEntry, StateError, StateStore};
 /// Rows per page of the parent index bootstrap copy.
 const BOOTSTRAP_PAGE_SIZE: usize = 5000;
 
+/// Covers a 30-second delivery timeout at the 50k-org workload (833 writes/s).
+/// The separate byte budget prevents large transactions from consuming this whole window.
+pub const DEFAULT_MAX_INFLIGHT_TRANSACTIONS: usize = 32_768;
+pub const DEFAULT_MAX_INFLIGHT_BYTES: usize = 128 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct DistributorConfig {
     /// Max transactions per batch.
@@ -60,6 +65,9 @@ pub struct DistributorConfig {
     pub max_batch_bytes: usize,
     /// Max stream transactions routed but not yet checkpointed. Reaching it pauses consumption.
     pub max_inflight_transactions: usize,
+    /// Soft serialized-work budget for uncheckpointed transactions. One transaction may exceed
+    /// it so oversized source transactions can still make progress. This is not an RSS limit.
+    pub max_inflight_bytes: usize,
     /// Max concurrent deliveries across partitions.
     pub max_concurrent_deliveries: usize,
     pub retry_backoff_min: Duration,
@@ -76,7 +84,8 @@ impl Default for DistributorConfig {
         Self {
             max_batch_transactions: 200,
             max_batch_bytes: 4 * 1024 * 1024,
-            max_inflight_transactions: 2000,
+            max_inflight_transactions: DEFAULT_MAX_INFLIGHT_TRANSACTIONS,
+            max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             max_concurrent_deliveries: 256,
             retry_backoff_min: Duration::from_millis(100),
             retry_backoff_max: Duration::from_secs(30),
@@ -102,6 +111,7 @@ pub enum DistributorError {
 
 /// One stream item that has been routed and awaits acknowledgement.
 struct InflightTxn {
+    retained_bytes: usize,
     /// Positions after this item, per shard (only the item's shard changes).
     shard: ShardId,
     position: String,
@@ -143,6 +153,7 @@ struct Inner {
     partitions: HashMap<String, PartitionQueue>,
     ready: VecDeque<String>,
     inflight: BTreeMap<u64, InflightTxn>,
+    inflight_bytes: usize,
     next_stream_index: u64,
     checkpoint: Checkpoint,
     /// Counters that changed since the last persisted checkpoint.
@@ -162,6 +173,7 @@ struct Inner {
 pub struct DistributorStatus {
     pub checkpoint: Checkpoint,
     pub inflight_transactions: usize,
+    pub inflight_bytes: usize,
     pub queued_partition_transactions: usize,
     pub quarantined_partitions: Vec<String>,
 }
@@ -197,6 +209,7 @@ impl Distributor {
             partitions,
             ready: VecDeque::new(),
             inflight: BTreeMap::new(),
+            inflight_bytes: 0,
             next_stream_index: 0,
             checkpoint: persisted.checkpoint,
             dirty_counters: BTreeMap::new(),
@@ -240,6 +253,7 @@ impl Distributor {
         DistributorStatus {
             checkpoint: inner.checkpoint.clone(),
             inflight_transactions: inner.inflight.len(),
+            inflight_bytes: inner.inflight_bytes,
             queued_partition_transactions: inner.partitions.values().map(|p| p.queue.len()).sum(),
             quarantined_partitions: inner
                 .quarantined
@@ -291,17 +305,7 @@ impl Distributor {
         futures::pin_mut!(prepared);
         loop {
             // Backpressure: do not read more until in-flight work drains.
-            loop {
-                let inflight = shared.inner.lock().expect("lock").inflight.len();
-                if inflight < shared.config.max_inflight_transactions {
-                    break;
-                }
-                metrics::counter!("orbit_distributor_backpressure_waits_total").increment(1);
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
-                    _ = shared.drained.notified() => {}
-                }
-            }
+            wait_for_inflight_capacity(shared, cancel).await?;
             let items = tokio::select! {
                 _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
                 items = prepared.next() => items.ok_or(DistributorError::StreamClosed)?,
@@ -337,15 +341,7 @@ impl Distributor {
             .into_iter();
             for (item, _) in items {
                 // The journal can be ahead, but queued deliveries still obey the exact credit cap.
-                loop {
-                    if shared.inner.lock().expect("lock").inflight.len() < shared.config.max_inflight_transactions {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
-                        _ = shared.drained.notified() => {}
-                    }
-                }
+                wait_for_inflight_capacity(shared, cancel).await?;
                 match item {
                     StreamItem::Transaction(tx) => tokio::select! {
                         _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
@@ -365,9 +361,13 @@ impl Distributor {
         let mut inner = shared.inner.lock().expect("lock");
         let idx = inner.next_stream_index;
         inner.next_stream_index += 1;
+        let retained_bytes =
+            std::mem::size_of::<InflightTxn>() + position.len() + shard.keyspace.len() + shard.shard.len();
+        inner.inflight_bytes += retained_bytes;
         inner.inflight.insert(
             idx,
             InflightTxn {
+                retained_bytes,
                 shard,
                 position,
                 assignments: vec![],
@@ -509,6 +509,14 @@ impl Distributor {
         }
         let mut assignments = Vec::with_capacity(routed.len());
         let mut pending = 0;
+        // Keep the charge until checkpoint advancement, even after a delivery frees its rows.
+        // This conservatively accounts for completed work behind a slow acknowledgement.
+        let mut retained_bytes = std::mem::size_of::<InflightTxn>()
+            + tx.position.len()
+            + parent_updates
+                .iter()
+                .map(|e| 2 * (std::mem::size_of::<ParentEntry>() + e.table.len() + e.key.len() + e.partition.len()))
+                .sum::<usize>();
         for (partition, changes) in routed {
             let seq = *inner.next_seq.get(&partition).unwrap_or(&0) + 1;
             inner.next_seq.insert(partition.clone(), seq);
@@ -526,6 +534,9 @@ impl Distributor {
                     ..tx.trace.clone()
                 },
             };
+            retained_bytes += partition.len()
+                + std::mem::size_of::<(String, u64)>()
+                + serialized_size(&ptx).map_err(StateError::from)?;
             let pq = inner.partitions.entry(partition.clone()).or_default();
             if pq.quarantined {
                 // The partition is quarantined: keep the transaction durably, count it as done.
@@ -541,9 +552,11 @@ impl Distributor {
             schedule_partition(&mut inner, &partition);
             pending += 1;
         }
+        inner.inflight_bytes += retained_bytes;
         inner.inflight.insert(
             idx,
             InflightTxn {
+                retained_bytes,
                 shard,
                 position: tx.position,
                 assignments,
@@ -552,6 +565,7 @@ impl Distributor {
             },
         );
         metrics::gauge!("orbit_distributor_inflight_transactions").set(inner.inflight.len() as f64);
+        metrics::gauge!("orbit_distributor_inflight_bytes").set(inner.inflight_bytes as f64);
         if pending == 0 {
             advance_checkpoint(&mut inner);
         }
@@ -839,6 +853,7 @@ fn advance_checkpoint(inner: &mut Inner) {
             break;
         }
         let t = inner.inflight.remove(&idx).expect("exists");
+        inner.inflight_bytes -= t.retained_bytes;
         inner.checkpoint.set(t.shard, t.position);
         for (p, seq) in t.assignments {
             inner.dirty_counters.insert(p, seq);
@@ -849,6 +864,48 @@ fn advance_checkpoint(inner: &mut Inner) {
         inner.checkpoint_dirty = true;
     }
     metrics::gauge!("orbit_distributor_inflight_transactions").set(inner.inflight.len() as f64);
+    metrics::gauge!("orbit_distributor_inflight_bytes").set(inner.inflight_bytes as f64);
+}
+
+fn has_inflight_capacity(shared: &Shared) -> bool {
+    let inner = shared.inner.lock().expect("lock");
+    inner.inflight.len() < shared.config.max_inflight_transactions.max(1)
+        && inner.inflight_bytes < shared.config.max_inflight_bytes.max(1)
+}
+
+async fn wait_for_inflight_capacity(shared: &Shared, cancel: &CancellationToken) -> Result<(), DistributorError> {
+    loop {
+        // Register before checking capacity: the last ack can drain the ledger between the
+        // check and awaiting Notify. notify_waiters does not retain a permit for a future waiter.
+        let drained = shared.drained.notified();
+        tokio::pin!(drained);
+        drained.as_mut().enable();
+        if has_inflight_capacity(shared) {
+            return Ok(());
+        }
+        metrics::counter!("orbit_distributor_backpressure_waits_total").increment(1);
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
+            _ = drained => {}
+        }
+    }
+}
+
+/// Count encoded bytes without allocating a second copy of a potentially large batch.
+fn serialized_size(value: &impl serde::Serialize) -> Result<usize, serde_json::Error> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 async fn checkpoint_flusher(shared: Arc<Shared>, cancel: CancellationToken) {

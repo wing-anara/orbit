@@ -42,7 +42,8 @@ All flags of `orbit-server run` accept environment variables (`crates/orbit-serv
 | `MAX_CONSECUTIVE_FAILURES`           | `20`                      | Retryable failures before the engine exits.  |
 | `DISABLE_FILLS`                      | `false`                   | Do not run the fill worker.                  |
 | `MAX_BATCH_TRANSACTIONS`             | `200`                     | Transactions per batch.                      |
-| `MAX_INFLIGHT_TRANSACTIONS`          | `2000`                    | Routed but not checkpointed transactions.    |
+| `MAX_INFLIGHT_BYTES`                 | `134217728`               | Soft serialized-work budget, not RSS.        |
+| `MAX_INFLIGHT_TRANSACTIONS`          | `32768`                    | Routed but not checkpointed transactions.    |
 
 `VITESS_KEYSPACE` is used by `schema introspect`. `RUST_LOG` sets the log filter (default `info,h2=warn,hyper=warn`). `LOG_FORMAT=json` switches to JSON logs.
 

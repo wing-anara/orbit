@@ -47,7 +47,9 @@ The count rules are:
 
 `advance_checkpoint` walks the ledger from the lowest index. It removes each entry with `pending == 0` and sets the shard position. It stops at the first entry that is still pending. The checkpoint therefore covers a contiguous prefix of the stream. A restart can replay work, but it can never skip work.
 
-The ledger also provides backpressure. When it holds `MAX_INFLIGHT_TRANSACTIONS` items (default 2000) the distributor stops reading from the subscriber. The subscriber channel then fills, and HTTP/2 flow control slows vtgate down.
+The ledger also provides backpressure. When it holds `MAX_INFLIGHT_TRANSACTIONS` items (default 32,768), or its estimated serialized work reaches `MAX_INFLIGHT_BYTES` (default 128 MiB), the distributor stops reading from the subscriber. The subscriber channel then fills, and HTTP/2 flow control slows vtgate down. One oversized transaction may cross the byte budget so it can still make progress. Its charge is released only when the checkpoint advances, even if some rows have already been delivered. This budget covers routed work, not the subscriber channel, hydration buffers, or total process RSS.
+
+The count window covers a 30-second delivery timeout at 833 source writes/second. The previous 2,000-item window provided only 2.4 seconds at that rate: a transient slow acknowledgment stalled healthy partitions behind it. The byte budget limits large imports independently of transaction count. Persistent partition failures can still fill this finite window; this is bounded backpressure, not an unbounded durable outbox.
 
 ## Flush timing
 

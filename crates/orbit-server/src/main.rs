@@ -110,6 +110,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         max_batch_transactions: args.max_batch_transactions,
         max_concurrent_deliveries: args.max_concurrent_deliveries.max(1),
         max_inflight_transactions: args.max_inflight_transactions,
+        max_inflight_bytes: args.max_inflight_bytes,
         ..Default::default()
     };
     let mut sub_cfg = subscriber_config(&args.vitess, &schema.keyspace, args.allow_merged_transactions);

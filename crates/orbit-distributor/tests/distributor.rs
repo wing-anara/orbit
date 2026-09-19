@@ -1052,3 +1052,115 @@ async fn queued_fleet_keeps_delivery_and_per_partition_concurrency_bounded() {
         Ok(()) | Err(orbit_distributor::DistributorError::Cancelled)
     ));
 }
+
+struct HeldPartitionSink {
+    fake: FakeDo,
+    entered: CancellationToken,
+    release: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl Sink for HeldPartitionSink {
+    async fn deliver(&self, batch: &CdcBatch) -> Result<CdcBatchAck, DeliveryError> {
+        if batch.partition == "held" {
+            self.entered.cancel();
+            self.release.cancelled().await;
+        }
+        Ok(self.fake.apply(batch))
+    }
+}
+
+#[tokio::test]
+async fn fleet_checkpoint_window_keeps_healthy_work_moving_behind_one_slow_ack() {
+    let sink = Arc::new(HeldPartitionSink {
+        fake: FakeDo::default(),
+        entered: CancellationToken::new(),
+        release: CancellationToken::new(),
+    });
+    let d =
+        Arc::new(Distributor::new(schema(), config(), StateStore::open_in_memory().unwrap(), sink.clone()).unwrap());
+    let (tx, rx) = mpsc::channel(32);
+    let cancel = CancellationToken::new();
+    let run = {
+        let d = d.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { d.run(rx, cancel).await })
+    };
+    tx.send(txn(1, vec![insert("held-row", "held", 1)])).await.unwrap();
+    sink.entered.cancelled().await;
+    // 30 seconds of source transactions at 833/s. The previous 2,000-item window stopped
+    // unrelated orgs after only 2.4 seconds, even though their deliveries had completed.
+    let producer = tokio::spawn(async move {
+        for g in 2..=25_001 {
+            tx.send(txn(g, vec![insert(&format!("row-{g}"), "healthy", g as i64)]))
+                .await
+                .unwrap();
+        }
+        tx
+    });
+    wait_until(Duration::from_secs(15), || {
+        sink.fake
+            .partitions
+            .lock()
+            .unwrap()
+            .get("healthy")
+            .is_some_and(|p| p.rows.len() == 25_000)
+    })
+    .await;
+    assert_eq!(
+        d.checkpoint().position(&shard0()),
+        None,
+        "checkpoint must not skip the held delivery"
+    );
+    assert_eq!(d.status().inflight_transactions, 25_001);
+    assert!(d.status().inflight_bytes < config().max_inflight_bytes);
+    sink.release.cancel();
+    wait_until(Duration::from_secs(5), || {
+        d.checkpoint().position(&shard0()) == Some(format!("MySQL56/{U1}:1-25001").as_str())
+    })
+    .await;
+    assert_eq!(d.status().inflight_bytes, 0);
+    let _tx = producer.await.unwrap();
+    cancel.cancel();
+    let _ = run.await;
+}
+
+#[tokio::test]
+async fn checkpoint_byte_budget_blocks_following_work_but_allows_one_oversized_transaction() {
+    let sink = Arc::new(HeldPartitionSink {
+        fake: FakeDo::default(),
+        entered: CancellationToken::new(),
+        release: CancellationToken::new(),
+    });
+    let cfg = DistributorConfig {
+        max_inflight_bytes: 2048,
+        ..config()
+    };
+    let d = Arc::new(Distributor::new(schema(), cfg, StateStore::open_in_memory().unwrap(), sink.clone()).unwrap());
+    let (tx, rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let run = {
+        let d = d.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { d.run(rx, cancel).await })
+    };
+    tx.send(txn(1, vec![insert(&"x".repeat(4096), "held", 1)]))
+        .await
+        .unwrap();
+    sink.entered.cancelled().await;
+    tx.send(txn(2, vec![insert("a", "healthy", 2)])).await.unwrap();
+    tx.send(txn(3, vec![insert("b", "healthy", 3)])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(d.status().inflight_transactions, 1);
+    assert!(d.status().inflight_bytes > 2048);
+    assert!(sink.fake.rows("healthy").is_empty());
+    sink.release.cancel();
+    wait_until(Duration::from_secs(5), || {
+        d.status().checkpoint.position(&shard0()) == Some(format!("MySQL56/{U1}:1-3").as_str())
+    })
+    .await;
+    assert_eq!(sink.fake.rows("healthy"), vec!["a", "b"]);
+    assert_eq!(d.status().inflight_bytes, 0);
+    cancel.cancel();
+    let _ = run.await;
+}
