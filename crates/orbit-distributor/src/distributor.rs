@@ -77,7 +77,7 @@ impl Default for DistributorConfig {
             max_batch_transactions: 200,
             max_batch_bytes: 4 * 1024 * 1024,
             max_inflight_transactions: 2000,
-            max_concurrent_deliveries: 32,
+            max_concurrent_deliveries: 256,
             retry_backoff_min: Duration::from_millis(100),
             retry_backoff_max: Duration::from_secs(30),
             max_reject_attempts: 20,
@@ -118,6 +118,7 @@ struct PartitionQueue {
     queue: VecDeque<(u64 /* stream index */, PartitionTransaction)>,
     /// A delivery task currently owns this partition.
     busy: bool,
+    ready: bool,
     quarantined: bool,
 }
 
@@ -140,6 +141,7 @@ struct Shared {
 struct Inner {
     next_seq: BTreeMap<String, u64>,
     partitions: HashMap<String, PartitionQueue>,
+    ready: VecDeque<String>,
     inflight: BTreeMap<u64, InflightTxn>,
     next_stream_index: u64,
     checkpoint: Checkpoint,
@@ -193,6 +195,7 @@ impl Distributor {
         let inner = Inner {
             next_seq: persisted.counters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             partitions,
+            ready: VecDeque::new(),
             inflight: BTreeMap::new(),
             next_stream_index: 0,
             checkpoint: persisted.checkpoint,
@@ -499,6 +502,7 @@ impl Distributor {
                 continue;
             }
             pq.queue.push_back((idx, ptx));
+            schedule_partition(&mut inner, &partition);
             pending += 1;
         }
         inner.inflight.insert(
@@ -530,20 +534,32 @@ impl Distributor {
     }
 }
 
-/// Picks idle partitions with queued work and spawns deliveries, bounded by the semaphore.
+/// Queue each idle partition once, in arrival order, without scanning the entire fleet.
+fn schedule_partition(inner: &mut Inner, partition: &str) {
+    let pq = inner.partitions.get_mut(partition).expect("partition exists");
+    if !pq.busy && !pq.ready && !pq.quarantined && !pq.queue.is_empty() {
+        pq.ready = true;
+        inner.ready.push_back(partition.to_owned());
+    }
+}
+
+/// Claim only work that can start now. A bulk burst must not reserve thousands of
+/// batches outside the scheduler while newly queued partitions wait unseen.
 async fn scheduler_loop(shared: Arc<Shared>, cancel: CancellationToken) {
     loop {
-        let mut ready: Vec<(String, CdcBatch, Vec<u64>)> = Vec::new();
-        {
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return,
+            p = shared.delivery_permits.clone().acquire_owned() => p.expect("semaphore open"),
+        };
+        let work = {
             let mut inner = shared.inner.lock().expect("lock");
-            let partitions: Vec<String> = inner
-                .partitions
-                .iter()
-                .filter(|(_, q)| !q.busy && !q.quarantined && !q.queue.is_empty())
-                .map(|(k, _)| k.clone())
-                .collect();
-            for partition in partitions {
+            let mut next = None;
+            while let Some(partition) = inner.ready.pop_front() {
                 let pq = inner.partitions.get_mut(&partition).expect("exists");
+                pq.ready = false;
+                if pq.busy || pq.quarantined || pq.queue.is_empty() {
+                    continue;
+                }
                 let mut txns = Vec::new();
                 let mut indexes = Vec::new();
                 let mut bytes = 0usize;
@@ -559,6 +575,10 @@ async fn scheduler_loop(shared: Arc<Shared>, cancel: CancellationToken) {
                     indexes.push(*idx);
                     let (_, mut ptx) = pq.queue.pop_front().expect("front exists");
                     ptx.trace.distributor_dispatched_at_ms = Some(now_ms());
+                    if let Some(received) = ptx.trace.subscriber_received_at_ms {
+                        metrics::histogram!("orbit_distributor_dispatch_wait_seconds")
+                            .record((now_ms() - received).max(0) as f64 / 1000.);
+                    }
                     txns.push(ptx);
                 }
                 pq.busy = true;
@@ -570,24 +590,24 @@ async fn scheduler_loop(shared: Arc<Shared>, cancel: CancellationToken) {
                     transactions: txns,
                     delivery_id: uuid::Uuid::new_v4().to_string(),
                 };
-                ready.push((partition, batch, indexes));
+                next = Some((partition, batch, indexes));
+                break;
             }
-        }
-        for (partition, batch, indexes) in ready {
-            let permit = tokio::select! {
-                _ = cancel.cancelled() => return,
-                p = shared.delivery_permits.clone().acquire_owned() => p.expect("semaphore open"),
-            };
+            metrics::gauge!("orbit_distributor_ready_partitions").set(inner.ready.len() as f64);
+            next
+        };
+        if let Some((partition, batch, indexes)) = work {
             let shared = shared.clone();
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                let _permit = permit;
-                deliver_with_retry(shared, partition, batch, indexes, cancel).await;
+                deliver_with_retry(shared, partition, batch, indexes, permit, cancel).await;
             });
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = shared.wake.notified() => {}
+        } else {
+            drop(permit);
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = shared.wake.notified() => {}
+            }
         }
     }
 }
@@ -597,8 +617,10 @@ async fn deliver_with_retry(
     partition: String,
     batch: CdcBatch,
     indexes: Vec<u64>,
+    initial_permit: tokio::sync::OwnedSemaphorePermit,
     cancel: CancellationToken,
 ) {
+    let mut permit = Some(initial_permit);
     let mut backoff = shared.config.retry_backoff_min;
     let mut rejects: u32 = 0;
     let first_seq = batch.first_seq().unwrap_or(0);
@@ -612,8 +634,17 @@ async fn deliver_with_retry(
             requeue(&mut inner, &partition, batch.transactions.clone(), &indexes);
             return;
         }
+        let attempt_permit = match permit.take() {
+            Some(permit) => permit,
+            None => tokio::select! {
+                _ = cancel.cancelled() => continue,
+                p = shared.delivery_permits.clone().acquire_owned() => p.expect("semaphore open"),
+            },
+        };
         let attempt_started = Instant::now();
         let result = shared.sink.deliver(&batch).await;
+        // Retry backoff owns only this partition, never a fleet-wide delivery slot.
+        drop(attempt_permit);
         metrics::histogram!("orbit_distributor_delivery_seconds").record(attempt_started.elapsed().as_secs_f64());
         match result {
             Ok(CdcBatchAck::Applied {
@@ -640,6 +671,7 @@ async fn deliver_with_retry(
                     }
                 }
                 inner.partitions.get_mut(&partition).expect("exists").busy = false;
+                schedule_partition(&mut inner, &partition);
                 advance_checkpoint(&mut inner);
                 debug!(
                     partition,
@@ -715,6 +747,7 @@ fn requeue(inner: &mut Inner, partition: &str, txns: Vec<PartitionTransaction>, 
         pq.queue.push_front((*idx, ptx));
     }
     pq.busy = false;
+    schedule_partition(inner, partition);
 }
 
 fn quarantine_batch(shared: &Shared, partition: &str, batch: &CdcBatch, indexes: &[u64], reason: &str) {

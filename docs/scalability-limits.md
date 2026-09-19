@@ -11,7 +11,9 @@ Placement is `one_per_partition` (`crates/orbit-protocol/src/schema.rs`, `Placem
 - SQLite-backed Durable Objects hold up to 10 GB per object. The cache stores every synced column of every row of every filled table of the partition, plus `held`, `membership`, `seq_log`, and session tables.
 - The WebSocket Hibernation API allows at most 32,768 connections per Durable Object. The code sets no lower limit, and each `delta` is evaluated per session, so CPU is the practical limit.
 
-The distributor keeps every Durable Object's deliveries serial and in `seq` order. Throughput for one partition is therefore one batch at a time. Across partitions, up to `max_concurrent_deliveries` (32) deliveries run at once.
+The distributor keeps every Durable Object's deliveries serial and in `seq` order. Throughput for one partition is therefore one batch at a time. Across partitions, up to `max_concurrent_deliveries` (256 by default, configurable through `--max-concurrent-deliveries` / `MAX_CONCURRENT_DELIVERIES`) deliveries run at once.
+
+The scheduler maintains a FIFO of ready partitions instead of scanning every known partition on each wake. It dequeues a batch only after reserving a delivery slot, so bulk arrivals cannot pin thousands of prebuilt batches ahead of subsequently queued work. A retrying partition remains serial, but releases its global delivery slot during backoff. `orbit_distributor_dispatch_wait_seconds` measures subscriber receipt to actual dispatch, including queue delay. Increasing concurrency is bounded, not an unlimited throughput guarantee; source routing, Worker capacity and latency must still be measured under the intended fleet profile.
 
 ## SQLite bound parameters
 
@@ -52,7 +54,7 @@ A query without `limit` returns every matching row of the partition. Every row t
 | `max_batch_transactions`    | 200                                                   |
 | `max_batch_bytes`           | 4 MiB (soft; one oversized transaction is sent alone) |
 | `max_inflight_transactions` | 2,000                                                 |
-| `max_concurrent_deliveries` | 32                                                    |
+| `max_concurrent_deliveries` | 256                                                    |
 | `retry_backoff_min` / `max` | 100 ms / 30 s                                         |
 | `max_reject_attempts`       | 20                                                    |
 | `checkpoint_interval`       | 500 ms                                                |

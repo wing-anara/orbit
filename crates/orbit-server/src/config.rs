@@ -107,6 +107,9 @@ pub struct RunArgs {
     pub max_consecutive_failures: u32,
     #[arg(long, env = "MAX_BATCH_TRANSACTIONS", default_value_t = 200)]
     pub max_batch_transactions: usize,
+    /// Maximum simultaneous HTTP deliveries to independent organization partitions.
+    #[arg(long, env = "MAX_CONCURRENT_DELIVERIES", default_value_t = 256)]
+    pub max_concurrent_deliveries: usize,
     #[arg(long, env = "MAX_INFLIGHT_TRANSACTIONS", default_value_t = 2000)]
     pub max_inflight_transactions: usize,
 }

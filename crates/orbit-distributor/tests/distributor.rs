@@ -951,3 +951,104 @@ async fn derived_tables_route_through_the_parent_index() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn retry_backoff_does_not_hold_the_only_delivery_slot() {
+    let fake = Arc::new(FakeDo::default());
+    fake.plan.lock().unwrap().fail_before = 1;
+    let cfg = DistributorConfig {
+        max_concurrent_deliveries: 1,
+        retry_backoff_min: Duration::from_secs(30),
+        retry_backoff_max: Duration::from_secs(30),
+        ..config()
+    };
+    let d = Arc::new(Distributor::new(schema(), cfg, StateStore::open_in_memory().unwrap(), fake.clone()).unwrap());
+    let (tx, rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let run = {
+        let d = d.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { d.run(rx, cancel).await })
+    };
+    tx.send(txn(1, vec![insert("a", "retrying", 1)])).await.unwrap();
+    wait_until(Duration::from_secs(2), || *fake.deliveries.lock().unwrap() == 1).await;
+    tx.send(txn(2, vec![insert("b", "healthy", 1)])).await.unwrap();
+    wait_until(Duration::from_secs(2), || fake.rows("healthy") == vec!["b"]).await;
+    assert!(fake.rows("retrying").is_empty());
+    // Checkpoint cannot skip the unapplied transaction even though another org progressed.
+    assert_eq!(d.status().inflight_transactions, 2);
+    cancel.cancel();
+    assert!(matches!(
+        run.await.unwrap(),
+        Ok(()) | Err(orbit_distributor::DistributorError::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn queued_fleet_keeps_delivery_and_per_partition_concurrency_bounded() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct BoundedSink {
+        fake: FakeDo,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        partitions: Mutex<std::collections::HashSet<String>>,
+    }
+    #[async_trait::async_trait]
+    impl Sink for BoundedSink {
+        async fn deliver(&self, batch: &CdcBatch) -> Result<CdcBatchAck, DeliveryError> {
+            assert!(
+                self.partitions.lock().unwrap().insert(batch.partition.clone()),
+                "two deliveries for one partition"
+            );
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let result = self.fake.apply(batch);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.partitions.lock().unwrap().remove(&batch.partition);
+            Ok(result)
+        }
+    }
+    let sink = Arc::new(BoundedSink {
+        fake: FakeDo::default(),
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        partitions: Mutex::new(Default::default()),
+    });
+    let cfg = DistributorConfig {
+        max_concurrent_deliveries: 4,
+        max_batch_transactions: 2,
+        ..config()
+    };
+    let d = Arc::new(Distributor::new(schema(), cfg, StateStore::open_in_memory().unwrap(), sink.clone()).unwrap());
+    let (tx, rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let run = {
+        let d = d.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { d.run(rx, cancel).await })
+    };
+    for seq in 1..=5 {
+        tx.send(txn(
+            seq,
+            (0..40)
+                .map(|org| insert(&format!("item{seq}"), &format!("org{org}"), 1))
+                .collect(),
+        ))
+        .await
+        .unwrap();
+    }
+    wait_until(Duration::from_secs(5), || {
+        d.status().checkpoint.position(&shard0()) == Some(format!("MySQL56/{U1}:1-5").as_str())
+    })
+    .await;
+    assert_eq!(sink.peak.load(Ordering::SeqCst), 4);
+    for org in 0..40 {
+        assert_eq!(sink.fake.seqs(&format!("org{org}")), vec![1, 2, 3, 4, 5]);
+    }
+    cancel.cancel();
+    assert!(matches!(
+        run.await.unwrap(),
+        Ok(()) | Err(orbit_distributor::DistributorError::Cancelled)
+    ));
+}

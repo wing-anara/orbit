@@ -56,7 +56,7 @@ orbit-server quarantine list|replay|drop
 `orbit-server run` starts these tasks in one process:
 
 - The subscriber. It opens a `VStream` on vtgate with one `select * from T` rule per synced table. It assembles `BEGIN`, `FIELD`, `ROW`, `VGTID` and `COMMIT` events into one `SourceTransaction` per commit. It projects each row onto the sync schema. It sends items into a bounded channel with capacity 256.
-- The distributor. It routes each transaction to logical partitions. It batches up to 200 transactions or 4 MiB per delivery. It delivers one batch at a time per partition, with at most 32 deliveries in flight. It persists the checkpoint in SQLite. See [checkpoints.md](checkpoints.md).
+- The distributor. It routes each transaction to logical partitions. It batches up to 200 transactions or 4 MiB per delivery. It delivers one batch at a time per partition, with at most 256 deliveries in flight by default. It persists the checkpoint in SQLite. See [checkpoints.md](checkpoints.md).
 - The fill worker. It long-polls the Worker for fill requests and runs copy-phase fills. It runs at most `FILL_CONCURRENCY` fills at the same time (default 4). `--disable-fills` turns it off.
 - A Prometheus metrics endpoint at `METRICS_ADDR` (default `127.0.0.1:9464`).
 - A status log line every 10 seconds.

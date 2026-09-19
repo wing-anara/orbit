@@ -108,6 +108,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     )?);
     let dist_cfg = DistributorConfig {
         max_batch_transactions: args.max_batch_transactions,
+        max_concurrent_deliveries: args.max_concurrent_deliveries.max(1),
         max_inflight_transactions: args.max_inflight_transactions,
         ..Default::default()
     };
