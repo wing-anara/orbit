@@ -323,7 +323,14 @@ impl Distributor {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                state.route_fanout_batch(&shared.schema, &sources)?
+                let started = Instant::now();
+                let routed = state.route_fanout_batch(&shared.schema, &sources)?;
+                if !sources.is_empty() {
+                    metrics::histogram!("orbit_distributor_journal_group_transactions").record(sources.len() as f64);
+                    metrics::histogram!("orbit_distributor_journal_group_seconds")
+                        .record(started.elapsed().as_secs_f64());
+                }
+                routed
             } else {
                 vec![]
             }
