@@ -285,6 +285,9 @@ impl Distributor {
             };
             Ok::<_, DistributorError>((item, hydrated))
         });
+        // Drain already-ready work without waiting to fill a group. FULL synchronous durability
+        // is retained, while busy fleets amortize the journal fsync across up to 64 decisions.
+        let prepared = prepared.ready_chunks(64);
         futures::pin_mut!(prepared);
         loop {
             // Backpressure: do not read more until in-flight work drains.
@@ -299,19 +302,53 @@ impl Distributor {
                     _ = shared.drained.notified() => {}
                 }
             }
-            let (item, hydrated) = tokio::select! {
+            let items = tokio::select! {
                 _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
-                item = prepared.next() => item.ok_or(DistributorError::StreamClosed)??,
-            };
-            match item {
-                StreamItem::Transaction(tx) => tokio::select! {
-                    _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
-                    result = self.route_transaction(tx, hydrated) => result?,
-                },
-                StreamItem::Position { shard, position } | StreamItem::Ddl { shard, position, .. } => {
-                    self.record_position(shard, position);
+                items = prepared.next() => items.ok_or(DistributorError::StreamClosed)?,
+            }
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+            let mut fanouts = if shared.schema.tables.iter().any(|t| !t.partition_routes.is_empty()) {
+                let state = shared.state.lock().expect("lock");
+                if !state.fanout_ready(&shared.schema.schema_hash)? {
+                    return Err(StateError::Fanout(crate::fanout::FanoutError::Snapshot(
+                        "fanout graph is not bootstrapped".into(),
+                    ))
+                    .into());
                 }
-                StreamItem::Heartbeat | StreamItem::CopyCompleted { .. } => {}
+                let sources = items
+                    .iter()
+                    .filter_map(|(item, hydrated)| match item {
+                        StreamItem::Transaction(tx) => Some((tx, hydrated.as_slice())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                state.route_fanout_batch(&shared.schema, &sources)?
+            } else {
+                vec![]
+            }
+            .into_iter();
+            for (item, _) in items {
+                // The journal can be ahead, but queued deliveries still obey the exact credit cap.
+                loop {
+                    if shared.inner.lock().expect("lock").inflight.len() < shared.config.max_inflight_transactions {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
+                        _ = shared.drained.notified() => {}
+                    }
+                }
+                match item {
+                    StreamItem::Transaction(tx) => tokio::select! {
+                        _ = cancel.cancelled() => return Err(DistributorError::Cancelled),
+                        result = self.route_transaction(tx, fanouts.next().unwrap_or_default()) => result?,
+                    },
+                    StreamItem::Position { shard, position } | StreamItem::Ddl { shard, position, .. } => {
+                        self.record_position(shard, position);
+                    }
+                    StreamItem::Heartbeat | StreamItem::CopyCompleted { .. } => {}
+                }
             }
         }
     }
@@ -408,7 +445,7 @@ impl Distributor {
     async fn route_transaction(
         &self,
         tx: SourceTransaction,
-        hydrated: Vec<(String, Row)>,
+        fanout: indexmap::IndexMap<String, Vec<orbit_protocol::cdc::RowChange>>,
     ) -> Result<(), DistributorError> {
         let started = Instant::now();
         let change_count = tx.changes.len();
@@ -450,17 +487,9 @@ impl Distributor {
                 return Err(e.into());
             }
             let (mut routed, mut stats) = result?;
-            if shared.schema.tables.iter().any(|t| !t.partition_routes.is_empty()) {
-                if !state.fanout_ready(&shared.schema.schema_hash)? {
-                    return Err(StateError::Fanout(crate::fanout::FanoutError::Snapshot(
-                        "fanout graph is not bootstrapped".into(),
-                    ))
-                    .into());
-                }
-                for (partition, changes) in state.route_fanout(&shared.schema, &tx, &hydrated)? {
-                    stats.routed += changes.len() as u64;
-                    routed.entry(partition).or_default().extend(changes);
-                }
+            for (partition, changes) in fanout {
+                stats.routed += changes.len() as u64;
+                routed.entry(partition).or_default().extend(changes);
             }
             (routed, stats)
         };

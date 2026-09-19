@@ -92,3 +92,9 @@ The OPFS store uses the `opfs-sahpool` VFS. Only one browser context per origin 
 ## Sequence log retention
 
 The Durable Object keeps the last 2,000 `(seq, gtid)` pairs (`SEQ_LOG_RETENTION`). Duplicates older than that are skipped without gtid verification.
+
+### Routing journal storage
+
+The routing journal uses SQLite WAL with synchronous FULL. Do not estimate fleet capacity from tmpfs runs: disk fsync latency can dominate even when delivery queues are empty. The distributor commits up to 64 already-ready routing decisions together, preserving source order and per-transaction replay records. A group failure rolls back the entire group; delivery checkpoints can only prune covered decisions. The in-flight delivery cap still applies to each transaction.
+
+Run `cargo run --release -p orbit-distributor --example durable_journal_capacity -- /path/on/target-disk/new-directory` to compare group sizes on the intended storage. This is a component diagnostic, not a substitute for an end-to-end fleet hold.

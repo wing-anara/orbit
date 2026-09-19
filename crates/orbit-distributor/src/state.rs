@@ -391,6 +391,27 @@ impl StateStore {
         )?)
     }
 
+    /// Commit a bounded, ordered group with one durable SQLite commit. Journals may lead the
+    /// delivery checkpoint, but replay always reuses each original decision.
+    pub fn route_fanout_batch(
+        &self,
+        schema: &orbit_protocol::schema::SyncSchema,
+        sources: &[(
+            &orbit_protocol::cdc::SourceTransaction,
+            &[(String, orbit_protocol::value::Row)],
+        )],
+    ) -> Result<Vec<indexmap::IndexMap<String, Vec<orbit_protocol::cdc::RowChange>>>, StateError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut routed = Vec::with_capacity(sources.len());
+        for (source, hydrated) in sources {
+            routed.push(crate::fanout_store::route_with_hydration_uncommitted(
+                &tx, schema, source, hydrated,
+            )?);
+        }
+        tx.commit()?;
+        Ok(routed)
+    }
+
     fn get_meta(&self, key: &str) -> Result<Option<String>, StateError> {
         Ok(self
             .conn

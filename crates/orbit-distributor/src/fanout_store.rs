@@ -175,7 +175,20 @@ pub fn route_with_hydration(
     hydrated: &[(String, Row)],
 ) -> Result<Routed, FanoutError> {
     let tx = db.unchecked_transaction().map_err(error)?;
-    let saved: Option<String> = tx
+    let routed = route_with_hydration_uncommitted(&tx, schema, source, hydrated)?;
+    tx.commit().map_err(error)?;
+    Ok(routed)
+}
+
+/// Called only inside the caller's SQLite transaction. Every decision in a group is persisted
+/// before any delivery can observe it; a failure rolls back the entire group.
+pub(crate) fn route_with_hydration_uncommitted(
+    db: &Connection,
+    schema: &SyncSchema,
+    source: &SourceTransaction,
+    hydrated: &[(String, Row)],
+) -> Result<Routed, FanoutError> {
+    let saved: Option<String> = db
         .query_row(
             "SELECT routed FROM fanout_journal WHERE keyspace=?1 AND shard=?2 AND gtid=?3",
             params![source.keyspace, source.shard, source.gtid],
@@ -199,16 +212,16 @@ pub fn route_with_hydration(
         let key = row_key(schema, table, row)?;
         let identity = (table.clone(), json(&key)?);
         if let std::collections::btree_map::Entry::Vacant(entry) = old.entry(identity) {
-            entry.insert(Snapshot(&tx).get(table, &key)?);
+            entry.insert(Snapshot(db).get(table, &key)?);
         }
-        put(&tx, schema, table, row)?;
+        put(db, schema, table, row)?;
     }
 
     for change in &source.changes {
         if !tracked.contains(&change.table) {
             continue;
         }
-        if !routing_changed && Snapshot(&tx).get(&change.table, &change.key)?.is_none() {
+        if !routing_changed && Snapshot(db).get(&change.table, &change.key)?.is_none() {
             continue;
         }
         let before_key = change
@@ -219,33 +232,32 @@ pub fn route_with_hydration(
         for key in before_key.iter().chain(std::iter::once(&change.key)) {
             let identity = (change.table.clone(), json(key)?);
             if let std::collections::btree_map::Entry::Vacant(entry) = old.entry(identity) {
-                entry.insert(Snapshot(&tx).get(&change.table, key)?);
+                entry.insert(Snapshot(db).get(&change.table, key)?);
             }
         }
         if let Some(key) = before_key {
-            remove(&tx, &change.table, &key)?;
+            remove(db, &change.table, &key)?;
         }
         if let Some(row) = &change.after {
-            put(&tx, schema, &change.table, row)?;
+            put(db, schema, &change.table, row)?;
         } else {
-            remove(&tx, &change.table, &change.key)?;
+            remove(db, &change.table, &change.key)?;
         }
     }
     let before = Before {
-        current: Snapshot(&tx),
+        current: Snapshot(db),
         rows: &old,
         schema,
     };
-    let routed = route_fanout(schema, &source.changes, &before, &Snapshot(&tx))?;
+    let routed = route_fanout(schema, &source.changes, &before, &Snapshot(db))?;
     if routing_changed {
-        collect_affected_unshared(&tx, schema, &before, &old)?;
+        collect_affected_unshared(db, schema, &before, &old)?;
     }
-    tx.execute(
+    db.execute(
         "INSERT INTO fanout_journal(keyspace,shard,gtid,routed) VALUES (?1,?2,?3,?4)",
         params![source.keyspace, source.shard, source.gtid, json(&routed)?],
     )
     .map_err(error)?;
-    tx.commit().map_err(error)?;
     Ok(routed)
 }
 
@@ -470,6 +482,95 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn grouped_decisions_match_sequential_and_survive_reopen_before_checkpoint() {
+        let path = std::env::temp_dir().join(format!("orbit-fanout-group-{}.sqlite", uuid::Uuid::new_v4()));
+        let schema = schema();
+        let permission = json!({"id":"p1","docId":"d1","org":"recipient","user":"alice"});
+        let grant = transaction("source:1", permission.clone(), RowOp::Insert);
+        let revoke = transaction("source:2", permission, RowOp::Delete);
+        let hydrated = vec![(
+            "doc".into(),
+            serde_json::from_value(json!({"id":"d1","org":"owner","name":"Original"})).unwrap(),
+        )];
+        let oracle = crate::state::StateStore::open_in_memory().unwrap();
+        let expected = vec![
+            oracle.route_fanout(&schema, &grant, &hydrated).unwrap(),
+            oracle.route_fanout(&schema, &revoke, &[]).unwrap(),
+        ];
+        assert_eq!(expected[0]["recipient"][0].op, RowOp::Insert);
+        assert_eq!(expected[1]["recipient"][0].op, RowOp::Delete);
+        {
+            let store = crate::state::StateStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .route_fanout_batch(&schema, &[(&grant, &hydrated), (&revoke, &[])])
+                    .unwrap(),
+                expected
+            );
+        }
+        {
+            let store = crate::state::StateStore::open(&path).unwrap();
+            // No checkpoint has covered these decisions. Replaying a grant must return its
+            // original insert even though the durable graph already contains the revocation.
+            assert_eq!(
+                store
+                    .route_fanout_batch(&schema, &[(&grant, &[]), (&revoke, &[])])
+                    .unwrap(),
+                expected
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn late_group_failure_rolls_back_earlier_graph_and_journal_writes() {
+        let path = std::env::temp_dir().join(format!("orbit-fanout-group-failure-{}.sqlite", uuid::Uuid::new_v4()));
+        let schema = schema();
+        let grant = transaction(
+            "source:1",
+            json!({"id":"p1","docId":"d1","org":"recipient","user":"alice"}),
+            RowOp::Insert,
+        );
+        let hydrated = vec![(
+            "doc".into(),
+            serde_json::from_value(json!({"id":"d1","org":"owner"})).unwrap(),
+        )];
+        let mut invalid = grant.clone();
+        invalid.gtid = "source:2".into();
+        invalid.changes.push(RowChange {
+            table: "doc".into(),
+            op: RowOp::Insert,
+            key: vec!["bad".into()],
+            before: None,
+            after: Some(serde_json::from_value(json!({"name":"missing key"})).unwrap()),
+        });
+        {
+            let store = crate::state::StateStore::open(&path).unwrap();
+            assert!(
+                store
+                    .route_fanout_batch(&schema, &[(&grant, &hydrated), (&invalid, &[])])
+                    .is_err()
+            );
+            assert!(!store.fanout_has_journal(&grant).unwrap());
+            assert!(!store.fanout_has_journal(&invalid).unwrap());
+        }
+        {
+            let db = Connection::open(&path).unwrap();
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM fanout_rows", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM fanout_cells", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn content_updates_preserve_shared_fanout_without_caching_private_rows() {
         let db = Connection::open_in_memory().unwrap();
