@@ -238,7 +238,7 @@ pub fn route_with_hydration(
     };
     let routed = route_fanout(schema, &source.changes, &before, &Snapshot(&tx))?;
     if routing_changed {
-        collect_unshared(&tx, schema)?;
+        collect_affected_unshared(&tx, schema, &before, &old)?;
     }
     tx.execute(
         "INSERT INTO fanout_journal(keyspace,shard,gtid,routed) VALUES (?1,?2,?3,?4)",
@@ -269,6 +269,93 @@ fn changes_routing(schema: &SyncSchema, change: &RowChange) -> bool {
     columns
         .into_iter()
         .any(|column| before.get(column) != after.get(column))
+}
+
+/// Collect only the relationship components touched by this transaction. Walk both images:
+/// a removed relationship must still lead us to dependencies that became unreachable.
+fn collect_affected_unshared(
+    db: &Connection,
+    schema: &SyncSchema,
+    before: &dyn RoutingSnapshot,
+    changed: &OverlayRows,
+) -> Result<(), FanoutError> {
+    // Older/custom schemas may express ownership without a traversable relation. Preserve
+    // their existing collector until that implicit edge has an indexed representation.
+    if schema.tables.iter().any(|table| {
+        table.partition_parent.as_ref().is_some_and(|parent| {
+            !table.relations.iter().any(|relation| {
+                &relation.target_table == parent
+                    && relation.from_columns == [table.partition_column.clone()]
+                    && schema
+                        .table(parent)
+                        .is_some_and(|p| relation.to_columns == p.primary_key)
+            })
+        })
+    }) {
+        return collect_unshared(db, schema);
+    }
+    let current = Snapshot(db);
+    let mut candidates = std::collections::BTreeSet::new();
+    let mut pending: Vec<_> = changed.keys().cloned().collect();
+    while let Some((table_name, encoded_key)) = pending.pop() {
+        if !candidates.insert((table_name.clone(), encoded_key.clone())) {
+            continue;
+        }
+        let key: RowKey = serde_json::from_str(&encoded_key).map_err(error)?;
+        let table = schema
+            .table(&table_name)
+            .ok_or_else(|| error("unknown affected table"))?;
+        for snapshot in [before, &current as &dyn RoutingSnapshot] {
+            let Some(row) = snapshot.get(&table_name, &key)? else {
+                continue;
+            };
+            for source in &schema.tables {
+                for relation in &source.relations {
+                    let edge = if source.name == table.name {
+                        Some((&relation.target_table, &relation.from_columns, &relation.to_columns))
+                    } else {
+                        None
+                    };
+                    let reverse = if relation.target_table == table.name {
+                        Some((&source.name, &relation.to_columns, &relation.from_columns))
+                    } else {
+                        None
+                    };
+                    for (target, from, to) in edge.into_iter().chain(reverse) {
+                        let values: Vec<_> = from
+                            .iter()
+                            .map(|c| row.get(c).cloned().ok_or_else(|| error("missing relation column")))
+                            .collect::<Result<_, _>>()?;
+                        for neighbor in snapshot.matching(target, to, &values)? {
+                            pending.push((target.clone(), json(&row_key(schema, target, &neighbor)?)?));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut keep = std::collections::BTreeSet::new();
+    for (table_name, encoded_key) in &candidates {
+        let table = schema
+            .table(table_name)
+            .ok_or_else(|| error("unknown affected table"))?;
+        if table.partition_routes.is_empty() {
+            continue;
+        }
+        let key: RowKey = serde_json::from_str(encoded_key).map_err(error)?;
+        if let Some(row) = current.get(table_name, &key)?
+            && !crate::fanout::partitions(schema, table, &row, &current)?.is_empty()
+        {
+            crate::fanout::retain_dependencies(schema, table, &row, &current, &mut keep)?;
+        }
+    }
+    for (table, encoded_key) in candidates {
+        if !keep.contains(&(table.clone(), encoded_key.clone())) {
+            let key: RowKey = serde_json::from_str(&encoded_key).map_err(error)?;
+            remove(db, &table, &key)?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_unshared(db: &Connection, schema: &SyncSchema) -> Result<(), FanoutError> {
@@ -430,6 +517,88 @@ mod tests {
             0
         );
         assert_eq!(route(&db, &schema, &rename).unwrap(), result);
+    }
+
+    #[test]
+    fn affected_collection_matches_full_collection_across_relationship_changes() {
+        use rand::{RngExt, SeedableRng};
+        let schema = schema();
+        for seed in 0..8 {
+            let local = Connection::open_in_memory().unwrap();
+            let oracle = Connection::open_in_memory().unwrap();
+            initialize(&local).unwrap();
+            initialize(&oracle).unwrap();
+            for i in 0..20 {
+                for (table, value) in [
+                    (
+                        "doc",
+                        json!({"id":format!("d{i}"),"org":format!("o{}",i%3),"name":"Original"}),
+                    ),
+                    (
+                        "permission",
+                        json!({"id":format!("p{i}"),"docId":format!("d{i}"),"org":format!("o{}",(i+1)%3),"user":"reader"}),
+                    ),
+                    (
+                        "metadata",
+                        json!({"id":format!("m{i}"),"docId":format!("d{i}"),"summary":"Original"}),
+                    ),
+                ] {
+                    let row: Row = serde_json::from_value(value).unwrap();
+                    for db in [&local, &oracle] {
+                        put(db, &schema, table, &row).unwrap();
+                    }
+                }
+            }
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            for step in 0..150 {
+                let i = rng.random_range(0..20);
+                let target = rng.random_range(0..20);
+                let (table, value) = match rng.random_range(0..4) {
+                    0 => (
+                        "doc",
+                        json!({"id":format!("d{i}"),"org":format!("o{}",i%3),"name":format!("name{step}")}),
+                    ),
+                    1 => (
+                        "metadata",
+                        json!({"id":format!("m{i}"),"docId":format!("d{target}"),"summary":"Summary"}),
+                    ),
+                    _ => (
+                        "permission",
+                        json!({"id":format!("p{i}"),"docId":format!("d{target}"),"org":format!("o{}",i%3),"user":"reader"}),
+                    ),
+                };
+                let row: Row = serde_json::from_value(value).unwrap();
+                let key = row_key(&schema, table, &row).unwrap();
+                let old = OverlayRows::from([(
+                    (table.to_string(), json(&key).unwrap()),
+                    Snapshot(&local).get(table, &key).unwrap(),
+                )]);
+                let delete = rng.random_range(0..5) == 0;
+                for db in [&local, &oracle] {
+                    if delete {
+                        remove(db, table, &key).unwrap();
+                    } else {
+                        put(db, &schema, table, &row).unwrap();
+                    }
+                }
+                let before = Before {
+                    current: Snapshot(&local),
+                    rows: &old,
+                    schema: &schema,
+                };
+                collect_affected_unshared(&local, &schema, &before, &old).unwrap();
+                collect_unshared(&oracle, &schema).unwrap();
+                let rows = |db: &Connection| -> Vec<(String, String, String)> {
+                    db.prepare("SELECT tbl,key,image FROM fanout_rows ORDER BY tbl,key")
+                        .unwrap()
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap()
+                };
+                assert_eq!(rows(&local), rows(&oracle), "seed={seed} step={step}");
+            }
+        }
     }
 
     #[test]
