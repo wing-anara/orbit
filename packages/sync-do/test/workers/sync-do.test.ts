@@ -787,3 +787,41 @@ describe("client sessions", () => {
     client.ws.close(1000)
   })
 })
+
+describe("durable fill registration", () => {
+  it.each(["http", "throw"])(
+    "retries a %s registry failure with the same fill id before the fill timeout",
+    async (mode) => {
+      const p = freshPartition()
+      const registry = env.ORBIT_FILL_REGISTRY.get(env.ORBIT_FILL_REGISTRY.idFromName("registry"))
+      await registry.fetch(
+        new Request("https://registry/test/fail-next", {
+          method: "POST",
+          body: JSON.stringify({ partition: p, mode }),
+        }),
+      )
+      const client = await connect(p, await token([p]))
+      client.send(hello(p, [{ id: "all", query: { table: "Chatbot" } }]))
+      await client.next("welcome")
+      let rejected: { id: string | null } = { id: null }
+      for (let i = 0; i < 20 && rejected.id === null; i++) {
+        rejected = await (
+          await registry.fetch(`https://registry/test/rejected?partition=${p}`)
+        ).json()
+        if (rejected.id === null) await new Promise((r) => setTimeout(r, 10))
+      }
+      expect(rejected.id).not.toBeNull()
+      const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+      if (mode === "throw") await evictDurableObject(stub, { webSockets: "hibernate" })
+      await new Promise((r) => setTimeout(r, 150))
+      await runDurableObjectAlarm(stub)
+      const fill = (await pollFills()).requests.find((r) => r.partition === p)
+      expect(fill?.fill_id).toBe(rejected.id)
+      await uploadFill(fill!.fill_id, [chatbot("recovered", { organizationId: p })], 0)
+      const snapshot = await client.next("snapshot")
+      expect(snapshot.rows.map((r) => r.key[0])).toEqual(["recovered"])
+      expect(client.messages.filter((m) => m.type === "subscription_error")).toEqual([])
+      client.ws.close(1000)
+    },
+  )
+})

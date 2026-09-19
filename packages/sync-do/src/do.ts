@@ -149,9 +149,14 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
     private engine: SyncEngine | null = null
     private sessions: Sessions | null = null
     private partition: string | null = null
+    private readonly registeringFills = new Set<string>()
+    private alarmScheduling: Promise<void> = Promise.resolve()
 
     constructor(ctx: DurableObjectState, env: SyncDurableObjectEnv) {
       super(ctx, env)
+      ctx.storage.sql.exec(
+        `CREATE TABLE IF NOT EXISTS fill_registrations (fill_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL)`,
+      )
       // Partition and engine are bound lazily: the first request carries the partition name.
       const stored = ctx.storage.sql
         .exec(
@@ -179,6 +184,9 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       this.engine = engine
       this.sessions = sessions
       this.partition = partition
+      // Recover registration work interrupted between the durable fill request and
+      // the registry acknowledgement. Enqueue is idempotent for the same fill id.
+      for (const fill of engine.outstandingFills()) this.ctx.waitUntil(this.enqueueFill(fill))
       if (events.length > 0) this.dispatch(events)
       return { engine, sessions }
     }
@@ -314,12 +322,17 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
     }
 
     private dropFromRegistry(fillId: string): void {
-      void this.registry().then((stub) =>
-        stub.fetch(
-          new Request(`https://registry/fills/${encodeURIComponent(fillId)}`, {
-            method: "DELETE",
-          }),
-        ),
+      this.ctx.storage.sql.exec(`DELETE FROM fill_registrations WHERE fill_id = ?`, fillId)
+      this.ctx.waitUntil(
+        this.registry()
+          .then((stub) =>
+            stub.fetch(
+              new Request(`https://registry/fills/${encodeURIComponent(fillId)}`, {
+                method: "DELETE",
+              }),
+            ),
+          )
+          .catch(() => undefined),
       )
     }
 
@@ -548,13 +561,16 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
     }
 
     /** Sets the alarm to `at` unless an earlier one is already set. */
-    private async scheduleAlarm(at: number): Promise<void> {
-      try {
-        const current = await this.ctx.storage.getAlarm()
-        if (current === null || current > at) await this.ctx.storage.setAlarm(at)
-      } catch {
-        // The next event that sets an alarm retries; an orphan that lingers costs little.
-      }
+    private scheduleAlarm(at: number): Promise<void> {
+      // Concurrent fill registrations must not overwrite an earlier retry alarm
+      // with a later expiry after both read the same previous alarm value.
+      this.alarmScheduling = this.alarmScheduling
+        .then(async () => {
+          const current = await this.ctx.storage.getAlarm()
+          if (current === null || current > at) await this.ctx.storage.setAlarm(at)
+        })
+        .catch(() => undefined)
+      return this.alarmScheduling
     }
 
     /**
@@ -680,7 +696,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       for (const event of events) {
         switch (event.type) {
           case "fill_needed":
-            void this.enqueueFill(event.request)
+            this.ctx.waitUntil(this.enqueueFill(event.request))
             break
           case "snapshot": {
             sessions.markLive(event.subscription)
@@ -850,19 +866,65 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
     }
 
     private async enqueueFill(request: FillRequest): Promise<void> {
+      if (this.registeringFills.has(request.fill_id)) return
+      if (
+        this.ctx.storage.sql
+          .exec(`SELECT 1 FROM fills WHERE fill_id = ?`, request.fill_id)
+          .toArray().length === 0
+      )
+        return
+      this.registeringFills.add(request.fill_id)
+      const retryAt = Date.now() + 10_000
+      this.ctx.storage.sql.exec(
+        `INSERT INTO fill_registrations (fill_id, next_attempt) VALUES (?, ?) ON CONFLICT(fill_id) DO UPDATE SET next_attempt = excluded.next_attempt`,
+        request.fill_id,
+        retryAt,
+      )
+      // Persist the retry alarm before the RPC, so eviction cannot strand a request.
+      await this.scheduleAlarm(retryAt)
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 10_000)
       try {
         const stub = await this.registry()
-        await stub.fetch(
+        const response = await stub.fetch(
           new Request("https://registry/enqueue", {
             method: "POST",
             body: JSON.stringify(encodeFillRequest(request)),
             headers: { "content-type": "application/json" },
+            signal: controller.signal,
           }),
         )
+        if (!response.ok) throw new Error(`fill registry returned ${response.status}`)
+        this.ctx.storage.sql.exec(
+          `DELETE FROM fill_registrations WHERE fill_id = ?`,
+          request.fill_id,
+        )
       } catch {
-        // The alarm retries outstanding fills.
+        const row = this.ctx.storage.sql
+          .exec(
+            `UPDATE fill_registrations SET attempts = attempts + 1 WHERE fill_id = ? RETURNING attempts`,
+            request.fill_id,
+          )
+          .toArray()[0]
+        const attempts = Number(row?.["attempts"] ?? 1)
+        const next = Date.now() + Math.min(100 * 2 ** Math.min(attempts - 1, 6), 5_000)
+        this.ctx.storage.sql.exec(
+          `UPDATE fill_registrations SET next_attempt = ? WHERE fill_id = ?`,
+          next,
+          request.fill_id,
+        )
+        log({
+          event: "orbit.fill.registration_retry",
+          partition: this.partition,
+          fill_id: request.fill_id,
+          attempts,
+        })
+        await this.scheduleAlarm(next)
+      } finally {
+        clearTimeout(timer)
+        this.registeringFills.delete(request.fill_id)
       }
-      await this.scheduleAlarm(Date.now() + fillTimeoutMs)
+      await this.scheduleAlarm(request.requested_at_ms + fillTimeoutMs)
     }
 
     /**
@@ -875,6 +937,9 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       if (nextExpiry !== null) await this.scheduleAlarm(nextExpiry)
       const engine = this.engine
       if (engine === null) return
+      this.ctx.storage.sql.exec(
+        `DELETE FROM fill_registrations WHERE fill_id NOT IN (SELECT fill_id FROM fills)`,
+      )
       const dropped = engine.sweepOrphans(now - subscriptionGraceMs)
       const nextOrphan = engine.nextOrphanDue(subscriptionGraceMs)
       const pendingCleanup = nextOrphan !== null && nextOrphan <= now
@@ -890,6 +955,15 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       for (const fill of engine.outstandingFills()) {
         if (now - fill.requested_at_ms < fillTimeoutMs) {
           pending += 1
+          const registration = this.ctx.storage.sql
+            .exec(`SELECT next_attempt FROM fill_registrations WHERE fill_id = ?`, fill.fill_id)
+            .toArray()[0]
+          if (registration !== undefined) {
+            const next = Number(registration["next_attempt"])
+            if (next <= now) await this.enqueueFill(fill)
+            else await this.scheduleAlarm(next)
+          }
+          await this.scheduleAlarm(fill.requested_at_ms + fillTimeoutMs)
           continue
         }
         const attempts = this.ctx.storage.sql
@@ -901,8 +975,10 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
             error: { code: "timeout", after_ms: fillTimeoutMs * attempts },
           })
           this.dispatch(events)
+          this.dropFromRegistry(fill.fill_id)
           continue
         }
+        this.dropFromRegistry(fill.fill_id)
         const next = engine.retryFill(fill.fill_id)
         if (next !== null) {
           pending += 1

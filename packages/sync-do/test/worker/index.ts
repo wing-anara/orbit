@@ -8,11 +8,40 @@ import {
   createOrbitHandler,
   hmacAuthorizer,
   makeSyncDurableObject,
+  FillRegistryDurableObject as BaseFillRegistry,
   type OrbitWorkerEnv,
 } from "../../src/index.ts"
 import fixture from "../../../../schema/fixtures/SyncSchema.json"
 
-export { FillRegistryDurableObject } from "../../src/index.ts"
+/** Fault injection is confined to the test Worker. */
+export class FillRegistryDurableObject extends BaseFillRegistry {
+  private readonly failNext = new Map<string, string>()
+  readonly rejectedIds = new Map<string, string>()
+
+  override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+    if (url.pathname === "/test/fail-next") {
+      const body = (await request.json()) as { partition: string; mode: string }
+      this.failNext.set(body.partition, body.mode)
+      return new Response(null, { status: 204 })
+    }
+    if (url.pathname === "/test/rejected")
+      return Response.json({
+        id: this.rejectedIds.get(url.searchParams.get("partition") ?? "") ?? null,
+      })
+    if (url.pathname === "/enqueue") {
+      const body = (await request.clone().json()) as { partition: string; fill_id: string }
+      const mode = this.failNext.get(body.partition)
+      if (mode !== undefined) {
+        this.failNext.delete(body.partition)
+        this.rejectedIds.set(body.partition, body.fill_id)
+        if (mode === "throw") throw new Error("injected registry connection failure")
+        return new Response("injected registry failure", { status: 503 })
+      }
+    }
+    return super.fetch(request)
+  }
+}
 
 export interface Env extends OrbitWorkerEnv {
   readonly ORBIT_INTERNAL_SECRET: string
