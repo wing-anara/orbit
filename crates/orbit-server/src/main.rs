@@ -101,10 +101,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let state = StateStore::open(&args.state).context("opening state store")?;
-    let sink: Arc<dyn Sink> = Arc::new(HttpSink::new(
+    let sink: Arc<dyn Sink> = Arc::new(HttpSink::with_concurrency(
         &args.worker_url,
         &args.worker_secret,
         Duration::from_secs(args.delivery_timeout_secs),
+        args.max_concurrent_deliveries.max(1),
     )?);
     let dist_cfg = DistributorConfig {
         max_batch_transactions: args.max_batch_transactions,

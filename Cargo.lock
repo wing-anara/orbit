@@ -1334,6 +1334,8 @@ dependencies = [
  "async-trait",
  "axum",
  "futures",
+ "hyper",
+ "hyper-util",
  "indexmap",
  "metrics",
  "orbit-gtid",
