@@ -15,7 +15,7 @@ import { createOrbitClient } from "../src/client.ts"
 import type { AsyncSqlDriver } from "../src/driver.ts"
 import { ClientEngine } from "../src/engine.ts"
 import type { MutationEvent } from "../src/mutations.ts"
-import { FakePushServer, FakeSyncServer } from "./support/fake-server.ts"
+import { FakePushServer, FakeSocket, FakeSyncServer } from "./support/fake-server.ts"
 import { nodeAsyncDriver } from "./support/node-driver.ts"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -833,6 +833,95 @@ describe("client engine end to end with the Durable Object core", () => {
     await Effect.runPromise(engine.close())
   })
 
+  it.each(["upgrade", "welcome"] as const)(
+    "retries a stalled %s without waiting for socket close",
+    async (stage) => {
+      const server = new FakeSyncServer(schema, "org_1")
+      server.hangClose = true
+      let attempts = 0
+      let stalled: FakeSocket | undefined
+      const engine = new ClientEngine({
+        schema,
+        partition: "org_1",
+        driver: nodeAsyncDriver(),
+        target: async () => ({ url: "ws://fake", protocols: [] }),
+        makeWebSocket: (url) => {
+          attempts++
+          if (attempts > 1) {
+            server.hangClose = false
+            return server.connect(url)
+          }
+          stalled =
+            stage === "upgrade"
+              ? new FakeSocket(server, url)
+              : (server.connect(url) as unknown as FakeSocket)
+          if (stage === "welcome") stalled.deliver = () => {}
+          return stalled as unknown as WebSocket
+        },
+        backoffMinMs: 5,
+        backoffMaxMs: 20,
+        connectTimeoutMs: 40,
+      })
+      try {
+        await Effect.runPromise(engine.open())
+        await waitFor(() => attempts === 2 && engine.getStatus().connection.status === "open")
+        expect(stalled?.readyState).toBe(2)
+        await settle(120)
+        expect(attempts).toBe(2)
+        const query = await Effect.runPromise(engine.subscribe({ table: "Chatbot" }))
+        await waitFor(() => server.pendingFills.length === 1)
+        server.completeFill("Chatbot", [chatbot("recovered")])
+        await Effect.runPromise(engine.awaitLive(query.id))
+        expect(query.getSnapshot().rows.map((r) => r.row["id"])).toEqual(["recovered"])
+      } finally {
+        await Effect.runPromise(engine.close())
+      }
+    },
+  )
+
+  it("expires a missing pong before the next heartbeat interval", async () => {
+    const server = new FakeSyncServer(schema, "org_1")
+    server.answerPings = false
+    server.hangClose = true
+    let pingAt = 0
+    let replacementAt = 0
+    let attempts = 0
+    const engine = new ClientEngine({
+      schema,
+      partition: "org_1",
+      driver: nodeAsyncDriver(),
+      target: async () => ({ url: "ws://fake", protocols: [] }),
+      makeWebSocket: (url) => {
+        attempts++
+        if (attempts > 1) {
+          replacementAt = Date.now()
+          server.answerPings = true
+          server.hangClose = false
+        }
+        const socket = server.connect(url)
+        const send = socket.send.bind(socket)
+        socket.send = (data) => {
+          if (typeof data === "string" && JSON.parse(data).type === "ping" && !pingAt)
+            pingAt = Date.now()
+          send(data)
+        }
+        return socket
+      },
+      backoffMinMs: 5,
+      backoffMaxMs: 20,
+      pingIntervalMs: 500,
+      pongTimeoutMs: 20,
+    })
+    try {
+      await Effect.runPromise(engine.open())
+      await waitFor(() => replacementAt > 0)
+      expect(replacementAt - pingAt).toBeLessThan(250)
+      expect(server.sessions.size).toBe(2)
+    } finally {
+      await Effect.runPromise(engine.close())
+    }
+  })
+
   it("detects a silently dead link by heartbeat even when the close handshake hangs", async () => {
     const server = new FakeSyncServer(schema, "org_1")
     const engine = new ClientEngine({
@@ -1359,7 +1448,9 @@ describe("named queries", () => {
       const all = client.liveQuery(q(sync).from("Chatbot").orderBy("id"))
       await waitFor(() => server.pendingFills.length > 0)
       server.completeFill("Chatbot", [chatbot("a"), chatbot("b"), chatbot("g", { type: "GROUP" })])
-      await waitFor(() => [docs, folders, all].every((q) => q.getSnapshot().status === "live"))
+      await waitFor(() =>
+        [docs, folders, all].every((query) => query.getSnapshot().status === "live"),
+      )
       const originalFolder = folders.getSnapshot()
       const originalB = docs.getSnapshot().rows[1]
       const seen: string[][] = []

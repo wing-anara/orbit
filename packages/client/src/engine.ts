@@ -45,6 +45,10 @@ import { AsyncLock, MutationManager, type MutationEvent, type MutationHandle } f
 import { LocalStore, StoreError } from "./store.ts"
 import { shareResultRows } from "./result-sharing.ts"
 
+const deltaWeight = (delta: Extract<ServerMessage, { type: "delta" }>) =>
+  delta.rows.length +
+  delta.memberships.reduce((n, change) => n + change.added.length + change.removed.length, 0)
+
 export type LiveQueryStatus = "pending" | "stale" | "live" | "error"
 
 export interface LiveQuerySnapshot {
@@ -138,6 +142,7 @@ export interface EngineConfig {
   readonly pushBackoffMaxMs?: number
   readonly pingIntervalMs?: number
   readonly pongTimeoutMs?: number
+  readonly connectTimeoutMs?: number
   readonly onLog?: (event: string, data: Record<string, unknown>) => void
   readonly now?: () => number
 }
@@ -341,6 +346,9 @@ export class ClientEngine {
         ...(this.config.backoffMaxMs === undefined
           ? {}
           : { backoffMaxMs: this.config.backoffMaxMs }),
+        ...(this.config.connectTimeoutMs === undefined
+          ? {}
+          : { connectTimeoutMs: this.config.connectTimeoutMs }),
         ...(this.config.pingIntervalMs === undefined
           ? {}
           : { pingIntervalMs: this.config.pingIntervalMs }),
@@ -368,13 +376,7 @@ export class ClientEngine {
                 // Ingestion emits hundreds of tiny status transactions. Bound accumulated
                 // work, not just their count, so draining them does not repeatedly read
                 // and render the same large query. One source transaction is indivisible.
-                const weight = (delta: typeof event.message) =>
-                  delta.rows.length +
-                  delta.memberships.reduce(
-                    (n, change) => n + change.added.length + change.removed.length,
-                    0,
-                  )
-                let changes = weight(event.message)
+                let changes = deltaWeight(event.message)
                 while (i < events.length && deltas.length < 256) {
                   const next = events[i]
                   if (next === undefined) break
@@ -384,7 +386,7 @@ export class ClientEngine {
                     next.message.type !== "delta"
                   )
                     break
-                  const nextWeight = weight(next.message)
+                  const nextWeight = deltaWeight(next.message)
                   if (changes + nextWeight > 2000) break
                   deltas.push(next.message)
                   changes += nextWeight

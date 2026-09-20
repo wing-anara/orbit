@@ -93,6 +93,8 @@ export interface OrbitClientConfig<D, M extends MutatorDefinitions<D> = Record<n
   /** Heartbeat: ping interval and the pong timeout that closes a dead socket. */
   readonly pingIntervalMs?: number
   readonly pongTimeoutMs?: number
+  /** Maximum socket upgrade and welcome wait; defaults to ten seconds. */
+  readonly connectTimeoutMs?: number
 }
 
 export interface LiveQueryResult<Row> {
@@ -327,6 +329,7 @@ export const createOrbitClient = async <
     ...(config.backoffMinMs === undefined ? {} : { backoffMinMs: config.backoffMinMs }),
     ...(config.backoffMaxMs === undefined ? {} : { backoffMaxMs: config.backoffMaxMs }),
     ...(config.queryTtlMs === undefined ? {} : { queryTtlMs: config.queryTtlMs }),
+    ...(config.connectTimeoutMs === undefined ? {} : { connectTimeoutMs: config.connectTimeoutMs }),
     ...(config.pingIntervalMs === undefined ? {} : { pingIntervalMs: config.pingIntervalMs }),
     ...(config.pongTimeoutMs === undefined ? {} : { pongTimeoutMs: config.pongTimeoutMs }),
   })

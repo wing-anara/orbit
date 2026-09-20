@@ -59,6 +59,8 @@ export interface ConnectionConfig {
    */
   readonly pingIntervalMs?: number
   readonly pongTimeoutMs?: number
+  /** Maximum socket upgrade and welcome wait; defaults to ten seconds. */
+  readonly connectTimeoutMs?: number
 }
 
 export type ConnectionEvent = (
@@ -116,6 +118,7 @@ export const makeConnection = (
     // `offline` event (that event is not reliable while the page is busy).
     const pingInterval = config.pingIntervalMs ?? 10_000
     const pongTimeout = config.pongTimeoutMs ?? 5_000
+    const connectTimeout = config.connectTimeoutMs ?? 10_000
     const makeWebSocket =
       config.makeWebSocket ??
       ((url: string, protocols: ReadonlyArray<string>) => new WebSocket(url, [...protocols]))
@@ -157,9 +160,10 @@ export const makeConnection = (
         const ws = makeWebSocket(target.url, target.protocols)
         yield* Ref.set(socket, ws)
         let opened = false
-        let lastPongAt = 0
         let lastPingAt = 0
         let heartbeat: ReturnType<typeof setInterval> | null = null
+        let pongDeadline: ReturnType<typeof setTimeout> | null = null
+        let connectDeadline: ReturnType<typeof setTimeout> | null = null
         // Each attempt owns a fresh socket, so exactly one listener per event is attached to it.
         const closed = yield* Effect.callback<AttemptResult>((resume) => {
           let settled = false
@@ -169,6 +173,8 @@ export const makeConnection = (
             if (readySocket === ws) readySocket = null
             if (opening !== null) Effect.runFork(Fiber.interrupt(opening))
             if (heartbeat !== null) clearInterval(heartbeat)
+            if (pongDeadline !== null) clearTimeout(pongDeadline)
+            if (connectDeadline !== null) clearTimeout(connectDeadline)
             if (hasWindow) window.removeEventListener("offline", onOffline)
             ws.removeEventListener("open", onOpen)
             ws.removeEventListener("message", onMessage)
@@ -195,14 +201,11 @@ export const makeConnection = (
           const onOffline = () => terminate(4001, "offline")
           const onOpen = () => {
             opened = true
-            lastPongAt = Date.now()
             heartbeat = setInterval(() => {
               if (ws !== readySocket || ws.readyState !== WebSocket.OPEN) return
-              if (lastPingAt > lastPongAt && Date.now() - lastPingAt > pongTimeout) {
-                terminate(4000, "heartbeat timeout")
-                return
-              }
+              if (pongDeadline !== null) return
               lastPingAt = Date.now()
+              pongDeadline = setTimeout(() => terminate(4000, "heartbeat timeout"), pongTimeout)
               try {
                 ws.send(JSON.stringify(encodeClient({ type: "ping", sentAt: lastPingAt })))
               } catch {
@@ -267,7 +270,14 @@ export const makeConnection = (
                   })
                   return
                 }
-                if (decoded.success.type === "pong") lastPongAt = Date.now()
+                if (decoded.success.type === "welcome" && connectDeadline !== null) {
+                  clearTimeout(connectDeadline)
+                  connectDeadline = null
+                }
+                if (decoded.success.type === "pong" && decoded.success.sentAt === lastPingAt) {
+                  if (pongDeadline !== null) clearTimeout(pongDeadline)
+                  pongDeadline = null
+                }
                 yield* Queue.offer(events, {
                   type: "message",
                   message: decoded.success,
@@ -278,6 +288,10 @@ export const makeConnection = (
           }
           const onClose = (event: CloseEvent) =>
             finish({ code: event.code, reason: event.reason, opened })
+          connectDeadline = setTimeout(
+            () => terminate(4000, "connection handshake timeout"),
+            connectTimeout,
+          )
           ws.addEventListener("open", onOpen)
           ws.addEventListener("message", onMessage)
           ws.addEventListener("error", ignoreSocketError)
