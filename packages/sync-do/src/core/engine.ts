@@ -353,13 +353,20 @@ export class SyncEngine {
   }
 
   /** Drops every cached scope, held change and membership. Subscriptions become pending. */
-  private resetScopes(reason: string): void {
+  private resetScopes(reason: string, preserveTable?: string): void {
     this.invalidateResume()
-    for (const t of this.deps.schema.tables) this.db.run(deleteAllSql(t))
-    this.db.run(`DELETE FROM scopes`)
+    for (const t of this.deps.schema.tables)
+      if (t.name !== preserveTable) this.db.run(deleteAllSql(t))
+    this.db.run(
+      `DELETE FROM scopes${preserveTable === undefined ? "" : " WHERE tbl <> ?"}`,
+      preserveTable === undefined ? [] : [preserveTable],
+    )
     this.db.run(`DELETE FROM held`)
     this.membership.clear()
-    this.db.run(`DELETE FROM fills`)
+    this.db.run(
+      `DELETE FROM fills${preserveTable === undefined ? "" : " WHERE tbl <> ?"}`,
+      preserveTable === undefined ? [] : [preserveTable],
+    )
     this.db.run(`UPDATE subscriptions SET live = 0`)
     this.setMeta("last_reset_reason", reason)
   }
@@ -495,7 +502,11 @@ export class SyncEngine {
    * Finishes a fill. On success the scope becomes live: held changes outside the fill position
    * are applied in order, then every pending subscription on now-live tables is materialized.
    */
-  completeFill(fillId: string, result: FillResult): ReadonlyArray<EngineEvent> {
+  completeFill(
+    fillId: string,
+    result: FillResult,
+    streamEpoch?: number,
+  ): ReadonlyArray<EngineEvent> {
     return this.db.transaction(() => {
       const scope = this.db.query(
         `SELECT tbl, hold_from_seq FROM scopes WHERE fill_id = ? AND state = 'filling'`,
@@ -506,6 +517,27 @@ export class SyncEngine {
       const tableName = asString(scope["tbl"])
       const table = this.rt.table(tableName)
       if (table === undefined) return []
+      const epochEvents: Array<EngineEvent> = []
+      if (result.status === "completed" && streamEpoch !== undefined) {
+        if (!Number.isSafeInteger(streamEpoch) || streamEpoch < this.epoch) {
+          result = {
+            status: "failed",
+            error: {
+              code: "internal",
+              message: "fill belongs to an invalid or stale stream epoch",
+            },
+          }
+        } else if (streamEpoch > this.epoch) {
+          // This snapshot comes from the new engine epoch. Keep its exact image, but discard
+          // every other cache and in-flight fill: those may predate skipped source history.
+          // Learning the epoch here avoids throwing this snapshot away on the first CDC write.
+          this.resetScopes(`fill stream epoch ${this.epoch} -> ${streamEpoch}`, tableName)
+          this.setMeta("epoch", String(streamEpoch))
+          this.setMeta("applied_seq", "0")
+          this.db.run(`DELETE FROM seq_log`)
+          epochEvents.push({ type: "scopes_reset", reason: "epoch_changed" })
+        }
+      }
       if (result.status === "failed") {
         // The scope goes back to absent so the next subscription retries; pending subscriptions
         // on this table are told, and callers may retry with backoff.
@@ -562,7 +594,7 @@ export class SyncEngine {
         }),
       )
       // Materialize subscriptions whose tables are now all live.
-      const events: Array<EngineEvent> = []
+      const events: Array<EngineEvent> = [...epochEvents]
       for (const sub of this.subscriptionsOn(tableName)) {
         if (sub.live) continue
         if ([...sub.planned.tables].every((t) => this.scope(t).state === "live")) {

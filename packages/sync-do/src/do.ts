@@ -266,6 +266,13 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
     private async acceptFill(request: Request, fillId: string): Promise<Response> {
       const engine = this.engine
       if (engine === null) return Response.json({ error: "unbound" }, { status: 409 })
+      const epochHeader = request.headers.get("x-orbit-stream-epoch")
+      const streamEpoch = epochHeader === null ? undefined : Number(epochHeader)
+      if (
+        streamEpoch !== undefined &&
+        (!/^\d+$/.test(epochHeader!) || !Number.isSafeInteger(streamEpoch) || streamEpoch < 0)
+      )
+        return Response.json({ error: "invalid fill stream epoch" }, { status: 400 })
       const scope = engine.status().scopes.some((s) => s.state === "filling")
       if (!scope) {
         // A stale lease re-issued a fill this object already completed: drop it from the registry.
@@ -302,7 +309,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
           }
           rows += r.success
         } else {
-          const events = engine.completeFill(fillId, chunk.result)
+          const events = engine.completeFill(fillId, chunk.result, streamEpoch)
           this.dispatch(events)
           done = true
           log({

@@ -31,6 +31,8 @@ The Rust fill worker (`crates/orbit-server/src/fill_worker.rs`) reserves executi
 
 The engine still executes received work if the claim response is lost: completion is idempotent, and discarding received work would recreate the lost-response stall. The DO buffers each upload before synchronously applying its rows and completion; subsequent uploads for the same completed fill are ignored. Completion deletes the registry row. Legacy engines that omit `ack=1` retain the original 180-second lease; new engines also accept legacy responses without a receipt header. This permits either deployment order.
 
+Fill uploads from current engines include the internal `x-orbit-stream-epoch` header. A completed snapshot from a newer epoch preserves its own exact table image, adopts that epoch, resets the cursor, and invalidates every other cached scope and outstanding fill. Those fills may predate skipped history and must be requested again. This happens during bootstrap, so the first CDC batch in the same epoch does not discard a just-loaded library. Older-epoch fills fail; a later CDC epoch still resets all scopes. Legacy uploads without the header retain their existing behavior. The header is internal and does not change the browser protocol or source database schema.
+
 The worker checks the `schema_hash` of the request. A mismatch produces a failed result without a fill. It then runs the fill under a per-fill timeout (`FILL_TIMEOUT_SECS`, default 120 s).
 
 ## Direct partition fills

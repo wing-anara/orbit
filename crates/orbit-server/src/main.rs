@@ -162,6 +162,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             subscriber: sub_cfg,
             source_client: tokio::sync::OnceCell::new(),
             schema: schema.clone(),
+            stream_epoch: distributor.checkpoint().epoch,
             concurrency: args.fill_concurrency,
             timeout: args.fill_timeout(),
         });

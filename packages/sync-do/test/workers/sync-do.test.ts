@@ -123,6 +123,7 @@ const uploadFill = async (
   rows: ReadonlyArray<Record<string, unknown>>,
   gno: number,
   status: "completed" | "failed" = "completed",
+  streamEpoch?: number,
 ) => {
   const lines: Array<FillChunk> = []
   if (rows.length > 0) lines.push({ type: "rows", fill_id: fillId, rows: rows as never })
@@ -143,7 +144,10 @@ const uploadFill = async (
   })
   const res = await internal(`/internal/fills/${encodeURIComponent(fillId)}`, {
     method: "POST",
-    headers: { "content-type": "application/x-ndjson" },
+    headers: {
+      "content-type": "application/x-ndjson",
+      ...(streamEpoch === undefined ? {} : { "x-orbit-stream-epoch": String(streamEpoch) }),
+    },
     body: lines.map((l) => JSON.stringify(l)).join("\n") + "\n",
   })
   return { status: res.status, body: (await res.json()) as Record<string, unknown> }
@@ -763,6 +767,27 @@ describe("client sessions", () => {
     while (!chunks[chunks.length - 1]?.complete) chunks.push(await client.next("snapshot"))
     expect(chunks.every((c) => c.basedOn === undefined)).toBe(true)
     expect(chunks.flatMap((c) => c.rows).length).toBe(4)
+    client.ws.close(1000)
+  })
+
+  it("learns the epoch from a verified fill and delivers the first write without another fill", async () => {
+    const p = freshPartition()
+    const client = await connect(p, await token([p]))
+    client.send(hello(p, [{ id: "all", query: { table: "Chatbot" } }]))
+    await client.next("welcome")
+    const req = (await pollFills()).requests.find((r) => r.partition === p)!
+    const malformed = await internal(`/internal/fills/${encodeURIComponent(req.fill_id)}`, {
+      method: "POST",
+      headers: { "x-orbit-stream-epoch": "NaN" },
+      body: "",
+    })
+    expect(malformed.status).toBe(400)
+    expect((await uploadFill(req.fill_id, [chatbot("first")], 10, "completed", 7)).status).toBe(200)
+    const snap = await client.next("snapshot")
+    expect(snap.rows.map((r) => r.key[0])).toEqual(["first"])
+    await deliver(p, [txn(50, [insert("Chatbot", chatbot("second"))])], 7)
+    expect(await client.next("delta")).toMatchObject({ cursor: 50 })
+    expect((await pollFills()).requests.filter((r) => r.partition === p)).toEqual([])
     client.ws.close(1000)
   })
 

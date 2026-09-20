@@ -222,6 +222,83 @@ describe("SyncEngine: cursor and deduplication", () => {
   })
 })
 
+describe("SyncEngine: fill stream epoch", () => {
+  const result = {
+    status: "completed" as const,
+    position: `MySQL56/${U1}:1-10`,
+    keyspace: "ks",
+    shard: "0",
+    row_count: 1,
+    duration_ms: 1,
+  }
+  it("keeps the verified snapshot on first CDC and invalidates other pre-epoch fills", () => {
+    const { engine } = makeEngine()
+    const old = engine.ensureScopes(["Chatbot", "organization"]).requests
+    const chat = old.find((r) => r.table === "Chatbot")!
+    const org = old.find((r) => r.table === "organization")!
+    engine.applyFillRows(org.fill_id, [organization("org_1")])
+    engine.applyFillRows(chat.fill_id, [chatbot("a")])
+    const events = engine.completeFill(chat.fill_id, result, 7)
+    expect(events).toContainEqual({ type: "scopes_reset", reason: "epoch_changed" })
+    expect(engine.epoch).toBe(7)
+    expect(engine.scope("Chatbot").state).toBe("live")
+    expect(engine.scope("organization").state).toBe("absent")
+    expect(Result.isFailure(engine.applyFillRows(org.fill_id, [organization("org_1")]))).toBe(true)
+    expect(engine.completeFill(org.fill_id, result, 6)).toEqual([])
+    const subscribed = engine.subscribe({ table: "Chatbot" })
+    if (Result.isFailure(subscribed)) throw subscribed.failure
+    const snapshot = subscribed.success.events.find((e) => e.type === "snapshot")
+    expect(snapshot?.type === "snapshot" && snapshot.rows.map((r) => r.key[0])).toEqual(["a"])
+    const first = engine.applyBatch(
+      batch(
+        schema,
+        "org_1",
+        [txn(50, [update("Chatbot", chatbot("a"), chatbot("a", { contents: "first edit" }))])],
+        7,
+      ),
+    )
+    expect(first.ack.status).toBe("applied")
+    expect(first.events.some((e) => e.type === "scopes_reset")).toBe(false)
+    expect(engine.scope("Chatbot").state).toBe("live")
+    expect(deltas(first.events)).toHaveLength(1)
+    const fresh = engine.ensureScopes(["organization"]).requests[0]!
+    expect(fresh.fill_id).not.toBe(org.fill_id)
+    engine.applyFillRows(fresh.fill_id, [organization("org_1")])
+    expect(
+      engine.completeFill(fresh.fill_id, result, 7).some((e) => e.type === "scopes_reset"),
+    ).toBe(false)
+    expect(engine.appliedSeq).toBe(50)
+  })
+  it("rejects a stale fill epoch and still resets caches on a later CDC epoch", () => {
+    const { engine } = makeEngine()
+    engine.applyBatch(batch(schema, "org_1", [txn(10, [])], 7))
+    const req = engine.ensureScopes(["Chatbot"]).requests[0]!
+    engine.subscribe({ table: "Chatbot" })
+    engine.applyFillRows(req.fill_id, [chatbot("stale")])
+    expect(
+      engine.completeFill(req.fill_id, result, 6).some((e) => e.type === "subscription_failed"),
+    ).toBe(true)
+    expect(engine.scope("Chatbot").state).toBe("absent")
+    const current = engine.ensureScopes(["Chatbot"]).requests[0]!
+    engine.applyFillRows(current.fill_id, [chatbot("current")])
+    engine.completeFill(current.fill_id, result, 7)
+    const bumped = engine.applyBatch(batch(schema, "org_1", [txn(1, [])], 8))
+    expect(bumped.events).toContainEqual({ type: "scopes_reset", reason: "epoch_changed" })
+    expect(engine.scope("Chatbot").state).toBe("absent")
+  })
+  it("a newer fill epoch preserves only its own exact rows and drops legacy live caches", () => {
+    const { engine } = makeEngine()
+    liveScope(engine, "organization", [organization("org_1")])
+    const req = engine.ensureScopes(["Chatbot"]).requests[0]!
+    engine.applyFillRows(req.fill_id, [chatbot("new")])
+    engine.completeFill(req.fill_id, result, 9)
+    expect(engine.epoch).toBe(9)
+    expect(engine.scope("organization").state).toBe("absent")
+    expect(engine.scope("Chatbot").state).toBe("live")
+    expect(engine.appliedSeq).toBe(0)
+  })
+})
+
 describe("SyncEngine: bootstrap race (hold and skip)", () => {
   it("holds changes while filling, then applies only those outside the fill position", () => {
     const { engine } = makeEngine()

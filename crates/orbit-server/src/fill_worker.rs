@@ -26,6 +26,7 @@ pub struct FillWorker {
     pub source_client: OnceCell<orbit_vstream::client::Client>,
     pub schema: Arc<SyncSchema>,
     pub concurrency: usize,
+    pub stream_epoch: u64,
     pub timeout: Duration,
 }
 
@@ -286,6 +287,7 @@ impl FillWorker {
                 .post(&url)
                 .bearer_auth(&self.secret)
                 .header("content-type", "application/x-ndjson")
+                .header("x-orbit-stream-epoch", self.stream_epoch.to_string())
                 .body(body.clone())
                 .send()
                 .await;
@@ -383,6 +385,7 @@ mod tests {
             source_client: OnceCell::new(),
             schema: Arc::new(serde_json::from_str(include_str!("../../../schema/fixtures/SyncSchema.json")).unwrap()),
             concurrency,
+            stream_epoch: 1,
             timeout: Duration::from_secs(120),
         })
     }
@@ -486,6 +489,7 @@ mod tests {
             subscriber: SubscriberConfig::new(orbit_vstream::client::VitessEndpoint::new("http://127.0.0.1:1"), "test"),
             source_client: OnceCell::new(),
             schema: Arc::new(serde_json::from_str(include_str!("../../../schema/fixtures/SyncSchema.json")).unwrap()),
+            stream_epoch: 1,
             concurrency: 3,
             timeout: Duration::from_secs(120),
         };
