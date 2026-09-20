@@ -18,6 +18,7 @@ pub mod fill;
 pub mod normalize;
 pub mod proto;
 pub mod routed_fill;
+pub mod select_fill;
 pub mod shared_projection;
 pub mod stream;
 pub mod subscriber;

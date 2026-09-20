@@ -8,7 +8,7 @@ use orbit_protocol::schema::{
 use crate::client::{Client, VitessEndpoint};
 use crate::decode::{RawRow, decode_row};
 use crate::error::VStreamError;
-use crate::proto::query::{BoundQuery, Field};
+use crate::proto::query::{BindVariable, BoundQuery, Field};
 use crate::proto::vtgate::{ExecuteRequest, Session};
 
 /// A decoded query result: the field list and one raw byte row per result row.
@@ -26,6 +26,15 @@ pub async fn query(endpoint: &VitessEndpoint, keyspace: &str, sql: &str) -> Resu
 
 /// Executes over an existing multiplexed gRPC channel. Callers can cheaply clone the client.
 pub async fn query_with_client(client: &mut Client, keyspace: &str, sql: &str) -> Result<QueryResult, VStreamError> {
+    query_with_client_bindings(client, keyspace, sql, Default::default()).await
+}
+
+pub async fn query_with_client_bindings(
+    client: &mut Client,
+    keyspace: &str,
+    sql: &str,
+    bind_variables: std::collections::HashMap<String, BindVariable>,
+) -> Result<QueryResult, VStreamError> {
     let req = ExecuteRequest {
         session: Some(Session {
             target_string: keyspace.to_string(),
@@ -34,6 +43,7 @@ pub async fn query_with_client(client: &mut Client, keyspace: &str, sql: &str) -
         }),
         query: Some(BoundQuery {
             sql: sql.to_string(),
+            bind_variables,
             ..Default::default()
         }),
         ..Default::default()

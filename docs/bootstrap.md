@@ -33,19 +33,13 @@ The engine still executes received work if the claim response is lost: completio
 
 The worker checks the `schema_hash` of the request. A mismatch produces a failed result without a fill. It then runs the fill under a per-fill timeout (`FILL_TIMEOUT_SECS`, default 120 s).
 
-## The copy phase
+## Direct partition fills
 
-`run_fill` in `crates/orbit-vstream/src/fill.rs` opens a `VStream` with an empty starting position. An empty position tells Vitess to run the copy phase. The request has one filter rule:
+The demand worker uses `run_select_fill_with_client` in `crates/orbit-vstream/src/select_fill.rs`. It reads a source position P, keyset-pages the partition on the primary in batches of 1,000 rows, and reads another source position E. It then replays full CDC row images from P through E before publishing the rows and the applied position. Reads need not share a SQL snapshot: reconciliation includes every change that could race with them. Keyset pagination avoids skipping unchanged rows when earlier rows are deleted. Composite cursor values retain their Vitess types and raw bytes, including unsigned BIGINT and binary keys.
 
-```sql
-select * from `Chatbot` where `organizationId` = 'org_42'
-```
+Replay removes old primary keys and deleted rows, and only inserts after-images whose partition matches the requested partition. Vitess may supply both images when either side of an update matches its filter, so the after-image check is necessary for organization moves. The fill completes only after entire committed transactions cover E; any newer transactions applied while catching up are included in the returned position. Schema changes and topology changes fail the fill instead of publishing an uncertain image.
 
-`tables_to_copy` names the one table. The assembler runs in `Lenient` mode because copy-phase positions repeat and start unknown.
-
-The worker applies every row image it receives to an in-memory map keyed by primary key. Copy rows and interleaved catch-up transactions both go through the same map. Inserts and updates set the row. Deletes remove it. Every transaction or position event updates the position per shard.
-
-The stream ends with a `COPY_COMPLETED` event without a shard. The map is then the exact set of rows for the partition at the last observed position of each shard. Vitess guarantees this: the copy phase interleaves binlog catch-up so that copied rows are consistent up to each emitted `VGTID`.
+This path never requests an empty-GTID copy stream. Vitess copy snapshots can take table locks and rotate the shared binlog; avoiding those operations prevents demand cache reads from requesting source-wide rotations. The legacy `run_fill` copy API remains available, but is not used by the demand worker for direct partitions. Primary reads are required.
 
 A fill that observed more than one shard is failed with an `internal` error. The Durable Object stores one position per scope, so multi-shard partitions are not supported.
 

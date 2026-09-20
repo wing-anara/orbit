@@ -12,7 +12,8 @@ use orbit_protocol::errors::EngineError;
 use orbit_protocol::fill::{FillChunk, FillPollResponse, FillRequest, FillResult};
 use orbit_protocol::schema::SyncSchema;
 use orbit_vstream::SubscriberConfig;
-use orbit_vstream::fill::{run_derived_fill_with_client, run_fill_with_client};
+use orbit_vstream::fill::run_derived_fill_with_client;
+use orbit_vstream::select_fill::run_select_fill_with_client;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -158,9 +159,8 @@ impl FillWorker {
             self.upload(&req, vec![], FillResult::Failed { error: err }).await;
             return;
         }
-        // A table with `partition_parent` cannot be filtered by the copy phase (it would need a
-        // subquery on the parent), so it is read through vtgate `Execute` instead. See
-        // `run_derived_fill` for why the position taken before the selects is exact.
+        // Derived and relation-routed tables need indexed joins. Direct tables use
+        // keyset reads plus CDC reconciliation, avoiding copy-phase source locks.
         let derived = self
             .schema
             .table(&req.table)
@@ -198,7 +198,7 @@ impl FillWorker {
                 )
                 .await
             } else {
-                run_fill_with_client(
+                run_select_fill_with_client(
                     &self.subscriber,
                     &self.schema,
                     &req.table,

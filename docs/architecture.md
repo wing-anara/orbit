@@ -36,7 +36,7 @@ flowchart LR
   SQ --> R
   DO -. "fill request" .-> REG
   REG -. "long poll" .-> F
-  F -. "VStream copy phase" .-> V
+  F -. "partition reads + CDC reconciliation" .-> V
   F -. "NDJSON upload" .-> DO
 ```
 
@@ -57,7 +57,7 @@ orbit-server quarantine list|replay|drop
 
 - The subscriber. It opens a `VStream` on vtgate with one `select * from T` rule per synced table. It assembles `BEGIN`, `FIELD`, `ROW`, `VGTID` and `COMMIT` events into one `SourceTransaction` per commit. It projects each row onto the sync schema. It sends items into a bounded channel with capacity 256.
 - The distributor. It routes each transaction to logical partitions. It groups up to 64 already-ready source items into one durable routing-journal commit (SQLite WAL, synchronous FULL), without waiting to fill a group. Each source transaction retains its own replay decision; nothing is queued for delivery before the group commits. It batches up to 200 transactions or 4 MiB per delivery. It delivers one batch at a time per partition, with at most 256 deliveries in flight by default. It persists the checkpoint in SQLite. See [checkpoints.md](checkpoints.md).
-- The fill worker. It long-polls the Worker for fill requests and runs copy-phase fills. It reserves a bounded shared budget for polling and executing fills, with up to eight polling lanes so registry round trips can overlap. Reserved permits transfer directly to received work; a competing poller cannot take them. It runs at most `FILL_CONCURRENCY` fills at the same time (default 4). `--disable-fills` turns it off.
+- The fill worker. It long-polls the Worker for fill requests and runs partition reads with CDC reconciliation for direct tables, and indexed SELECT fills for derived or relation-routed tables. It reserves a bounded shared budget for polling and executing fills, with up to eight polling lanes so registry round trips can overlap. Reserved permits transfer directly to received work; a competing poller cannot take them. It runs at most `FILL_CONCURRENCY` fills at the same time (default 4). `--disable-fills` turns it off.
 - A Prometheus metrics endpoint at `METRICS_ADDR` (default `127.0.0.1:9464`).
 - A status log line every 10 seconds.
 
