@@ -34,8 +34,10 @@ import {
   type SubscribeMessage,
   type SyncError,
   WS_SUBPROTOCOL,
+  WS_HEARTBEAT_REQUEST,
+  WS_HEARTBEAT_RESPONSE,
 } from "@orbit/protocol/client"
-import { resolveNamedQuery, type AnyDefinedQueries } from "@orbit/query"
+import { planQuery, resolveNamedQuery, type AnyDefinedQueries } from "@orbit/query"
 import { compatibility, projectRow } from "@orbit/schema"
 
 import { SyncEngine, type EngineEvent } from "./core/engine.ts"
@@ -80,6 +82,11 @@ export interface SyncDurableObjectConfig {
    * memberships are reclaimed in bounded alarm passes. Default: one hour.
    */
   readonly subscriptionGraceMs?: number
+  /** Retain up to eight orphaned views of at most 1,000 members for reuse across days.
+   * Inactive views receive no CDC maintenance. Zero disables this bounded warm cache.
+   * Defaults to 36 hours, independently of the short subscription grace period.
+   */
+  readonly warmSubscriptionRetentionMs?: number
 }
 
 const SNAPSHOT_CHUNK_DEFAULT = 500
@@ -100,6 +107,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
   const maxFillAttempts = config.maxFillAttempts ?? 5
   const snapshotChunkRows = config.snapshotChunkRows ?? SNAPSHOT_CHUNK_DEFAULT
   const subscriptionGraceMs = config.subscriptionGraceMs ?? SUBSCRIPTION_GRACE_DEFAULT
+  const warmSubscriptionRetentionMs = config.warmSubscriptionRetentionMs ?? 36 * 60 * 60_000
   const allowAdHoc = config.allowAdHocQueries ?? config.queries === undefined
   const hasClientsTable = config.schema.tables.some((t) => t.name === ORBIT_CLIENTS_TABLE)
 
@@ -154,6 +162,9 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
 
     constructor(ctx: DurableObjectState, env: SyncDurableObjectEnv) {
       super(ctx, env)
+      ctx.setWebSocketAutoResponse(
+        new WebSocketRequestResponsePair(WS_HEARTBEAT_REQUEST, WS_HEARTBEAT_RESPONSE),
+      )
       ctx.storage.sql.exec(
         `CREATE TABLE IF NOT EXISTS fill_registrations (fill_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL)`,
       )
@@ -209,6 +220,8 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       const { engine, sessions } = bound
       try {
         if (url.pathname === "/ws") return this.openSocket(request, partition)
+        if (url.pathname === "/session/renew" && request.method === "POST")
+          return await this.renewSession(request, partition)
         if (url.pathname === "/cdc" && request.method === "POST") {
           const body: unknown = await request.json()
           const started = Date.now()
@@ -368,7 +381,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
         ...(expiresAt === undefined ? {} : { expiresAt }),
       }
       server.serializeAttachment(encodeAttachment(attachment))
-      this.ctx.acceptWebSocket(server)
+      this.ctx.acceptWebSocket(server, [`session:${session}`])
       // The alarm closes the socket when the grant expires; the client reconnects with a new token.
       if (expiresAt !== undefined) void this.scheduleAlarm(expiresAt)
       // A client that offered the Orbit subprotocol (the token travels in it) expects the echo.
@@ -376,6 +389,88 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       if (offeredSubprotocols(request).includes(WS_SUBPROTOCOL))
         headers.set("sec-websocket-protocol", WS_SUBPROTOCOL)
       return new Response(null, { status: 101, webSocket: client, headers })
+    }
+
+    /** The Worker has verified the fresh grant. Preserve only the same live identity;
+     * expired/closed sessions must reconnect and must never be resurrected here.
+     * Expiry lives in the hibernation attachment, not a per-renewal SQL record.
+     */
+    private async renewSession(request: Request, partition: string): Promise<Response> {
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return Response.json({ error: "invalid JSON" }, { status: 400 })
+      }
+      const decoded = Schema.decodeUnknownResult(
+        Schema.Struct({
+          sessionId: Schema.String,
+        }),
+      )(body)
+      if (Result.isFailure(decoded) || decoded.success.sessionId.length > 128)
+        return Response.json({ error: "invalid session" }, { status: 400 })
+      const { sessionId } = decoded.success
+      const subject = request.headers.get("x-orbit-subject")
+      const rawExpiry = request.headers.get("x-orbit-expires")
+      const expiresAt = rawExpiry === "" ? null : Number(rawExpiry)
+      const now = Date.now()
+      if (
+        subject === null ||
+        rawExpiry === null ||
+        (expiresAt !== null && (!Number.isSafeInteger(expiresAt) || expiresAt <= now))
+      )
+        return Response.json({ error: "invalid grant" }, { status: 401 })
+      const tagged = this.ctx.getWebSockets(`session:${sessionId}`)
+      // Compatibility with live sockets accepted before session tags were introduced.
+      const sockets = tagged.length > 0 ? tagged : this.ctx.getWebSockets()
+      for (const ws of sockets) {
+        const attachment = readAttachment(ws)
+        if (attachment === null || attachment.session !== sessionId) continue
+        if (attachment.subject !== subject || attachment.partition !== partition)
+          return Response.json({ error: "identity mismatch" }, { status: 403 })
+        if (
+          ws.readyState !== WebSocket.OPEN ||
+          !attachment.hello ||
+          this.expireIfDue(ws, attachment, now)
+        )
+          return Response.json({ error: "session expired" }, { status: 409 })
+        const session = this.sessions?.get(sessionId)
+        const engine = this.engine
+        if (session == null || engine === null)
+          return Response.json({ error: "session not found" }, { status: 409 })
+        // Re-resolve authorization just as reconnect would. Query definitions may change
+        // across deployments even though the token subject and schema are unchanged.
+        for (const held of this.sessions?.clientSubsOf(sessionId) ?? []) {
+          const ref = held.queryRef
+          const resolved =
+            ref === null
+              ? null
+              : resolveQuery(ref, { partition, subject, clientId: session.clientId })
+          const planned =
+            resolved === null || Result.isFailure(resolved)
+              ? null
+              : planQuery(engine.rt, resolved.success)
+          if (
+            planned === null ||
+            Result.isFailure(planned) ||
+            planned.success.key !== held.subscription
+          ) {
+            ws.close(CloseCode.sessionExpired, "query authorization changed")
+            return Response.json({ error: "query authorization changed" }, { status: 409 })
+          }
+        }
+        const { expiresAt: previousExpiry, ...rest } = attachment
+        if (previousExpiry !== (expiresAt ?? undefined))
+          ws.serializeAttachment(
+            encodeAttachment({ ...rest, ...(expiresAt === null ? {} : { expiresAt }) }),
+          )
+        // The existing earlier alarm remains valid and will re-evaluate the attachment.
+        // Only an earlier/new expiry needs a new alarm; extending a grant writes no SQL.
+        if (expiresAt !== null && (previousExpiry === undefined || expiresAt < previousExpiry))
+          await this.scheduleAlarm(expiresAt)
+        return Response.json({ expiresAt, serverTime: now })
+      }
+      return Response.json({ error: "session not found" }, { status: 409 })
     }
 
     /** Closes the socket when the grant behind it has expired. Returns true when it did. */
@@ -494,6 +589,12 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
           schemaHash: config.schema.schema_hash,
           cursor: engine.appliedSeq,
           serverTime: now,
+          heartbeat: "static-v1",
+          ...(attachment.expiresAt === undefined
+            ? {}
+            : {
+                sessionRenewal: { expiresAt: attachment.expiresAt },
+              }),
         })
         for (const sub of msg.subscriptions) this.subscribe(ws, attachment.session, sub)
         return
@@ -518,10 +619,12 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
           return
         }
         case "ack":
-          sessions.touch(attachment.session, now, msg.cursor)
+          // This cursor is diagnostic, not a replay/checkpoint boundary. Keep it with the
+          // hibernating socket instead of charging a SQL write for every delivered delta.
+          if (attachment.ackCursor !== msg.cursor)
+            ws.serializeAttachment(encodeAttachment({ ...attachment, ackCursor: msg.cursor }))
           return
         case "ping":
-          sessions.touch(attachment.session, now)
           this.send(ws, { type: "pong", sentAt: msg.sentAt, serverTime: now })
           return
       }
@@ -557,14 +660,26 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
 
     /**
      * The last session left a subscription. It stays materialized for the grace period (see
-     * `subscriptionGraceMs`); the alarm drops it afterwards.
+     * `subscriptionGraceMs`, or the bounded warm retention); the alarm drops it afterwards.
      */
     private orphan(subscription: string): void {
       const engine = this.engine
       if (engine === null) return
       const now = Date.now()
-      engine.markOrphaned(subscription, now)
-      void this.scheduleAlarm(now + subscriptionGraceMs)
+      engine.markOrphaned(
+        subscription,
+        now,
+        warmSubscriptionRetentionMs > 0
+          ? {
+              graceMs: subscriptionGraceMs,
+              warmMs: warmSubscriptionRetentionMs,
+              maxViews: 8,
+              maxMembers: 1000,
+            }
+          : undefined,
+      )
+      const due = engine.nextOrphanDue(subscriptionGraceMs)
+      if (due !== null) void this.scheduleAlarm(due)
     }
 
     /** Sets the alarm to `at` unless an earlier one is already set. */
@@ -628,7 +743,13 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
         this.send(ws, { type: "subscription_error", id: sub.id, error: outcome.failure })
         return
       }
-      sessions.setClientSub(session, sub.id, outcome.success.subscription, outcome.success.status)
+      sessions.setClientSub(
+        session,
+        sub.id,
+        outcome.success.subscription,
+        outcome.success.status,
+        sub.query,
+      )
       const snapshot = outcome.success.events.find(
         (e) => e.type === "snapshot" && e.subscription === outcome.success.subscription,
       )
@@ -848,6 +969,15 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
     }
 
     private send(ws: WebSocket, message: ServerMessage): void {
+      // Native pongs prove transport liveness, not authorization. Never deliver application
+      // data after expiry even if an alarm is delayed and no ordinary client frame arrives.
+      const attachment = readAttachment(ws)
+      if (
+        message.type !== "error" &&
+        attachment !== null &&
+        this.expireIfDue(ws, attachment, Date.now())
+      )
+        return
       try {
         ws.send(JSON.stringify(encodeServer(message)))
       } catch {
@@ -947,7 +1077,7 @@ export const makeSyncDurableObject = (config: SyncDurableObjectConfig) => {
       this.ctx.storage.sql.exec(
         `DELETE FROM fill_registrations WHERE fill_id NOT IN (SELECT fill_id FROM fills)`,
       )
-      const dropped = engine.sweepOrphans(now - subscriptionGraceMs)
+      const dropped = engine.sweepOrphans(now, subscriptionGraceMs)
       const nextOrphan = engine.nextOrphanDue(subscriptionGraceMs)
       const pendingCleanup = nextOrphan !== null && nextOrphan <= now
       if (dropped.length > 0 || pendingCleanup)

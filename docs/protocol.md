@@ -6,7 +6,7 @@ Related documents: [architecture.md](architecture.md), [auth.md](auth.md), [quer
 
 ## Client protocol v1
 
-The client protocol is defined in `packages/protocol/src/client-protocol.ts`. `CLIENT_PROTOCOL_VERSION` is `1`. Messages are JSON. Every message is a member of a tagged union. Decoding is exhaustive: an unknown message is an error.
+The client protocol is defined in `packages/protocol/src/client-protocol.ts`. `CLIENT_PROTOCOL_VERSION` is `1`. Application messages are JSON; negotiated native heartbeats use a fixed text pair. Every JSON message is a member of a tagged union. Decoding is exhaustive: an unknown message is an error.
 
 The cursor is the partition sequence (`applied_seq` of the Durable Object) at which the client's local state is consistent. Deltas carry the cursor they advance to. The client applies consecutive queued deltas in bounded, ordered atomic batches and acknowledges the last committed cursor. Snapshots and connection transitions are batching barriers.
 
@@ -36,7 +36,7 @@ Snapshots and deltas optionally carry `version`. The version combines schema, a 
 
 `unsubscribe` has `id`.
 
-`ack` has `cursor`. The server records it on the session row.
+`ack` has `cursor`. The server records changed acknowledgments in the hibernation attachment, without SQL writes. This is diagnostic state: recovery uses the durable engine and browser cursors, not the session acknowledgment.
 
 `ping` has `sentAt` (unix milliseconds).
 
@@ -44,14 +44,16 @@ Snapshots and deltas optionally carry `version`. The version combines schema, a 
 
 `welcome` answers a valid `hello`.
 
-| Field             | Meaning                                     |
-| ----------------- | ------------------------------------------- |
-| `protocolVersion` | `1`                                         |
-| `sessionId`       | Server-generated session id.                |
-| `partition`       | The authorized partition.                   |
-| `schemaHash`      | The server's schema hash.                   |
-| `cursor`          | The Durable Object's current `applied_seq`. |
-| `serverTime`      | Unix milliseconds.                          |
+| Field             | Meaning                                                                              |
+| ----------------- | ------------------------------------------------------------------------------------ |
+| `protocolVersion` | `1`                                                                                  |
+| `sessionId`       | Server-generated session id.                                                         |
+| `partition`       | The authorized partition.                                                            |
+| `schemaHash`      | The server's schema hash.                                                            |
+| `cursor`          | The Durable Object's current `applied_seq`.                                          |
+| `serverTime`      | Unix milliseconds.                                                                   |
+| `sessionRenewal`  | Optional `{ expiresAt }` (unix milliseconds); advertises authenticated HTTP renewal. |
+| `heartbeat`       | Optional `"static-v1"`; advertises native text auto-response.                        |
 
 `subscribed` has `id`, `status`, and `query`. `status` is `pending` while the Durable Object fills the scope from the source, and `live` once the snapshot follows. `query` is the resolved, normalized query the server materializes; for a named query it is the resolver's output with the session identity applied. The client adopts it when it differs from its local resolution.
 
@@ -118,7 +120,8 @@ The client treats 4400, 4401, 4403, and 4409 as fatal. It stops reconnecting and
 3. For each subscription the server sends `subscribed`. When every table of the query is live, it sends `subscribed` with `live` and then the snapshot chunks. Otherwise it sends `pending` and requests a fill.
 4. When a fill completes, the server materializes the pending subscriptions and sends `subscribed live` plus a snapshot to every session that references them.
 5. Each applied CDC transaction produces one `delta` per interested session. The client applies it and sends `ack`.
-6. The client sends `ping` every 10 seconds. The server answers with `pong`.
+6. The client sends a heartbeat every 10 seconds. With `heartbeat: "static-v1"`, it sends the literal text `orbit:ping:v1`; Cloudflare auto-responds with `orbit:pong:v1` without waking the DO. Otherwise it uses JSON `ping`/`pong`. Only one heartbeat is outstanding; a missed reply disconnects. A native pong proves transport liveness, not current authorization. Expiry remains enforced by the alarm and the data path.
+7. With `sessionRenewal`, the client obtains fresh credentials before expiry and renews the existing session over HTTP. Failure falls back to reconnect; no durable mutation or client cursor is dropped. See [auth.md](auth.md).
 
 ## Internal protocol
 
@@ -165,15 +168,16 @@ A Durable Object that lacks a scope registers a `FillRequest`: `fill_id`, `schem
 
 The Worker router in `packages/sync-do/src/worker.ts` mounts these routes under the prefix (default `/orbit`). Every `/internal/*` route requires `Authorization: Bearer <internalSecret>`.
 
-| Route                             | Purpose                                                             |
-| --------------------------------- | ------------------------------------------------------------------- |
-| `GET /ws?partition=P&token=T`     | Client WebSocket. Authorized, then forwarded to the Durable Object. |
-| `POST /internal/cdc/:partition`   | Distributor delivery of a `CdcBatch`. Returns a `CdcBatchAck`.      |
-| `GET /internal/fills/next?wait=S` | Fill worker long poll. `S` defaults to 20 seconds, capped at 25.    |
-| `POST /internal/fills/:fillId`    | Fill upload as NDJSON. The partition is parsed from the fill id.    |
-| `GET /internal/status/:partition` | Durable Object status.                                              |
-| `POST /internal/reset/:partition` | Operator reset. Closes sockets with 4500 and deletes all storage.   |
-| `GET /internal/registry/status`   | Number of queued fills.                                             |
+| Route                             | Purpose                                                                 |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| `GET /ws?partition=P`             | Client WebSocket. Authorized, then forwarded to the Durable Object.     |
+| `POST /session/renew?partition=P` | Fresh bearer authorization for an existing session; JSON `{sessionId}`. |
+| `POST /internal/cdc/:partition`   | Distributor delivery of a `CdcBatch`. Returns a `CdcBatchAck`.          |
+| `GET /internal/fills/next?wait=S` | Fill worker long poll. `S` defaults to 20 seconds, capped at 25.        |
+| `POST /internal/fills/:fillId`    | Fill upload as NDJSON. The partition is parsed from the fill id.        |
+| `GET /internal/status/:partition` | Durable Object status.                                                  |
+| `POST /internal/reset/:partition` | Operator reset. Closes sockets with 4500 and deletes all storage.       |
+| `GET /internal/registry/status`   | Number of queued fills.                                                 |
 
 ## Versioning fields
 

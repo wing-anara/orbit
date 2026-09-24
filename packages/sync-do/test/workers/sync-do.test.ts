@@ -3,7 +3,7 @@
  * registry, eviction, and alarms.
  */
 
-import { env, SELF } from "cloudflare:test"
+import { env, SELF, runInDurableObject } from "cloudflare:test"
 import { evictDurableObject, runDurableObjectAlarm } from "cloudflare:test"
 import { Effect, Schema } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
@@ -17,15 +17,18 @@ import {
 } from "@orbit/protocol"
 import {
   CLIENT_PROTOCOL_VERSION,
+  WS_HEARTBEAT_REQUEST,
+  WS_HEARTBEAT_RESPONSE,
   decodeServerMessage,
   encodeClientMessage,
   type ClientMessage,
   type ServerMessage,
 } from "@orbit/protocol/client"
 
+import { readAttachment, encodeAttachment } from "../../src/sessions.ts"
 import { signToken } from "../../src/authorizer.ts"
 import { durableObjectNameFor } from "../../src/placement.ts"
-import { schema } from "../worker/index.ts"
+import { schema, revokedQuerySubjects } from "../worker/index.ts"
 
 const SECRET = "test-secret"
 const U1 = "a2523813-adbe-11f1-b19c-0a2250a7ed6c"
@@ -160,6 +163,7 @@ class Client {
   closed: { code: number; reason: string } | null = null
   constructor(readonly ws: WebSocket) {
     ws.addEventListener("message", (e) => {
+      if (e.data === WS_HEARTBEAT_RESPONSE) return
       this.messages.push(decodeServerMessage(JSON.parse(String(e.data))))
       const w = this.waiters
       this.waiters = []
@@ -356,6 +360,213 @@ describe("client sessions", () => {
     expect(missing.status).toBe(401)
   })
 
+  it(
+    "renews the same session with fresh authorization and zero SQL writes, including after hibernation",
+    { timeout: 20000 },
+    async () => {
+      const p = freshPartition()
+      const client = await connect(p, await token([p], "user-1", 120))
+      const query = { name: "mine", args: {} }
+      client.send(hello(p, [], { subscriptions: [{ type: "subscribe", id: "mine", query }] }))
+      const welcome = await client.next("welcome")
+      expect(welcome.heartbeat).toBe("static-v1")
+      expect(welcome.sessionRenewal?.expiresAt).toBeGreaterThan(Date.now())
+      const fill = (await pollFills()).requests.find((r) => r.partition === p)!
+      await uploadFill(
+        fill.fill_id,
+        [chatbot("visible", { groupId: "user-1" }), chatbot("private-peer", { groupId: "user-2" })],
+        0,
+      )
+      const snap = await client.next("snapshot")
+      expect(snap.rows.map((r) => r.key[0])).toEqual(["visible"])
+      const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+      const inspect = () =>
+        runInDurableObject(stub, async (_object, state) => ({
+          changes: state.storage.sql.exec(`SELECT total_changes() AS n`).one()["n"],
+          sessions: state.storage.sql.exec(`SELECT * FROM sessions`).toArray(),
+          subs: state.storage.sql.exec(`SELECT * FROM client_subs`).toArray(),
+          expiry: state.getWebSockets().map((ws) => readAttachment(ws)?.expiresAt),
+        }))
+      const renew = async (
+        tok: string,
+        subscriptions = [{ id: "mine", query }],
+        sessionId = welcome.sessionId,
+        partition = p,
+      ) => {
+        const response = await SELF.fetch(
+          `${base}/session/renew?partition=${encodeURIComponent(partition)}`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${tok}`,
+              "content-type": "application/json",
+              "x-orbit-subject": "user-1",
+              "x-orbit-expires": String(Date.now() + 99999999),
+            },
+            body: JSON.stringify({ sessionId, subscriptions }),
+          },
+        )
+        const body = await response.text()
+        return new Response(body, { status: response.status, headers: response.headers })
+      }
+      const original = await inspect()
+      expect((await renew("invalid")).status).toBe(401)
+      expect((await renew(await token([p], "user-2"))).status).toBe(403)
+      expect((await renew(await token(["other"]))).status).toBe(403)
+      expect((await renew(await token([p]), undefined, "missing")).status).toBe(409)
+      expect((await renew(await token([p], "user-1", -10))).status).toBe(401)
+      expect(await inspect()).toEqual(original)
+      const preflight = await SELF.fetch(`${base}/session/renew?partition=${p}`, {
+        method: "OPTIONS",
+      })
+      expect(preflight.status).toBe(204)
+      expect(preflight.headers.get("access-control-allow-headers")).toContain("Authorization")
+      for (const hibernate of [false, true]) {
+        if (hibernate) await evictDurableObject(stub, { webSockets: "hibernate" })
+        const before = await inspect()
+        const response = await renew(await token([p], "user-1", hibernate ? 7200 : 3600))
+        expect(response.status).toBe(200)
+        await response.json()
+        expect(response.headers.get("cache-control")).toBe("no-store")
+        const after = await inspect()
+        expect(after.changes).toBe(before.changes)
+        expect(after.sessions).toEqual(original.sessions)
+        expect(after.subs).toEqual(original.subs)
+        expect(after.expiry[0]).toBeGreaterThan(before.expiry[0]!)
+      }
+      // The same subscribed session still receives exactly the rows authorized by its subject.
+      await deliver(p, [
+        txn(1, [
+          insert("Chatbot", chatbot("after-renew", { groupId: "user-1" })),
+          insert("Chatbot", chatbot("denied", { groupId: "user-2" })),
+        ]),
+      ])
+      const delta = await client.next("delta")
+      expect(delta.rows.map((r) => r.key[0])).toEqual(["after-renew"])
+      // Change the server resolver without changing the client's ref, subject or schema.
+      revokedQuerySubjects.add("user-1")
+      try {
+        expect((await renew(await token([p]))).status).toBe(409)
+        expect((await client.waitClosed()).code).toBe(4408)
+      } finally {
+        revokedQuerySubjects.delete("user-1")
+      }
+    },
+  )
+
+  it("never resurrects an expired session and native heartbeats cannot extend authorization", async () => {
+    const p = freshPartition()
+    const client = await connect(p, await token([p]))
+    client.send(hello(p, []))
+    const welcome = await client.next("welcome")
+    const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+    const ping = () =>
+      new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(Error("native heartbeat timeout")), 2000)
+        const listener = (e: MessageEvent) => {
+          if (e.data !== WS_HEARTBEAT_RESPONSE) return
+          clearTimeout(timer)
+          client.ws.removeEventListener("message", listener)
+          resolve()
+        }
+        client.ws.addEventListener("message", listener)
+        client.ws.send(WS_HEARTBEAT_REQUEST)
+      })
+    for (const hibernate of [false, true]) {
+      if (hibernate) await evictDurableObject(stub, { webSockets: "hibernate" })
+      const before = await runInDurableObject(stub, async (_object, state) => ({
+        changes: state.storage.sql.exec(`SELECT total_changes() AS n`).one()["n"],
+        attachment: readAttachment(state.getWebSockets()[0]!),
+      }))
+      for (let i = 0; i < 100; i++) await ping()
+      const after = await runInDurableObject(stub, async (_object, state) => ({
+        changes: state.storage.sql.exec(`SELECT total_changes() AS n`).one()["n"],
+        attachment: readAttachment(state.getWebSockets()[0]!),
+        native: state.getWebSocketAutoResponseTimestamp(state.getWebSockets()[0]!) !== null,
+      }))
+      expect(after).toEqual({ ...before, native: true })
+    }
+    await runInDurableObject(stub, async (_object, state) => {
+      const ws = state.getWebSockets()[0]!
+      const a = readAttachment(ws)!
+      ws.serializeAttachment(encodeAttachment({ ...a, expiresAt: Date.now() - 1 }))
+    })
+    const response = await SELF.fetch(`${base}/session/renew?partition=${p}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${await token([p])}`, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: welcome.sessionId, subscriptions: [] }),
+    })
+    expect(response.status).toBe(409)
+    expect((await client.waitClosed()).code).toBe(4408)
+  })
+
+  it("blocks outgoing data after expiry even if no client frame or expiry alarm arrives", async () => {
+    const p = freshPartition()
+    const client = await connect(p, await token([p]))
+    client.send(hello(p, [{ id: "all", query: { table: "Chatbot" } }]))
+    await client.next("welcome")
+    const fill = (await pollFills()).requests.find((r) => r.partition === p)!
+    await uploadFill(fill.fill_id, [chatbot("first")], 0)
+    await client.next("snapshot")
+    const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+    await runInDurableObject(stub, async (_object, state) => {
+      const ws = state.getWebSockets()[0]!
+      ws.serializeAttachment(
+        encodeAttachment({ ...readAttachment(ws)!, expiresAt: Date.now() - 1 }),
+      )
+    })
+    await deliver(p, [txn(1, [insert("Chatbot", chatbot("must-not-leak"))])])
+    expect((await client.waitClosed()).code).toBe(4408)
+    expect(client.messages.filter((m) => m.type === "delta")).toEqual([])
+  })
+
+  it(
+    "handles 100 changing grants without session churn or SQL writes and honors shorter expiry",
+    { timeout: 20000 },
+    async () => {
+      const p = freshPartition()
+      const client = await connect(p, await token([p], "user-1", 60))
+      client.send(hello(p, []))
+      const welcome = await client.next("welcome")
+      const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+      const inspect = () =>
+        runInDurableObject(stub, async (_object, state) => ({
+          changes: state.storage.sql.exec(`SELECT total_changes() AS n`).one()["n"],
+          count: state.storage.sql.exec(`SELECT COUNT(*) AS n FROM sessions`).one()["n"],
+          attachment: readAttachment(state.getWebSockets()[0]!),
+        }))
+      const before = await inspect()
+      for (let i = 0; i < 100; i++) {
+        const response = await SELF.fetch(`${base}/session/renew?partition=${p}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${await token([p], "user-1", 120 + i)}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ sessionId: welcome.sessionId }),
+        })
+        expect(response.status).toBe(200)
+        await response.json()
+      }
+      const after = await inspect()
+      expect(after.changes).toBe(before.changes)
+      expect(after.count).toBe(1)
+      expect(after.attachment?.session).toBe(welcome.sessionId)
+      const shortened = await SELF.fetch(`${base}/session/renew?partition=${p}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${await token([p], "user-1", 30)}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ sessionId: welcome.sessionId }),
+      })
+      expect(shortened.status).toBe(200)
+      await shortened.json()
+      expect((await inspect()).attachment!.expiresAt!).toBeLessThan(after.attachment!.expiresAt!)
+      client.ws.close(1000)
+    },
+  )
+
   it("closes a socket with 4408 once the grant behind it expires", async () => {
     const p = freshPartition()
     const client = await connect(p, await token([p], "user-1", 1))
@@ -509,6 +720,51 @@ describe("client sessions", () => {
     client.ws.close(1000, "done")
   })
 
+  it("keeps heartbeats write-free across hibernation and keeps acknowledgments in the hibernation attachment", async () => {
+    const p = freshPartition()
+    const client = await connect(p, await token([p]))
+    client.send(hello(p, []))
+    await client.next("welcome")
+    const stub = env.ORBIT_SYNC.get(env.ORBIT_SYNC.idFromName(durableObjectNameFor(schema, p)))
+    const stateOf = () =>
+      runInDurableObject(stub, async (_object, state) => ({
+        changes: state.storage.sql.exec(`SELECT total_changes() AS n`).one()["n"],
+        session: state.storage.sql.exec(`SELECT cursor, last_seen_at FROM sessions`).one(),
+        ack: readAttachment(state.getWebSockets()[0]!)?.ackCursor,
+      }))
+    for (const hibernate of [false, true]) {
+      if (hibernate) await evictDurableObject(stub, { webSockets: "hibernate" })
+      // Capture after reopening SQLite; total_changes is connection-local.
+      const before = await stateOf()
+      for (let i = 0; i < 100; i++) {
+        client.send({ type: "ping", sentAt: i })
+        expect((await client.next("pong")).sentAt).toBe(i)
+      }
+      expect(await stateOf()).toEqual(before)
+    }
+    client.send({ type: "ack", cursor: 12 })
+    client.send({ type: "ping", sentAt: 101 })
+    await client.next("pong")
+    const beforeDuplicates = await stateOf()
+    expect(beforeDuplicates.session["cursor"]).toBe(0)
+    expect(beforeDuplicates.ack).toBe(12)
+    for (let i = 0; i < 100; i++) client.send({ type: "ack", cursor: 12 })
+    client.send({ type: "ping", sentAt: 102 })
+    await client.next("pong")
+    expect(await stateOf()).toEqual(beforeDuplicates)
+    await evictDurableObject(stub, { webSockets: "hibernate" })
+    expect((await stateOf()).session).toEqual(beforeDuplicates.session)
+    expect((await stateOf()).ack).toBe(12)
+    const beforeReset = await stateOf()
+    client.send({ type: "ack", cursor: 0 })
+    client.send({ type: "ping", sentAt: 103 })
+    await client.next("pong")
+    const reset = await stateOf()
+    expect(reset.changes).toBe(beforeReset.changes)
+    expect(reset.ack).toBe(0)
+    client.ws.close(1000, "done")
+  })
+
   it("survives eviction: sessions and subscriptions come back from storage", async () => {
     const p = freshPartition()
     const client = await connect(p, await token([p]))
@@ -597,6 +853,50 @@ describe("client sessions", () => {
     expect((await b.next("delta")).memberships[0]?.subscriptionId).toBe("b-sub")
     a.ws.close(1000)
     b.ws.close(1000)
+  })
+
+  it("keeps small views warm by default even with a custom short grace period", async () => {
+    const p = freshPartition()
+    const stub = env.ORBIT_WARM_SYNC.get(env.ORBIT_WARM_SYNC.idFromName(p))
+    // Direct DO requests stand in for the authenticated Worker in this configuration test.
+    const response = await stub.fetch("https://orbit.test/ws", {
+      headers: { upgrade: "websocket", "x-orbit-partition": p, "x-orbit-subject": "user-1" },
+    })
+    const ws = response.webSocket
+    if (ws === null) throw new Error("no websocket")
+    ws.accept()
+    const client = new Client(ws)
+    client.send(hello(p))
+    await client.next("welcome")
+    await runInDurableObject(stub, async (_object, state) => {
+      // An empty, completed scope avoids involving the separately bound fill registry.
+      state.storage.sql
+        .exec("INSERT INTO scopes(tbl,state,updated_at) VALUES ('Chatbot','live',0)")
+        .toArray()
+    })
+    client.send({ type: "subscribe", id: "warm", query: { table: "Chatbot" } })
+    expect((await client.next("subscribed")).status).toBe("live")
+    await client.next("snapshot")
+    client.send({ type: "unsubscribe", id: "warm" })
+    await client.next("unsubscribed")
+    const deadline = await runInDurableObject(stub, async (_object, state) => {
+      const row = state.storage.sql
+        .exec<{ orphaned_at: number; retire_at: number }>(
+          "SELECT orphaned_at, retire_at FROM subscriptions",
+        )
+        .one()
+      return row.retire_at - row.orphaned_at
+    })
+    expect(deadline).toBe(36 * 60 * 60_000)
+    await evictDurableObject(stub)
+    client.send({ type: "subscribe", id: "again", query: { table: "Chatbot" } })
+    expect((await client.next("subscribed")).status).toBe("live")
+    await client.next("snapshot")
+    await runInDurableObject(stub, async (_object, state) => {
+      for (const socket of state.getWebSockets()) socket.close(1000)
+    })
+    await client.waitClosed()
+    client.ws.close(1000)
   })
 
   it("reopens an orphaned view with current membership and resumes deltas", async () => {

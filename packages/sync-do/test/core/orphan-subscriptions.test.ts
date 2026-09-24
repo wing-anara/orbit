@@ -208,3 +208,89 @@ describe("orphan subscription maintenance", () => {
     driver.db.close()
   })
 })
+
+describe("bounded warm retention", () => {
+  const policy = { graceMs: 60, warmMs: 36 * 60, maxViews: 8, maxMembers: 1000 }
+  it("keeps only eight small views warm, expires large/older ones, and never maintains idle views", () => {
+    const { engine, driver, deps } = makeEngine()
+    seed(engine, 1500)()
+    const ids: string[] = []
+    for (let i = 1; i <= 12; i++) {
+      const sub = subscribe(engine, window(i * 10)).subscription
+      ids.push(sub)
+      engine.markOrphaned(sub, i, policy)
+    }
+    const large = subscribe(engine, window(1500)).subscription
+    engine.markOrphaned(large, 13, policy)
+    expect(
+      driver.query(`SELECT id FROM subscriptions WHERE retire_at > orphaned_at + 60`),
+    ).toHaveLength(8)
+    expect(engine.nextOrphanDue(60)).toBe(61)
+    for (let i = 0; i < 10; i++) engine.sweepOrphans(100, 60)
+    expect(engine.subscription(ids[0]!)).toBeNull()
+    expect(engine.subscription(large)).toBeNull()
+    expect(driver.query(`SELECT id FROM subscriptions`)).toHaveLength(8)
+    const retained = engine.membershipOf(ids[11]!)
+    // Offline source changes do not maintain retained memberships.
+    engine.applyBatch(
+      batch(schema, "org_1", [
+        txn(1, [remove("Chatbot", chatbot("00000")), insert("Chatbot", chatbot("new"))]),
+      ]),
+    )
+    expect(engine.membershipOf(ids[11]!)).toEqual(retained)
+    // Re-open through a fresh engine at a later time, without trusting stale members.
+    const reopened = new SyncEngine(deps)
+    reopened.init()
+    subscribe(reopened, window(120))
+    expect(reopened.membershipOf(ids[11]!)).toEqual(reopened.recompute(ids[11]!))
+    expect(reopened.membershipOf(ids[11]!).some((m) => m.key[0] === "00000")).toBe(false)
+    expect(
+      driver.query(`SELECT retire_at FROM subscriptions WHERE id = ?`, [ids[11]!])[0]!["retire_at"],
+    ).toBeNull()
+    for (let i = 0; i < 10; i++) reopened.sweepOrphans(10_000, 60)
+    expect(driver.query(`SELECT id FROM subscriptions`)).toEqual([{ id: ids[11] }])
+  })
+
+  it("reconciles a retained query over ten daily reopens without rewriting unchanged members", () => {
+    const { engine, driver, deps } = makeEngine()
+    seed(engine, 300)()
+    const retainedPolicy = { graceMs: 60, warmMs: 2160, maxViews: 8, maxMembers: 1000 }
+    const id = subscribe(engine, window(300)).subscription
+    let current = engine
+    for (let day = 0; day < 10; day++) {
+      current.markOrphaned(id, day * 1440, retainedPolicy)
+      current.sweepOrphans(day * 1440 + 1000, 60)
+      expect(current.subscription(id)).not.toBeNull()
+      current = new SyncEngine(deps)
+      current.init()
+      const writes = vi.spyOn(driver, "run")
+      subscribe(current, window(300))
+      expect(
+        writes.mock.calls.filter(([sql]) =>
+          /INSERT.*membership_rows|DELETE FROM membership_rows/.test(sql),
+        ),
+      ).toEqual([])
+      expect(current.membershipOf(id)).toEqual(current.recompute(id))
+      writes.mockRestore()
+    }
+  })
+
+  it("keeps legacy expiry behavior and rolls back retention decisions atomically", () => {
+    const { engine, driver } = makeEngine()
+    seed(engine, 100)()
+    const id = subscribe(engine, window(100)).subscription
+    engine.markOrphaned(id, 10)
+    expect(engine.nextOrphanDue(60)).toBe(70)
+    expect(engine.sweepOrphans(69, 60)).toEqual([])
+    const before = driver.query(`SELECT * FROM subscriptions`)
+    expect(() =>
+      driver.transaction(() => {
+        subscribe(engine, window(100))
+        engine.markOrphaned(id, 20, policy)
+        throw Error("interrupted retention")
+      }),
+    ).toThrow("interrupted retention")
+    expect(driver.query(`SELECT * FROM subscriptions`)).toEqual(before)
+    expect(engine.sweepOrphans(70, 60)).toEqual([id])
+  })
+})

@@ -965,89 +965,113 @@ describe("SyncEngine: large transactions", () => {
 })
 
 describe("SyncEngine: randomized incremental maintenance equals full recomputation", () => {
-  it("holds across random inserts, updates, deletes and query shapes", { timeout: 60_000 }, () => {
-    let seed = 42
-    const rand = (): number => {
-      seed = (seed * 1103515245 + 12345) & 0x7fffffff
-      return seed / 0x7fffffff
-    }
-    const pick = <T>(xs: ReadonlyArray<T>): T => xs[Math.floor(rand() * xs.length)]!
-    for (let round = 0; round < 12; round++) {
-      const { engine } = makeEngine()
-      liveScope(engine, "organization", [organization("org_1")])
-      liveScope(engine, "Chatbot", [
-        chatbot("f1", { type: "GROUP" }),
-        chatbot("f2", { type: "GROUP" }),
-      ])
-      const queries: Array<Query> = [
-        {
-          table: "Chatbot",
-          where: { op: "eq", column: "type", value: "DOCUMENT" },
-          orderBy: [{ column: "displayOrder", direction: "asc" }],
-          limit: 3,
-          include: ["folder"],
-        },
-        {
-          table: "Chatbot",
-          where: {
-            op: "and",
-            args: [
-              { op: "eq", column: "groupId", value: "f1" },
-              { op: "isNotNull", column: "displayOrder" },
-            ],
+  it.each([42, 101, 8675309])(
+    "holds across random inserts, updates, deletes and query shapes (seed %i)",
+    { timeout: 60_000 },
+    (initialSeed) => {
+      let seed = initialSeed
+      const rand = (): number => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        return seed / 0x7fffffff
+      }
+      const pick = <T>(xs: ReadonlyArray<T>): T => xs[Math.floor(rand() * xs.length)]!
+      for (let round = 0; round < 12; round++) {
+        const { engine } = makeEngine()
+        liveScope(engine, "organization", [organization("org_1")])
+        liveScope(engine, "Chatbot", [
+          chatbot("f1", { type: "GROUP" }),
+          chatbot("f2", { type: "GROUP" }),
+        ])
+        const queries: Array<Query> = [
+          {
+            table: "Chatbot",
+            where: { op: "eq", column: "type", value: "DOCUMENT" },
+            orderBy: [{ column: "displayOrder", direction: "asc" }],
+            limit: 3,
+            include: ["folder"],
           },
-          orderBy: [{ column: "displayOrder", direction: "desc" }],
-          limit: 2,
-        },
-        {
-          table: "Chatbot",
-          where: {
-            op: "or",
-            args: [
-              { op: "gt", column: "displayOrder", value: 5 },
-              { op: "isNull", column: "groupId" },
-            ],
+          {
+            table: "Chatbot",
+            where: {
+              op: "and",
+              args: [
+                { op: "eq", column: "groupId", value: "f1" },
+                { op: "isNotNull", column: "displayOrder" },
+              ],
+            },
+            orderBy: [{ column: "displayOrder", direction: "desc" }],
+            limit: 2,
           },
-        },
-        {
-          table: "Chatbot",
-          where: { op: "eq", column: "type", value: "GROUP" },
-          include: ["documents", "organization"],
-        },
-        {
-          table: "Chatbot",
-          where: { op: "like", column: "id", pattern: "d%" },
-          orderBy: [
-            { column: "createdAt", direction: "desc" },
-            { column: "displayOrder", direction: "asc" },
-          ],
-          limit: 4,
-        },
-        // Relation predicate: folders that contain a document with a display order above 4.
-        {
-          table: "Chatbot",
-          where: {
-            op: "and",
-            args: [
-              { op: "eq", column: "type", value: "GROUP" },
-              {
-                op: "exists",
-                relation: "documents",
-                where: { op: "gt", column: "displayOrder", value: 4 },
-              },
-            ],
+          {
+            table: "Chatbot",
+            where: {
+              op: "or",
+              args: [
+                { op: "gt", column: "displayOrder", value: 5 },
+                { op: "isNull", column: "groupId" },
+              ],
+            },
           },
-        },
-        // Negated relation predicate: documents whose folder has no other document in it.
-        {
-          table: "Chatbot",
-          where: {
-            op: "and",
-            args: [
-              { op: "eq", column: "type", value: "DOCUMENT" },
-              {
-                op: "not",
-                arg: {
+          {
+            table: "Chatbot",
+            where: { op: "eq", column: "type", value: "GROUP" },
+            include: ["documents", "organization"],
+          },
+          {
+            table: "Chatbot",
+            where: { op: "like", column: "id", pattern: "d%" },
+            orderBy: [
+              { column: "createdAt", direction: "desc" },
+              { column: "displayOrder", direction: "asc" },
+            ],
+            limit: 4,
+          },
+          // Relation predicate: folders that contain a document with a display order above 4.
+          {
+            table: "Chatbot",
+            where: {
+              op: "and",
+              args: [
+                { op: "eq", column: "type", value: "GROUP" },
+                {
+                  op: "exists",
+                  relation: "documents",
+                  where: { op: "gt", column: "displayOrder", value: 4 },
+                },
+              ],
+            },
+          },
+          // Negated relation predicate: documents whose folder has no other document in it.
+          {
+            table: "Chatbot",
+            where: {
+              op: "and",
+              args: [
+                { op: "eq", column: "type", value: "DOCUMENT" },
+                {
+                  op: "not",
+                  arg: {
+                    op: "exists",
+                    relation: "folder",
+                    where: {
+                      op: "exists",
+                      relation: "documents",
+                      where: { op: "isNull", column: "displayOrder" },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+          // A window over documents of folders that hold a document without a display order, with
+          // the folder and the folder's other documents included (self relation at two levels).
+          {
+            table: "Chatbot",
+            where: {
+              op: "and",
+              args: [
+                { op: "eq", column: "type", value: "DOCUMENT" },
+                {
                   op: "exists",
                   relation: "folder",
                   where: {
@@ -1056,117 +1080,97 @@ describe("SyncEngine: randomized incremental maintenance equals full recomputati
                     where: { op: "isNull", column: "displayOrder" },
                   },
                 },
-              },
-            ],
-          },
-        },
-        // A window over documents of folders that hold a document without a display order, with
-        // the folder and the folder's other documents included (self relation at two levels).
-        {
-          table: "Chatbot",
-          where: {
-            op: "and",
-            args: [
-              { op: "eq", column: "type", value: "DOCUMENT" },
-              {
-                op: "exists",
-                relation: "folder",
-                where: {
-                  op: "exists",
-                  relation: "documents",
-                  where: { op: "isNull", column: "displayOrder" },
-                },
-              },
-            ],
-          },
-          orderBy: [{ column: "displayOrder", direction: "desc" }],
-          limit: 2,
-          include: [{ relation: "folder", include: ["documents"] }],
-        },
-        // Filtered and nested includes: folders with their ordered documents and each document's folder.
-        {
-          table: "Chatbot",
-          where: { op: "eq", column: "type", value: "GROUP" },
-          include: [
-            {
-              relation: "documents",
-              where: { op: "isNotNull", column: "displayOrder" },
-              include: ["folder", "organization"],
+              ],
             },
-          ],
-        },
-      ]
-      const ids = queries.map((q) => {
-        const r = engine.subscribe(q)
-        if (!Result.isSuccess(r)) throw new Error("subscribe failed")
-        return r.success.subscription
-      })
-      const live = new Map<string, Record<string, unknown>>([
-        ["f1", chatbot("f1", { type: "GROUP" })],
-        ["f2", chatbot("f2", { type: "GROUP" })],
-      ])
-      let seq = 0
-      for (let step = 0; step < 80; step++) {
-        const changes = []
-        const n = 1 + Math.floor(rand() * 3)
-        for (let i = 0; i < n; i++) {
-          // Folders change too: they are include targets and chain hops, and can become documents.
-          const id = rand() < 0.15 ? pick(["f1", "f2"]) : `d${Math.floor(rand() * 10)}`
-          const existing = live.get(id)
-          const kind = existing === undefined ? "insert" : rand() < 0.25 ? "delete" : "update"
-          const fresh = chatbot(id, {
-            groupId: pick(["f1", "f2", null]),
-            displayOrder: pick([null, 1, 2, 5, 7, 9]),
-            createdAt: pick(["2026-01-01 00:00:00", "2026-02-01 00:00:00"]),
-            type: rand() < 0.1 ? "GROUP" : "DOCUMENT",
-          })
-          if (kind === "insert") {
-            changes.push(insert("Chatbot", fresh))
-            live.set(id, fresh)
-          } else if (kind === "delete") {
-            changes.push(remove("Chatbot", existing as never))
-            live.delete(id)
-          } else {
-            changes.push(update("Chatbot", existing as never, fresh))
-            live.set(id, fresh)
+            orderBy: [{ column: "displayOrder", direction: "desc" }],
+            limit: 2,
+            include: [{ relation: "folder", include: ["documents"] }],
+          },
+          // Filtered and nested includes: folders with their ordered documents and each document's folder.
+          {
+            table: "Chatbot",
+            where: { op: "eq", column: "type", value: "GROUP" },
+            include: [
+              {
+                relation: "documents",
+                where: { op: "isNotNull", column: "displayOrder" },
+                include: ["folder", "organization"],
+              },
+            ],
+          },
+        ]
+        const ids = queries.map((q) => {
+          const r = engine.subscribe(q)
+          if (!Result.isSuccess(r)) throw new Error("subscribe failed")
+          return r.success.subscription
+        })
+        const live = new Map<string, Record<string, unknown>>([
+          ["f1", chatbot("f1", { type: "GROUP" })],
+          ["f2", chatbot("f2", { type: "GROUP" })],
+        ])
+        let seq = 0
+        for (let step = 0; step < 80; step++) {
+          const changes = []
+          const n = 1 + Math.floor(rand() * 3)
+          for (let i = 0; i < n; i++) {
+            // Folders change too: they are include targets and chain hops, and can become documents.
+            const id = rand() < 0.15 ? pick(["f1", "f2"]) : `d${Math.floor(rand() * 10)}`
+            const existing = live.get(id)
+            const kind = existing === undefined ? "insert" : rand() < 0.25 ? "delete" : "update"
+            const fresh = chatbot(id, {
+              groupId: pick(["f1", "f2", null]),
+              displayOrder: pick([null, 1, 2, 5, 7, 9]),
+              createdAt: pick(["2026-01-01 00:00:00", "2026-02-01 00:00:00"]),
+              type: rand() < 0.1 ? "GROUP" : "DOCUMENT",
+            })
+            if (kind === "insert") {
+              changes.push(insert("Chatbot", fresh))
+              live.set(id, fresh)
+            } else if (kind === "delete") {
+              changes.push(remove("Chatbot", existing as never))
+              live.delete(id)
+            } else {
+              changes.push(update("Chatbot", existing as never, fresh))
+              live.set(id, fresh)
+            }
           }
-        }
-        seq += 1
-        const r = engine.applyBatch(batch(schema, "org_1", [txn(seq, changes)]))
-        expect(r.ack.status, `round ${round} step ${step}: ${JSON.stringify(r.ack)}`).toBe(
-          "applied",
-        )
-        for (const id of ids) {
-          const stored = engine
-            .membershipOf(id)
-            .map((m) => `${m.table}:${m.key[0]}`)
-            .sort()
-          const recomputed = engine
-            .recompute(id)
-            .map((m) => `${m.table}:${m.key[0]}`)
-            .sort()
-          expect(stored, `round ${round} step ${step} query ${id}`).toEqual(recomputed)
-        }
-        // Every delta row for a member must equal the cache row (row images are fresh).
-        for (const d of deltas(r.events)) {
-          for (const row of d.rows as ReadonlyArray<RowUpdate>) {
-            if (row.row === null) continue
-            const snapRow = (() => {
-              const sid = ids.find((s) =>
-                engine
-                  .membershipOf(s)
-                  .some((m) => m.table === row.table && m.key[0] === row.key[0]),
-              )
-              if (sid === undefined) return undefined
-              const snap = engine.snapshot(sid)
-              return snap.type === "snapshot"
-                ? snap.rows.find((x) => x.table === row.table && x.key[0] === row.key[0])?.row
-                : undefined
-            })()
-            if (snapRow !== undefined) expect(row.row).toEqual(snapRow)
+          seq += 1
+          const r = engine.applyBatch(batch(schema, "org_1", [txn(seq, changes)]))
+          expect(r.ack.status, `round ${round} step ${step}: ${JSON.stringify(r.ack)}`).toBe(
+            "applied",
+          )
+          for (const id of ids) {
+            const stored = engine
+              .membershipOf(id)
+              .map((m) => `${m.table}:${m.key[0]}`)
+              .sort()
+            const recomputed = engine
+              .recompute(id)
+              .map((m) => `${m.table}:${m.key[0]}`)
+              .sort()
+            expect(stored, `round ${round} step ${step} query ${id}`).toEqual(recomputed)
+          }
+          // Every delta row for a member must equal the cache row (row images are fresh).
+          for (const d of deltas(r.events)) {
+            for (const row of d.rows as ReadonlyArray<RowUpdate>) {
+              if (row.row === null) continue
+              const snapRow = (() => {
+                const sid = ids.find((s) =>
+                  engine
+                    .membershipOf(s)
+                    .some((m) => m.table === row.table && m.key[0] === row.key[0]),
+                )
+                if (sid === undefined) return undefined
+                const snap = engine.snapshot(sid)
+                return snap.type === "snapshot"
+                  ? snap.rows.find((x) => x.table === row.table && x.key[0] === row.key[0])?.row
+                  : undefined
+              })()
+              if (snapRow !== undefined) expect(row.row).toEqual(snapRow)
+            }
           }
         }
       }
-    }
-  })
+    },
+  )
 })

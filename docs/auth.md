@@ -94,11 +94,21 @@ The Durable Object name is `${app}/p${placementVersion}/${partition}` (see [plac
 
 ## What the Durable Object trusts
 
-The Durable Object reads `x-orbit-partition`, `x-orbit-subject` and `x-orbit-expires` from the forwarded request. It does not verify the token itself. This is safe only because the Durable Object is reachable through the Worker binding alone. The Worker sets both headers after authorization. A client cannot set them, because the Worker overwrites `x-orbit-partition` on every forward and sets `x-orbit-subject` only on the authorized `/ws` path.
+The Durable Object reads `x-orbit-partition`, `x-orbit-subject` and `x-orbit-expires` from the forwarded request. It does not verify the token itself. This is safe only because the Durable Object is reachable through the Worker binding alone. The Worker sets all three headers after authorization. A client cannot set them, because the Worker overwrites `x-orbit-partition` on every forward and sets `x-orbit-subject` on the authorized `/ws` and `/session/renew` paths.
 
 The Durable Object adds two checks of its own. `hello.partition` must equal the partition in the socket attachment; a mismatch closes the socket with code 4403. The expiry is stored in the socket attachment; an alarm closes the socket with code 4408 (`sessionExpired`) when it passes, and a message that arrives after the expiry gets the same close. The client treats 4408 as a normal reconnect and presents a fresh token. A client that offered the `orbit` subprotocol gets it echoed in the upgrade response, as browsers require.
 
-The subject is stored in the `sessions` table for diagnostics.
+The subject is stored in the `sessions` table and used when resolving queries.
+
+### Renewing without rebuilding subscriptions
+
+A server advertising `welcome.sessionRenewal` accepts `POST {prefix}/session/renew?partition=P`, with `Authorization: Bearer <fresh token>` and JSON `{ "sessionId": "..." }`. URL tokens are not accepted on this endpoint. The Worker reauthorizes the partition and overwrites all trusted headers. Browser requests omit cookies; the route supports CORS for bearer authorization.
+
+The DO requires a live, unexpired session with the same subject and partition. It re-resolves every stored original query reference using the current server definitions and requires the same normalized query key. Changed policy or a legacy session without original references gets HTTP 409 and closes with 4408; reconnect performs normal authorization and subscription setup. Expired sessions cannot be revived. The response is `{ expiresAt, serverTime }`, where `expiresAt: null` means a non-expiring grant.
+
+Successful renewal updates only the hibernation attachment. It preserves the socket, session, subscriptions and cache; it does not persist an SQL cursor or last-seen timestamp. An existing earlier expiry alarm rechecks the new deadline; a shortened deadline schedules an earlier alarm. Outbound data is also blocked after expiry, independently of heartbeat traffic or delayed alarms.
+
+The browser obtains fresh credentials through its existing token callback shortly before expiry, using server-relative time. Denial, malformed responses, timeout or a changed target falls back to reconnect. Old servers retain the previous expiry/reconnect behavior, and old clients continue to work. A token callback that caches the same expiring token cannot take advantage of renewal; it must return a fresh grant.
 
 ## The internal secret
 
@@ -126,7 +136,7 @@ const token = await Effect.runPromise(
 )
 ```
 
-`memberOrganizations` runs `SELECT organization_id FROM member WHERE user_id = ?`. The token lives five minutes. The browser client calls `syncToken` through `getToken` on every connection attempt, so expiry never blocks a reconnect.
+`memberOrganizations` runs `SELECT organization_id FROM member WHERE user_id = ?`. The token lives five minutes. The browser client calls `syncToken` through `getToken` on every connection attempt and before negotiated session renewal.
 
 The same `member` table authorizes writes. The push endpoint checks the membership of the caller for the partition before it runs a mutator (see [mutations.md](mutations.md)).
 
@@ -142,7 +152,7 @@ Set them in `.dev.vars` for local development, or with `wrangler secret put` for
 
 ## Limits of the model
 
-- Authorization happens at connection time. A revoked membership does not close an open socket before the grant expires. The socket lives at most until the token's `exp`; a short token lifetime bounds the window.
+- Authorization happens at connection time and on every renewal. A revoked membership does not close an open socket before the grant expires. Access lasts at most until the current grant expires unless a fresh authorized grant renews it; short token lifetimes bound the revocation window.
 - The `"*"` partition grant gives access to every partition. Use it only for trusted services.
 - There is no rate limit and no per-subject quota. Close code 4429 (`overloaded`) is defined but not sent.
-- The token travels in the URL query string. Make sure the Worker does not log full request URLs.
+- The default browser token travels in a WebSocket subprotocol, and renewal uses a bearer header. Legacy WebSocket URL tokens remain supported; do not log credentials or full legacy request URLs.

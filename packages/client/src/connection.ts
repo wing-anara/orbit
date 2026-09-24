@@ -12,6 +12,10 @@ import {
   CloseCode,
   ClientMessage,
   ServerMessage,
+  SessionRenewal,
+  WS_TOKEN_PREFIX,
+  WS_HEARTBEAT_REQUEST,
+  WS_HEARTBEAT_RESPONSE,
   type ClientMessage as ClientMessageType,
   type ServerMessage as ServerMessageType,
 } from "@orbit/protocol/client"
@@ -49,6 +53,7 @@ export interface ConnectionConfig {
   readonly target: () => Effect.Effect<ConnectionTarget, ConnectionError>
   /** Called on every (re)connect so the caller can send `hello`. */
   readonly onOpen: (send: (m: ClientMessageType) => void) => Effect.Effect<void>
+  readonly fetch?: typeof fetch
   readonly makeWebSocket?: (url: string, protocols: ReadonlyArray<string>) => WebSocket
   readonly backoffMinMs?: number
   readonly backoffMaxMs?: number
@@ -101,6 +106,33 @@ const attemptState = (n: number): ConnectionState =>
   n === 0
     ? { status: "connecting", attempt: n }
     : { status: "reconnecting", attempt: n, retryInMs: 0, lastError: "" }
+
+/** Never send newly obtained credentials to a different connection target or redirect. */
+const renewalEndpoint = (
+  original: ConnectionTarget,
+  fresh: ConnectionTarget,
+): { url: string; token: string } => {
+  const before = new URL(original.url)
+  const next = new URL(fresh.url)
+  if (
+    before.origin !== next.origin ||
+    before.pathname !== next.pathname ||
+    before.searchParams.get("partition") !== next.searchParams.get("partition") ||
+    !next.pathname.endsWith("/ws") ||
+    !["ws:", "wss:"].includes(next.protocol)
+  )
+    throw Error("connection target changed")
+  const offered = fresh.protocols.find((p) => p.startsWith(WS_TOKEN_PREFIX))
+  const token =
+    offered === undefined
+      ? next.searchParams.get("token")
+      : decodeURIComponent(offered.slice(WS_TOKEN_PREFIX.length))
+  if (token === null || token === "") throw Error("no renewal token")
+  next.protocol = next.protocol === "wss:" ? "https:" : "http:"
+  next.pathname = next.pathname.slice(0, -3) + "/session/renew"
+  next.searchParams.delete("token")
+  return { url: next.toString(), token }
+}
 
 export const makeConnection = (
   config: ConnectionConfig,
@@ -161,6 +193,8 @@ export const makeConnection = (
         yield* Ref.set(socket, ws)
         let opened = false
         let lastPingAt = 0
+        let staticHeartbeat = false
+        let pendingStaticHeartbeat = false
         let heartbeat: ReturnType<typeof setInterval> | null = null
         let pongDeadline: ReturnType<typeof setTimeout> | null = null
         let connectDeadline: ReturnType<typeof setTimeout> | null = null
@@ -168,10 +202,16 @@ export const makeConnection = (
         const closed = yield* Effect.callback<AttemptResult>((resume) => {
           let settled = false
           let opening: ReturnType<typeof Effect.runFork> | null = null
+          let renewing: ReturnType<typeof Effect.runFork> | null = null
+          let renewalTimer: ReturnType<typeof setTimeout> | null = null
+          let renewalDeadline: ReturnType<typeof setTimeout> | null = null
           const detach = () => {
             terminateAttempt = null
             if (readySocket === ws) readySocket = null
             if (opening !== null) Effect.runFork(Fiber.interrupt(opening))
+            if (renewing !== null) Effect.runFork(Fiber.interrupt(renewing))
+            if (renewalTimer !== null) clearTimeout(renewalTimer)
+            if (renewalDeadline !== null) clearTimeout(renewalDeadline)
             if (heartbeat !== null) clearInterval(heartbeat)
             if (pongDeadline !== null) clearTimeout(pongDeadline)
             if (connectDeadline !== null) clearTimeout(connectDeadline)
@@ -197,6 +237,93 @@ export const makeConnection = (
             if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
               ws.close(code, reason)
           }
+          /** Schedule relative to server time, so a skewed client clock cannot extend a grant. */
+          const scheduleRenewal = (
+            sessionId: string,
+            expiresAt: number | null,
+            serverTime: number,
+          ) => {
+            if (settled || expiresAt === null) return
+            const remaining = expiresAt - serverTime
+            if (remaining <= 0) {
+              terminate(4000, "session expired")
+              return
+            }
+            const lead = Math.min(30_000, remaining / 5)
+            if (renewalTimer !== null) clearTimeout(renewalTimer)
+            renewalTimer = setTimeout(() => {
+              if (settled || ws !== readySocket) return
+              renewalDeadline = setTimeout(
+                () => terminate(4000, "session renewal timeout"),
+                Math.min(connectTimeout, lead),
+              )
+              renewing = Effect.runFork(
+                Effect.gen(function* () {
+                  const fresh = yield* config.target()
+                  if (settled || generation !== attemptGeneration) return
+                  const endpoint = yield* Effect.try({
+                    try: () => renewalEndpoint(target, fresh),
+                    catch: () =>
+                      new ConnectionError({
+                        message: "renewal target changed or lacks credentials",
+                        code: null,
+                        fatal: false,
+                      }),
+                  })
+                  const response = yield* Effect.tryPromise({
+                    try: (signal) =>
+                      (config.fetch ?? fetch)(endpoint.url, {
+                        method: "POST",
+                        headers: {
+                          authorization: `Bearer ${endpoint.token}`,
+                          "content-type": "application/json",
+                        },
+                        body: JSON.stringify({ sessionId }),
+                        credentials: "omit",
+                        redirect: "error",
+                        signal,
+                      }),
+                    catch: () =>
+                      new ConnectionError({
+                        message: "session renewal request failed",
+                        code: null,
+                        fatal: false,
+                      }),
+                  })
+                  if (!response.ok)
+                    return yield* new ConnectionError({
+                      message: "session renewal refused",
+                      code: response.status,
+                      fatal: false,
+                    })
+                  const result = yield* Effect.tryPromise({
+                    try: () => response.json() as Promise<unknown>,
+                    catch: () =>
+                      new ConnectionError({
+                        message: "invalid renewal response",
+                        code: null,
+                        fatal: false,
+                      }),
+                  })
+                  const renewed = yield* Schema.decodeUnknownEffect(SessionRenewal)(result)
+                  if (settled || generation !== attemptGeneration) return
+                  if (renewalDeadline !== null) clearTimeout(renewalDeadline)
+                  renewalDeadline = null
+                  // A cached token may not advance expiry. Do not hammer auth in a tight loop;
+                  // the original server expiry will reconnect normally in that case.
+                  if (renewed.expiresAt === null || renewed.expiresAt > expiresAt)
+                    scheduleRenewal(sessionId, renewed.expiresAt, renewed.serverTime)
+                }).pipe(
+                  Effect.catch(() =>
+                    Effect.sync(() => {
+                      if (!settled && generation === attemptGeneration)
+                        terminate(4000, "session renewal failed")
+                    }),
+                  ),
+                ),
+              )
+            }, remaining - lead)
+          }
           terminateAttempt = () => terminate(4000, "local apply failed")
           const onOffline = () => terminate(4001, "offline")
           const onOpen = () => {
@@ -205,9 +332,14 @@ export const makeConnection = (
               if (ws !== readySocket || ws.readyState !== WebSocket.OPEN) return
               if (pongDeadline !== null) return
               lastPingAt = Date.now()
+              pendingStaticHeartbeat = staticHeartbeat
               pongDeadline = setTimeout(() => terminate(4000, "heartbeat timeout"), pongTimeout)
               try {
-                ws.send(JSON.stringify(encodeClient({ type: "ping", sentAt: lastPingAt })))
+                ws.send(
+                  staticHeartbeat
+                    ? WS_HEARTBEAT_REQUEST
+                    : JSON.stringify(encodeClient({ type: "ping", sentAt: lastPingAt })),
+                )
               } catch {
                 terminate(4000, "send failed")
               }
@@ -234,6 +366,13 @@ export const makeConnection = (
           }
           const onMessage = (event: MessageEvent<unknown>) => {
             const data = typeof event.data === "string" ? event.data : ""
+            if (data === WS_HEARTBEAT_RESPONSE && pendingStaticHeartbeat) {
+              if (!settled && generation === attemptGeneration && pongDeadline !== null) {
+                clearTimeout(pongDeadline)
+                pongDeadline = null
+              }
+              return
+            }
             Effect.runFork(
               Effect.gen(function* () {
                 const parsedResult = yield* Effect.result(
@@ -270,11 +409,26 @@ export const makeConnection = (
                   })
                   return
                 }
-                if (decoded.success.type === "welcome" && connectDeadline !== null) {
-                  clearTimeout(connectDeadline)
+                if (
+                  decoded.success.type === "welcome" &&
+                  !settled &&
+                  generation === attemptGeneration
+                ) {
+                  if (connectDeadline !== null) clearTimeout(connectDeadline)
                   connectDeadline = null
+                  staticHeartbeat = decoded.success.heartbeat === "static-v1"
+                  if (decoded.success.sessionRenewal !== undefined)
+                    scheduleRenewal(
+                      decoded.success.sessionId,
+                      decoded.success.sessionRenewal.expiresAt,
+                      decoded.success.serverTime,
+                    )
                 }
-                if (decoded.success.type === "pong" && decoded.success.sentAt === lastPingAt) {
+                if (
+                  !pendingStaticHeartbeat &&
+                  decoded.success.type === "pong" &&
+                  decoded.success.sentAt === lastPingAt
+                ) {
                   if (pongDeadline !== null) clearTimeout(pongDeadline)
                   pongDeadline = null
                 }

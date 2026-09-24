@@ -53,7 +53,7 @@ describe("shared membership chunks", () => {
     store.share("b", "a")
     const dump = () =>
       ["membership_rows", "membership_chunks", "membership_writers"].map((table) =>
-        driver.query(`SELECT * FROM ${table} ORDER BY rowid`),
+        driver.query(`SELECT * FROM ${table} ORDER BY 1, 2`),
       )
     const before = dump()
     expect(() =>
@@ -113,5 +113,90 @@ describe("shared membership chunks", () => {
       { key: "[1]" },
     ])
     expect(driver.query(`SELECT key FROM membership WHERE subscription = 'grown'`)).toEqual([])
+  })
+})
+
+describe("membership storage format upgrade", () => {
+  const legacyStore = () => {
+    const { driver, deps } = makeEngine()
+    driver.transaction(() => {
+      driver.run(`DROP VIEW membership`)
+      for (const table of ["membership_rows", "membership_chunks", "membership_writers"]) {
+        const ddl = String(
+          driver.query(`SELECT sql FROM sqlite_master WHERE name = ?`, [table])[0]!["sql"],
+        )
+        driver.run(`DROP TABLE ${table}`)
+        driver.run(ddl.replace(/ WITHOUT ROWID/i, ""))
+      }
+    })
+    return { driver, deps }
+  }
+  const layout = (driver: ReturnType<typeof makeEngine>["driver"]) =>
+    driver.query(
+      `SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name LIKE 'membership_%' ORDER BY name`,
+    )
+
+  it("retains a populated old cache, then upgrades only after shared chunks are reclaimed", () => {
+    const { driver, deps } = legacyStore()
+    // Seed a cache from the old release, including a shared physical chunk.
+    driver.run(`INSERT INTO membership_rows VALUES ('chunk', '', 'Chatbot', '[1]')`)
+    driver.run(`INSERT INTO membership_chunks VALUES ('a','chunk'), ('b','chunk')`)
+    const store = new MembershipStore(driver, deps.newId)
+    const old = layout(driver)
+    store.init()
+    expect(layout(driver)).toEqual(old)
+    store.drop("a")
+    store.init()
+    expect(layout(driver)).toEqual(old)
+    expect(driver.query(`SELECT key FROM membership WHERE subscription = 'b'`)).toEqual([
+      { key: "[1]" },
+    ])
+    store.drop("b")
+    store.init()
+    expect(layout(driver).every((r) => String(r["sql"]).includes("WITHOUT ROWID"))).toBe(true)
+    store.add("new", members(0, 1000))
+    store.share("peer", "new")
+    store.remove("peer", members(1, 2)[0]!)
+    expect(driver.query(`SELECT key FROM membership WHERE subscription = 'new'`)).toHaveLength(1000)
+    expect(driver.query(`SELECT key FROM membership WHERE subscription = 'peer'`)).toHaveLength(999)
+    expect(store.collect("peer", 5).spent).toBeLessThanOrEqual(5)
+    store.drop("new")
+    store.drop("peer")
+    expect(driver.query(`SELECT * FROM membership_rows`)).toEqual([])
+  })
+
+  it("rolls back an interrupted empty-cache upgrade and retries without losing the view or indexes", () => {
+    const { driver, deps } = legacyStore()
+    // Install the existing view without asking init to upgrade yet.
+    driver.run(
+      `CREATE VIEW membership AS SELECT c.subscription, r.path, r.tbl, r.key FROM membership_chunks c JOIN membership_rows r ON r.subscription = c.chunk`,
+    )
+    const before = layout(driver)
+    let fail = true
+    const store = new MembershipStore(
+      {
+        ...driver,
+        run: (sql, params) => {
+          driver.run(sql, params)
+          if (fail && sql.startsWith("DROP TABLE membership_chunks"))
+            throw Error("interrupted migration")
+        },
+      },
+      deps.newId,
+    )
+    expect(() => store.init()).toThrow("interrupted migration")
+    expect(layout(driver)).toEqual(before)
+    expect(driver.query(`SELECT * FROM membership`)).toEqual([])
+    fail = false
+    store.init()
+    expect(layout(driver).every((r) => String(r["sql"]).includes("WITHOUT ROWID"))).toBe(true)
+    expect(
+      driver.query(
+        `SELECT name FROM sqlite_master WHERE type='index' AND name IN ('membership_by_row','membership_chunk_owners')`,
+      ),
+    ).toHaveLength(2)
+    const stable = layout(driver)
+    store.init()
+    expect(layout(driver)).toEqual(stable)
   })
 })

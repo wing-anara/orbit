@@ -138,6 +138,9 @@ export const ServerMessage = Schema.Union([
     /** The Durable Object's current cursor. */
     cursor: NonNegativeInt,
     serverTime: NonNegativeInt,
+    /** Optional capabilities: old clients ignore these and old servers omit them. */
+    sessionRenewal: Schema.optionalKey(Schema.Struct({ expiresAt: NonNegativeInt })),
+    heartbeat: Schema.optionalKey(Schema.Literal("static-v1")),
   }),
   /**
    * Full result of one subscription at `cursor`. Large results arrive in several messages with
@@ -219,3 +222,14 @@ export const encodeClientMessage = Schema.encodeUnknownSync(ClientMessage)
 export const decodeClientMessage = Schema.decodeUnknownSync(ClientMessage)
 export const encodeServerMessage = Schema.encodeUnknownSync(ServerMessage)
 export const decodeServerMessage = Schema.decodeUnknownSync(ServerMessage)
+
+/** Native DO auto-response frames. Only used after capability negotiation in welcome.
+ * One outstanding ping per socket; timeout discards that socket before another attempt.
+ */
+export const WS_HEARTBEAT_REQUEST = "orbit:ping:v1"
+export const WS_HEARTBEAT_RESPONSE = "orbit:pong:v1"
+
+export const SessionRenewal = Schema.Struct({
+  expiresAt: Schema.NullOr(NonNegativeInt),
+  serverTime: NonNegativeInt,
+})

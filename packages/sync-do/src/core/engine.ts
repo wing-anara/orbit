@@ -195,6 +195,8 @@ const reject = (reason: RejectReason): ApplyOutcome => ({
   events: [],
 })
 
+import { writeCachedRow } from "./write-row.ts"
+
 import { MembershipStore } from "./membership.ts"
 
 export class SyncEngine {
@@ -237,6 +239,9 @@ export class SyncEngine {
       // visit the retained history of abandoned windows.
       this.db.run(
         `CREATE INDEX IF NOT EXISTS subscriptions_active ON subscriptions (orphaned_at, live)`,
+      )
+      this.db.run(
+        `CREATE INDEX IF NOT EXISTS subscriptions_retire ON subscriptions (retire_at, orphaned_at) WHERE orphaned_at IS NOT NULL`,
       )
       const storedHash = this.meta("schema_hash")
       const storedPartition = this.meta("partition")
@@ -287,7 +292,7 @@ export class SyncEngine {
 
   private setMeta(key: string, value: string): void {
     this.db.run(
-      `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE meta.value IS NOT excluded.value`,
       [key, value],
     )
   }
@@ -782,7 +787,7 @@ export class SyncEngine {
           : SchemaRuntime.keyString(this.rt.keyOf(table, change.before))
       if (oldKey !== key) this.db.run(deleteByKeySql(table), [oldKey])
     }
-    this.db.run(upsertSql(table), rowToParams(table, row.success))
+    writeCachedRow(this.db, table, row.success)
     return Result.succeed(undefined)
   }
 
@@ -861,7 +866,10 @@ export class SyncEngine {
           // writes only the members that differ instead of the whole window again.
           if (seed) this.membership.share(p.key, base.id)
         } else {
-          this.db.run(`UPDATE subscriptions SET orphaned_at = NULL WHERE id = ?`, [p.key])
+          this.db.run(
+            `UPDATE subscriptions SET orphaned_at = NULL, retire_at = NULL WHERE id = ? AND orphaned_at IS NOT NULL`,
+            [p.key],
+          )
           this.db.run(`DELETE FROM meta WHERE key = ?`, [`orphan_version:${p.key}`])
         }
         const { pending, requests } = this.ensureScopes(p.tables)
@@ -881,7 +889,7 @@ export class SyncEngine {
           canonicalJson(resume.query) === canonicalJson(p.query)
         // A held, live materialization needs neither row reads nor membership serialization.
         if (unchanged && (existing?.live === true || retainedVersion === resume.version)) {
-          this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [p.key])
+          this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ? AND live <> 1`, [p.key])
           return {
             subscription: p.key,
             status: "live",
@@ -982,16 +990,42 @@ export class SyncEngine {
    * A returning subscriber reconciles the retained membership against the current cache.
    * `sweepOrphans` drops it once the grace period has passed.
    */
-  markOrphaned(id: string, now: number): void {
+  markOrphaned(
+    id: string,
+    now: number,
+    retention?: {
+      readonly graceMs: number
+      readonly warmMs: number
+      readonly maxViews: number
+      readonly maxMembers: number
+    },
+  ): void {
     this.db.transaction(() => {
       // A server-owned proof, not just the client's claim: this membership was
       // complete at exactly this cache version before maintenance was suspended.
       if (this.subscription(id)?.live === true)
         this.setMeta(`orphan_version:${id}`, this.resumeVersion())
+      let retireAt: number | null = null
+      if (retention !== undefined) {
+        const count = this.db.query(
+          `SELECT COUNT(*) AS n FROM (SELECT 1 FROM membership WHERE subscription = ? LIMIT ?)`,
+          [id, retention.maxMembers + 1],
+        )[0]?.["n"]
+        const small = Number(count) <= retention.maxMembers && retention.maxViews > 0
+        retireAt = now + (small ? Math.max(retention.graceMs, retention.warmMs) : retention.graceMs)
+      }
       this.db.run(
-        `UPDATE subscriptions SET orphaned_at = ?, live = 0 WHERE id = ? AND orphaned_at IS NULL`,
-        [now, id],
+        `UPDATE subscriptions SET orphaned_at = ?, retire_at = ?, live = 0 WHERE id = ? AND orphaned_at IS NULL`,
+        [now, retireAt, id],
       )
+      if (retention !== undefined && retention.maxViews > 0) {
+        // Keep at most maxViews small views beyond the next ordinary grace period. Their memberships
+        // are NOT maintained by CDC while orphaned; reactivation reconciles against cache.
+        this.db.run(
+          `UPDATE subscriptions SET retire_at = orphaned_at + ? WHERE id IN (SELECT id FROM subscriptions WHERE orphaned_at IS NOT NULL AND retire_at > ? ORDER BY retire_at DESC LIMIT -1 OFFSET ?)`,
+          [retention.graceMs, now + retention.graceMs, retention.maxViews],
+        )
+      }
     })
   }
 
@@ -999,12 +1033,16 @@ export class SyncEngine {
    * Reclaims expired memberships in bounded passes so a large historical window
    * cannot monopolize the DO alarm. Returns only subscriptions fully removed.
    */
-  sweepOrphans(before: number): ReadonlyArray<string> {
+  sweepOrphans(before: number, graceMs = 0): ReadonlyArray<string> {
     return this.db.transaction(() => {
       const ids = this.db
         .query(
-          `SELECT id FROM subscriptions WHERE orphaned_at IS NOT NULL AND orphaned_at <= ? ORDER BY orphaned_at LIMIT 16`,
-          [before],
+          `SELECT id FROM (
+            SELECT id, due FROM (SELECT id, retire_at AS due FROM subscriptions WHERE orphaned_at IS NOT NULL AND retire_at <= ? ORDER BY retire_at LIMIT 16)
+            UNION ALL
+            SELECT id, due FROM (SELECT id, orphaned_at + ? AS due FROM subscriptions WHERE orphaned_at IS NOT NULL AND retire_at IS NULL AND orphaned_at <= ? ORDER BY orphaned_at LIMIT 16)
+          ) ORDER BY due LIMIT 16`,
+          [before, graceMs, before - graceMs],
         )
         .map((r) => asString(r["id"]))
       const dropped: Array<string> = []
@@ -1026,8 +1064,15 @@ export class SyncEngine {
 
   /** The earliest time an orphaned subscription becomes due, or null when none is orphaned. */
   nextOrphanDue(graceMs: number): number | null {
-    const v = this.db.query(`SELECT MIN(orphaned_at) AS m FROM subscriptions`)[0]?.["m"]
-    return typeof v === "number" ? v + graceMs : null
+    const v = this.db.query(
+      `SELECT MIN(due) AS m FROM (
+        SELECT MIN(retire_at) AS due FROM subscriptions WHERE orphaned_at IS NOT NULL AND retire_at IS NOT NULL
+        UNION ALL
+        SELECT MIN(orphaned_at) + ? AS due FROM subscriptions WHERE orphaned_at IS NOT NULL AND retire_at IS NULL
+      )`,
+      [graceMs],
+    )[0]?.["m"]
+    return typeof v === "number" ? v : null
   }
 
   /** Current members of a subscription, computed from the cache. */
@@ -1124,7 +1169,7 @@ export class SyncEngine {
         held.add(memberRef(asString(row["tbl"]), asString(row["key"])))
     }
     this.membership.add(sub.id, members)
-    this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [sub.id])
+    this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ? AND live <> 1`, [sub.id])
     const snapshot = this.snapshotFrom(sub.id, members, held)
     return {
       ...snapshot,
@@ -1162,7 +1207,7 @@ export class SyncEngine {
       sub.id,
       members.filter((m) => !present.has([m.path, m.table, m.key].join(" "))),
     )
-    this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ?`, [sub.id])
+    this.db.run(`UPDATE subscriptions SET live = 1 WHERE id = ? AND live <> 1`, [sub.id])
     return this.snapshotFrom(sub.id, members, skip)
   }
 

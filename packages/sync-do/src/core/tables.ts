@@ -24,8 +24,8 @@ export const ENGINE_DDL: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS held (seq INTEGER NOT NULL, ord INTEGER NOT NULL, tbl TEXT NOT NULL, gtid TEXT NOT NULL, change TEXT NOT NULL, PRIMARY KEY (seq, ord))`,
   `CREATE INDEX IF NOT EXISTS held_tbl ON held (tbl, seq, ord)`,
   `CREATE TABLE IF NOT EXISTS seq_log (seq INTEGER PRIMARY KEY, gtid TEXT NOT NULL, applied_at INTEGER NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, tables TEXT NOT NULL, live INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, orphaned_at INTEGER)`,
-  `CREATE TABLE IF NOT EXISTS membership (subscription TEXT NOT NULL, path TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, path, tbl, key))`,
+  `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, query TEXT NOT NULL, tables TEXT NOT NULL, live INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, orphaned_at INTEGER, retire_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS membership (subscription TEXT NOT NULL, path TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, path, tbl, key)) WITHOUT ROWID`,
   // Covering index for "which subscriptions hold this row": the delta fan-out and the
   // any-path check. The old two-column index made the planner scan a whole subscription.
   `DROP INDEX IF EXISTS membership_row`,
@@ -48,11 +48,16 @@ export const ENGINE_UPGRADES: ReadonlyArray<{
     statements: [`ALTER TABLE subscriptions ADD COLUMN orphaned_at INTEGER`],
   },
   {
+    table: "subscriptions",
+    column: "retire_at",
+    statements: [`ALTER TABLE subscriptions ADD COLUMN retire_at INTEGER`],
+  },
+  {
     table: "membership",
     column: "path",
     statements: [
       `DROP TABLE membership`,
-      `CREATE TABLE membership (subscription TEXT NOT NULL, path TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, path, tbl, key))`,
+      `CREATE TABLE membership (subscription TEXT NOT NULL, path TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, path, tbl, key)) WITHOUT ROWID`,
     ],
   },
 ]

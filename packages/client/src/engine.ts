@@ -337,6 +337,7 @@ export class ClientEngine {
               }),
           }),
         onOpen: (send) => this.lock.runEffect(Effect.sync(() => this.sendHello(send))),
+        ...(this.config.fetch === undefined ? {} : { fetch: this.config.fetch }),
         ...(this.config.makeWebSocket === undefined
           ? {}
           : { makeWebSocket: this.config.makeWebSocket }),

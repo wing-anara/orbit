@@ -10,6 +10,7 @@
 
 import { Result, Schema } from "effect"
 import type { SqlValue } from "@orbit/query"
+import { QueryRef } from "@orbit/protocol"
 import { SchemaSummary } from "@orbit/protocol/client"
 
 import type { SqlDriver } from "./core/driver.ts"
@@ -23,6 +24,8 @@ export const SocketAttachment = Schema.Struct({
   subject: Schema.String,
   partition: Schema.String,
   hello: Schema.Boolean,
+  /** Diagnostic client acknowledgment; recovery uses the durable engine/browser cursors. */
+  ackCursor: Schema.optionalKey(Schema.Finite),
   /** When the grant behind the socket expires (unix ms); absent when it does not expire. */
   expiresAt: Schema.optionalKey(Schema.Finite),
 })
@@ -38,11 +41,13 @@ export const readAttachment = (ws: WebSocket): SocketAttachment | null => {
   return Result.isSuccess(decoded) ? decoded.success : null
 }
 
+const decodeQueryRef = Schema.decodeUnknownSync(Schema.fromJsonString(QueryRef))
+
 const decodeSchemaSummary = Schema.decodeUnknownSync(Schema.fromJsonString(SchemaSummary))
 
 export const SESSION_DDL: ReadonlyArray<string> = [
   `CREATE TABLE IF NOT EXISTS sessions (session TEXT PRIMARY KEY, client_id TEXT NOT NULL, subject TEXT NOT NULL, schema_json TEXT NOT NULL, identical_schema INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, connected_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS client_subs (session TEXT NOT NULL, client_sub_id TEXT NOT NULL, subscription TEXT NOT NULL, status TEXT NOT NULL, PRIMARY KEY (session, client_sub_id))`,
+  `CREATE TABLE IF NOT EXISTS client_subs (session TEXT NOT NULL, client_sub_id TEXT NOT NULL, subscription TEXT NOT NULL, status TEXT NOT NULL, query_ref TEXT, PRIMARY KEY (session, client_sub_id))`,
   `CREATE INDEX IF NOT EXISTS client_subs_subscription ON client_subs (subscription)`,
 ]
 
@@ -52,7 +57,6 @@ export interface SessionRow {
   readonly subject: string
   readonly schema: SchemaSummary
   readonly identicalSchema: boolean
-  readonly cursor: number
 }
 
 const str = (v: SqlValue | undefined): string => (typeof v === "string" ? v : "")
@@ -61,6 +65,14 @@ const num = (v: SqlValue | undefined): number => (typeof v === "number" ? v : 0)
 export class Sessions {
   constructor(private readonly db: SqlDriver) {
     for (const stmt of SESSION_DDL) db.run(stmt)
+    // Old sessions reconnect once to populate original query refs; never infer authorization
+    // from a previously normalized AST. No row rewrite is needed for this nullable column.
+    if (
+      !db
+        .query(`SELECT name FROM pragma_table_info('client_subs')`)
+        .some((r) => r["name"] === "query_ref")
+    )
+      db.run(`ALTER TABLE client_subs ADD COLUMN query_ref TEXT`)
   }
 
   create(row: {
@@ -94,7 +106,6 @@ export class Sessions {
       subject: str(r["subject"]),
       schema: decodeSchemaSummary(str(r["schema_json"])),
       identicalSchema: num(r["identical_schema"]) === 1,
-      cursor: num(r["cursor"]),
     }
   }
 
@@ -110,35 +121,34 @@ export class Sessions {
     this.db.run(`DELETE FROM sessions WHERE session = ?`, [session])
   }
 
-  touch(session: string, now: number, cursor?: number): void {
-    if (cursor === undefined)
-      this.db.run(`UPDATE sessions SET last_seen_at = ? WHERE session = ?`, [now, session])
-    else
-      this.db.run(`UPDATE sessions SET last_seen_at = ?, cursor = ? WHERE session = ?`, [
-        now,
-        cursor,
-        session,
-      ])
-  }
-
   setClientSub(
     session: string,
     clientSubId: string,
     subscription: string,
     status: "pending" | "live",
+    queryRef?: QueryRef,
   ): void {
     this.db.run(
-      `INSERT INTO client_subs (session, client_sub_id, subscription, status) VALUES (?, ?, ?, ?) ON CONFLICT(session, client_sub_id) DO UPDATE SET subscription = excluded.subscription, status = excluded.status`,
-      [session, clientSubId, subscription, status],
+      `INSERT INTO client_subs (session, client_sub_id, subscription, status, query_ref) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session, client_sub_id) DO UPDATE SET subscription = excluded.subscription, status = excluded.status, query_ref = excluded.query_ref WHERE client_subs.subscription IS NOT excluded.subscription OR client_subs.status IS NOT excluded.status OR client_subs.query_ref IS NOT excluded.query_ref`,
+      [
+        session,
+        clientSubId,
+        subscription,
+        status,
+        queryRef === undefined ? null : JSON.stringify(queryRef),
+      ],
     )
   }
 
   markLive(subscription: string): void {
-    this.db.run(`UPDATE client_subs SET status = 'live' WHERE subscription = ?`, [subscription])
+    this.db.run(
+      `UPDATE client_subs SET status = 'live' WHERE subscription = ? AND status <> 'live'`,
+      [subscription],
+    )
   }
 
   markAllPending(): void {
-    this.db.run(`UPDATE client_subs SET status = 'pending'`)
+    this.db.run(`UPDATE client_subs SET status = 'pending' WHERE status <> 'pending'`)
   }
 
   removeClientSub(session: string, clientSubId: string): string | null {
@@ -159,15 +169,18 @@ export class Sessions {
     readonly clientSubId: string
     readonly subscription: string
     readonly status: string
+    readonly queryRef: QueryRef | null
   }> {
     return this.db
-      .query(`SELECT client_sub_id, subscription, status FROM client_subs WHERE session = ?`, [
-        session,
-      ])
+      .query(
+        `SELECT client_sub_id, subscription, status, query_ref FROM client_subs WHERE session = ?`,
+        [session],
+      )
       .map((r) => ({
         clientSubId: str(r["client_sub_id"]),
         subscription: str(r["subscription"]),
         status: str(r["status"]),
+        queryRef: typeof r["query_ref"] === "string" ? decodeQueryRef(r["query_ref"]) : null,
       }))
   }
 

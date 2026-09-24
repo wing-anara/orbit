@@ -3,7 +3,7 @@
  * Worker and provide the authorizer; the router never lets a client choose a Durable Object.
  *
  * Routes (under `prefix`, default `/orbit`):
- * * `GET  /ws?partition=P&token=T`      client WebSocket (authorized, then forwarded to the DO)
+ * * `GET  /ws?partition=P`      client WebSocket (authorized, then forwarded to the DO)
  * * `POST /internal/cdc/:partition`     distributor delivery (bearer `internalSecret`)
  * * `GET  /internal/fills/next?wait=S`  fill worker long poll
  * * `POST /internal/fills/:fillId`      fill upload (NDJSON)
@@ -118,7 +118,9 @@ export const createOrbitHandler = <Env extends OrbitWorkerEnv>(config: OrbitHand
     Effect.gen(function* () {
       const url = new URL(request.url)
       const partition = url.searchParams.get("partition")
-      const token = socketToken(request, url)
+      const token = url.pathname.endsWith("/session/renew")
+        ? bearer(request)
+        : socketToken(request, url)
       if (partition === null || partition === "")
         return yield* new AuthError({ reason: "malformed", message: "partition is required" })
       if (token === null)
@@ -135,24 +137,46 @@ export const createOrbitHandler = <Env extends OrbitWorkerEnv>(config: OrbitHand
     if (!url.pathname.startsWith(prefix + "/")) return json({ error: "not found" }, 404)
     const path = url.pathname.slice(prefix.length)
 
-    if (path === "/ws") {
-      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket")
+    const renewing = path === "/session/renew"
+    const renewalCors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "POST, OPTIONS",
+      "access-control-allow-headers": "Authorization, Content-Type",
+      "access-control-max-age": "86400",
+      "cache-control": "no-store",
+    }
+    const clientResponse = (response: Response): Response => {
+      if (!renewing) return response
+      const headers = new Headers(response.headers)
+      for (const [key, value] of Object.entries(renewalCors)) headers.set(key, value)
+      return new Response(response.body, { status: response.status, headers })
+    }
+    if (renewing && request.method === "OPTIONS")
+      return new Response(null, { status: 204, headers: renewalCors })
+    if (renewing && request.method !== "POST")
+      return clientResponse(json({ error: "method not allowed" }, 405))
+    if (path === "/ws" || renewing) {
+      if (!renewing && request.headers.get("upgrade")?.toLowerCase() !== "websocket")
         return json({ error: "expected websocket upgrade" }, 426)
       const exit = await runtimeFor(env).runPromiseExit(authorizeClient(request))
       if (Exit.isFailure(exit)) {
         const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
         const error = failure !== undefined && failure._tag === "Fail" ? failure.error : undefined
         if (error instanceof PartitionDenied)
-          return json({ error: "partition_denied", partition: error.partition }, 403)
+          return clientResponse(
+            json({ error: "partition_denied", partition: error.partition }, 403),
+          )
         if (error instanceof AuthError)
-          return json({ error: "unauthorized", reason: error.reason }, 401)
-        return json({ error: "internal" }, 500)
+          return clientResponse(json({ error: "unauthorized", reason: error.reason }, 401))
+        return clientResponse(json({ error: "internal" }, 500))
       }
       const { grant, partition } = exit.value
-      return forward(env, partition, "/ws", request, {
-        "x-orbit-subject": grant.subject,
-        "x-orbit-expires": grant.expiresAt === null ? "" : String(grant.expiresAt),
-      })
+      return clientResponse(
+        await forward(env, partition, renewing ? "/session/renew" : "/ws", request, {
+          "x-orbit-subject": grant.subject,
+          "x-orbit-expires": grant.expiresAt === null ? "" : String(grant.expiresAt),
+        }),
+      )
     }
 
     if (path.startsWith("/internal/")) {

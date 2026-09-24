@@ -44,6 +44,7 @@ export class FillRegistryDurableObject extends BaseFillRegistry {
 }
 
 export interface Env extends OrbitWorkerEnv {
+  readonly ORBIT_WARM_SYNC: DurableObjectNamespace
   readonly ORBIT_INTERNAL_SECRET: string
   readonly ORBIT_TOKEN_SECRET: string
 }
@@ -53,6 +54,7 @@ export const schema: SyncSchema = Schema.decodeUnknownSync(SyncSchema)(fixture)
 /** Named queries for the tests; the fixture has no typed definition, so ASTs are built directly. */
 const definition = { _tag: "SyncSchemaDefinition" } as const
 const define = defineQuery(definition)
+export const revokedQuerySubjects = new Set<string>()
 export const queries = defineQueries(definition, {
   documentsInFolder: define(
     Schema.Struct({ folderId: Schema.String }),
@@ -74,7 +76,11 @@ export const queries = defineQueries(definition, {
     (ctx) =>
       new TypedQuery<typeof definition, "Chatbot">({
         table: "Chatbot",
-        where: { op: "eq", column: "contents", value: ctx.subject ?? "" },
+        where: {
+          op: "eq",
+          column: "groupId",
+          value: revokedQuerySubjects.has(ctx.subject ?? "") ? "__revoked__" : (ctx.subject ?? ""),
+        },
       }),
   ),
 })
@@ -87,6 +93,13 @@ export const SyncDurableObject = makeSyncDurableObject({
   fillTimeoutMs: 2_000,
   maxFillAttempts: 3,
   snapshotChunkRows: 3,
+  subscriptionGraceMs: 1_500,
+  warmSubscriptionRetentionMs: 0,
+})
+
+export const WarmSyncDurableObject = makeSyncDurableObject({
+  schema,
+  allowAdHocQueries: true,
   subscriptionGraceMs: 1_500,
 })
 

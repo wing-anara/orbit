@@ -18,22 +18,26 @@ export class MembershipStore {
   ) {}
 
   init(): void {
+    this.db.transaction(() => this.initStorage())
+  }
+
+  private initStorage(): void {
     const old = this.db.query(`SELECT type FROM sqlite_master WHERE name = 'membership'`)[0]
     if (old?.["type"] === "table") this.db.run(`ALTER TABLE membership RENAME TO membership_rows`)
     this.db.run(
-      `CREATE TABLE IF NOT EXISTS membership_rows (subscription TEXT NOT NULL, path TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, path, tbl, key))`,
+      `CREATE TABLE IF NOT EXISTS membership_rows (subscription TEXT NOT NULL, path TEXT NOT NULL, tbl TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (subscription, path, tbl, key)) WITHOUT ROWID`,
     )
     this.db.run(
       `CREATE INDEX IF NOT EXISTS membership_by_row ON membership_rows (tbl, key, subscription)`,
     )
     this.db.run(
-      `CREATE TABLE IF NOT EXISTS membership_chunks (subscription TEXT NOT NULL, chunk TEXT NOT NULL, PRIMARY KEY (subscription, chunk))`,
+      `CREATE TABLE IF NOT EXISTS membership_chunks (subscription TEXT NOT NULL, chunk TEXT NOT NULL, PRIMARY KEY (subscription, chunk)) WITHOUT ROWID`,
     )
     this.db.run(
       `CREATE INDEX IF NOT EXISTS membership_chunk_owners ON membership_chunks (chunk, subscription)`,
     )
     this.db.run(
-      `CREATE TABLE IF NOT EXISTS membership_writers (subscription TEXT PRIMARY KEY, chunk TEXT NOT NULL, size INTEGER NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS membership_writers (subscription TEXT PRIMARY KEY, chunk TEXT NOT NULL, size INTEGER NOT NULL) WITHOUT ROWID`,
     )
     // Legacy memberships become single chunks without rewriting their rows.
     // New chunks are bounded; an old chunk is copied only if a shared view edits it.
@@ -41,6 +45,25 @@ export class MembershipStore {
       this.db.run(
         `INSERT INTO membership_chunks (subscription, chunk) SELECT id, id FROM subscriptions`,
       )
+    // Format v2 removes the redundant primary-key B-tree. Never rewrite a populated
+    // cache on wake: old and new layouts share the same queries and can coexist across
+    // objects. Upgrade only once all membership state is naturally empty (after GC/reset).
+    // DDL and the view replacement are in the caller's transaction, including rollback.
+    const tables = ["membership_rows", "membership_chunks", "membership_writers"]
+    const legacy =
+      this.db.query(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('membership_rows', 'membership_chunks', 'membership_writers') AND upper(sql) NOT LIKE '%WITHOUT ROWID%' LIMIT 1`,
+      ).length > 0
+    if (
+      legacy &&
+      tables.every((table) => this.db.query(`SELECT 1 FROM ${table} LIMIT 1`).length === 0)
+    ) {
+      this.db.run(`DROP VIEW IF EXISTS membership`)
+      for (const table of tables) this.db.run(`DROP TABLE ${table}`)
+      // A single recursive call creates the new layout; no user rows or cursors are touched.
+      this.initStorage()
+      return
+    }
     this.db.run(
       `CREATE VIEW IF NOT EXISTS membership AS SELECT c.subscription, r.path, r.tbl, r.key FROM membership_chunks c JOIN membership_rows r ON r.subscription = c.chunk`,
     )
@@ -143,7 +166,7 @@ export class MembershipStore {
         ).length > 0
       if (!shared) {
         this.db.run(
-          `DELETE FROM membership_rows WHERE rowid IN (SELECT rowid FROM membership_rows WHERE subscription = ? LIMIT ?)`,
+          `DELETE FROM membership_rows WHERE (subscription, path, tbl, key) IN (SELECT subscription, path, tbl, key FROM membership_rows WHERE subscription = ? LIMIT ?)`,
           [chunk, budget - spent],
         )
         const deleted = Number(this.db.query(`SELECT changes() AS n`)[0]?.["n"] ?? 0)

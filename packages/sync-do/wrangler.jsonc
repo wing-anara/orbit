@@ -9,11 +9,19 @@
   "durable_objects": {
     "bindings": [
       { "name": "ORBIT_SYNC", "class_name": "SyncDurableObject" },
+      { "name": "ORBIT_WARM_SYNC", "class_name": "WarmSyncDurableObject" },
       { "name": "ORBIT_FILL_REGISTRY", "class_name": "FillRegistryDurableObject" },
     ],
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["SyncDurableObject", "FillRegistryDurableObject"] },
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "SyncDurableObject",
+        "WarmSyncDurableObject",
+        "FillRegistryDurableObject",
+      ],
+    },
   ],
   "vars": {
     "ORBIT_INTERNAL_SECRET": "test-secret",
